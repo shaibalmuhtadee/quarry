@@ -3,7 +3,8 @@ param(
         "check", "test", "tools",
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test",
-        "generate", "generate-check", "build", "api-connect"
+        "generate", "generate-check", "format-check", "vet", "build",
+        "api-connect", "smoke-test"
     )]
     [string]$Command = "check"
 )
@@ -37,6 +38,16 @@ function Invoke-Go {
     if ($LASTEXITCODE -ne 0) {
         throw "go $($Arguments -join ' ') failed with exit code $LASTEXITCODE."
     }
+}
+
+function Find-GoFmtExecutable {
+    $executableName = if ($IsWindows) { "gofmt.exe" } else { "gofmt" }
+    $goFmtExecutable = Join-Path (Split-Path -Parent $script:GoExecutable) $executableName
+    if (Test-Path -LiteralPath $goFmtExecutable) {
+        return $goFmtExecutable
+    }
+
+    throw "gofmt is not available beside the Go executable. Reinstall the Go toolchain."
 }
 
 function Find-DockerExecutable {
@@ -81,7 +92,33 @@ function Test-GoPackages {
         return
     }
 
-    Invoke-Go -Arguments @("test", "./...")
+    Invoke-Go -Arguments @("test", "-count=1", "./...")
+}
+
+function Test-GoFormatting {
+    $goFiles = @(
+        Get-ChildItem -LiteralPath $repositoryRoot -Recurse -Filter "*.go" -File |
+            ForEach-Object { $_.FullName }
+    )
+    if ($goFiles.Count -eq 0) {
+        return
+    }
+
+    $unformattedFiles = @(& $script:GoFmtExecutable -l @goFiles)
+    if ($LASTEXITCODE -ne 0) {
+        throw "gofmt failed with exit code $LASTEXITCODE."
+    }
+    if ($unformattedFiles.Count -gt 0) {
+        throw "gofmt found unformatted files:`n$($unformattedFiles -join "`n")"
+    }
+}
+
+function Test-GoVet {
+    Invoke-Go -Arguments @("vet", "./...")
+}
+
+function Test-GoBuild {
+    Invoke-Go -Arguments @("build", "./...")
 }
 
 function Get-PostgresConnectionString {
@@ -140,7 +177,19 @@ function Test-ApiConnection {
     }
 }
 
+function Test-ComposeSmoke {
+    Invoke-Docker -Arguments @("compose", "up", "--detach", "--wait", "postgres")
+    try {
+        Invoke-Goose -MigrationCommand "up"
+        Test-ApiConnection
+    }
+    finally {
+        Invoke-Docker -Arguments @("compose", "down")
+    }
+}
+
 $script:GoExecutable = Find-GoExecutable
+$script:GoFmtExecutable = Find-GoFmtExecutable
 $script:DockerExecutable = $null
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 
@@ -155,8 +204,14 @@ try {
         }
         "check" {
             Invoke-Go -Arguments @("mod", "tidy", "-diff")
+            Test-GoFormatting
             Test-Tools
+            Invoke-Sqlc -SqlcCommand "diff"
+            Test-GoVet
             Test-GoPackages
+            Test-GoBuild
+            Invoke-Docker -Arguments @("compose", "config", "--quiet")
+            Test-ComposeSmoke
         }
         "db-config" {
             Invoke-Docker -Arguments @("compose", "config")
@@ -191,11 +246,20 @@ try {
         "generate-check" {
             Invoke-Sqlc -SqlcCommand "diff"
         }
+        "format-check" {
+            Test-GoFormatting
+        }
+        "vet" {
+            Test-GoVet
+        }
         "build" {
-            Invoke-Go -Arguments @("build", "./...")
+            Test-GoBuild
         }
         "api-connect" {
             Test-ApiConnection
+        }
+        "smoke-test" {
+            Test-ComposeSmoke
         }
     }
 }

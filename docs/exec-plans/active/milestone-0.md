@@ -209,7 +209,7 @@ Generate database code with sqlc and prove that `cmd/api` can connect to Postgre
 
 ## Slice 5: CI and developer instructions
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -246,6 +246,15 @@ Make local and CI validation use the same commands, then document the Milestone 
 - document fresh-clone startup and validation
 - satisfy all Milestone 0 tests
 
+### Validation result
+
+- `pwsh ./scripts/dev.ps1 check` passed the same validation path used by GitHub Actions.
+- The command verified Go formatting, module consistency, pinned tools, sqlc generation consistency, `go vet`, uncached tests, builds, and Compose rendering.
+- The migration integration test applied, rolled back, and reapplied the schema against a fresh PostgreSQL 18.6 container.
+- The Compose smoke test started PostgreSQL, applied migrations, ran the `cmd/api` connection check, and stopped PostgreSQL without deleting its volume.
+- The GitHub Actions workflow uses Go 1.27.0 from `go.mod` and delegates validation to `scripts/dev.ps1`.
+- PowerShell parsing and `git diff --check` passed.
+
 ## Milestone audit
 
 Status: not started
@@ -261,3 +270,4 @@ After all slices pass, audit the repository against the original Milestone 0 req
 - Job states use the six V1 values from the project plan. Attempt status rejects empty values but does not define an enum because the project plan has not finalized attempt states.
 - `cmd/api` remains a one-shot connection check in Milestone 0. It reads `QUARRY_DATABASE_URL` when set and otherwise uses the local Compose connection string.
 - Generated database code uses sqlc's pgx/v5 target and remains committed under `internal/store/postgres/generated`.
+- Local development and GitHub Actions use `pwsh ./scripts/dev.ps1 check` as the single complete validation command.
