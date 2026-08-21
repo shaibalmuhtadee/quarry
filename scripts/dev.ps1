@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("check", "test", "tools")]
+    [ValidateSet("check", "test", "tools", "db-config", "db-up", "db-ready", "db-down")]
     [string]$Command = "check"
 )
 
@@ -34,6 +34,31 @@ function Invoke-Go {
     }
 }
 
+function Find-DockerExecutable {
+    $dockerCommand = Get-Command docker -ErrorAction SilentlyContinue
+    if ($null -ne $dockerCommand) {
+        return $dockerCommand.Source
+    }
+
+    throw "Docker is not available. Install Docker Desktop and add the Docker CLI to PATH."
+}
+
+function Invoke-Docker {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    if ($null -eq $script:DockerExecutable) {
+        $script:DockerExecutable = Find-DockerExecutable
+    }
+
+    & $script:DockerExecutable @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "docker $($Arguments -join ' ') failed with exit code $LASTEXITCODE."
+    }
+}
+
 function Test-Tools {
     Invoke-Go -Arguments @("version")
     Invoke-Go -Arguments @("tool", "goose", "-version")
@@ -55,6 +80,7 @@ function Test-GoPackages {
 }
 
 $script:GoExecutable = Find-GoExecutable
+$script:DockerExecutable = $null
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 
 Push-Location $repositoryRoot
@@ -70,6 +96,21 @@ try {
             Invoke-Go -Arguments @("mod", "tidy", "-diff")
             Test-Tools
             Test-GoPackages
+        }
+        "db-config" {
+            Invoke-Docker -Arguments @("compose", "config")
+        }
+        "db-up" {
+            Invoke-Docker -Arguments @("compose", "up", "--detach", "--wait", "postgres")
+        }
+        "db-ready" {
+            Invoke-Docker -Arguments @(
+                "compose", "exec", "--no-TTY", "postgres",
+                "pg_isready", "--username", "quarry", "--dbname", "quarry"
+            )
+        }
+        "db-down" {
+            Invoke-Docker -Arguments @("compose", "down")
         }
     }
 }

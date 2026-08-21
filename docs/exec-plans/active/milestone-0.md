@@ -67,7 +67,7 @@ Initialize the Go module, pin development tools, add the common command script, 
 
 ## Slice 2: local PostgreSQL
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -98,6 +98,13 @@ Add one PostgreSQL Compose service with a health check and persistent local deve
 - create the PostgreSQL Compose service
 - provide a reproducible development database
 - prove that a fresh environment can start PostgreSQL
+
+### Validation result
+
+- `pwsh ./scripts/dev.ps1 db-config` rendered the Compose configuration successfully.
+- `pwsh ./scripts/dev.ps1 db-up` pulled PostgreSQL 18.6, created the named volume, and waited until the service was healthy.
+- `pwsh ./scripts/dev.ps1 db-ready` ran `pg_isready` inside the container and reported that PostgreSQL accepted connections.
+- `pwsh ./scripts/dev.ps1 db-down` removed the container and network without deleting `quarry_postgres-data`.
 
 ## Slice 3: initial schema and migrations
 
@@ -233,3 +240,4 @@ After all slices pass, audit the repository against the original Milestone 0 req
 
 - The common command interface uses PowerShell instead of GNU Make because the development environment is Windows 11. This follows the project plan's allowance for a Makefile or equivalent command interface. GitHub-hosted Ubuntu runners include PowerShell.
 - Slice 1 contains no Go packages. The `test` command reports that state and succeeds without running tests. It will run `go test ./...` after a later slice adds the first package.
+- PostgreSQL 18 stores its version-specific data directory below `/var/lib/postgresql`, so the named volume mounts there instead of the pre-18 `/var/lib/postgresql/data` path.

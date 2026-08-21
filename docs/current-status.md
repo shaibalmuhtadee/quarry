@@ -3,6 +3,6 @@
 - Current milestone: Milestone 0, repository skeleton and persistence
 - Milestone status: in progress
 - Completed milestones: none
-- Current area of work: Slice 1 complete; awaiting approval to start Slice 2
+- Current area of work: Slice 2 complete; awaiting approval to start Slice 3
 - Known blockers: none
 - Known deviations: PowerShell provides the common command interface instead of GNU Make. This does not change the system architecture.
