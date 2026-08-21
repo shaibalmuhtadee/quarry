@@ -108,7 +108,7 @@ Add one PostgreSQL Compose service with a health check and persistent local deve
 
 ## Slice 3: initial schema and migrations
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -146,6 +146,14 @@ Create reviewable Goose migrations for `jobs` and `job_attempts`, then prove the
 - create the initial job and attempt schema
 - apply migrations from an empty database
 - reproduce migrations on fresh PostgreSQL
+
+### Validation result
+
+- `pwsh ./scripts/dev.ps1 migration-test` started a fresh PostgreSQL 18.6 container and ran the integration test without cached results.
+- The test applied migration version 1, inserted a valid job and attempt, and verified primary-key, foreign-key, not-null, and check constraints by their PostgreSQL SQLSTATE codes.
+- The test rolled back to version 0, confirmed both domain tables were absent, reapplied version 1, and repeated the schema checks.
+- The Compose migration commands applied, reported, rolled back, and reapplied the migration successfully against the development database.
+- `pwsh ./scripts/dev.ps1 check`, `go vet ./...`, PowerShell parsing, and `git diff --check` passed.
 
 ## Slice 4: pgx, sqlc, and application connectivity
 
@@ -241,3 +249,5 @@ After all slices pass, audit the repository against the original Milestone 0 req
 - The common command interface uses PowerShell instead of GNU Make because the development environment is Windows 11. This follows the project plan's allowance for a Makefile or equivalent command interface. GitHub-hosted Ubuntu runners include PowerShell.
 - Slice 1 contains no Go packages. The `test` command reports that state and succeeds without running tests. It will run `go test ./...` after a later slice adds the first package.
 - PostgreSQL 18 stores its version-specific data directory below `/var/lib/postgresql`, so the named volume mounts there instead of the pre-18 `/var/lib/postgresql/data` path.
+- The initial schema contains only job identity, payload, state, timestamps, attempt identity, and their immediate constraints. Worker, lease, retry, cancellation, idempotency, result, error, and performance-index fields remain deferred to the milestones that implement them.
+- Job states use the six V1 values from the project plan. Attempt status rejects empty values but does not define an enum because the project plan has not finalized attempt states.

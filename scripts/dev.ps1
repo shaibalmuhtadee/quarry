@@ -1,5 +1,9 @@
 param(
-    [ValidateSet("check", "test", "tools", "db-config", "db-up", "db-ready", "db-down")]
+    [ValidateSet(
+        "check", "test", "tools",
+        "db-config", "db-up", "db-ready", "db-down",
+        "migrate-up", "migrate-down", "migrate-status", "migration-test"
+    )]
     [string]$Command = "check"
 )
 
@@ -79,6 +83,30 @@ function Test-GoPackages {
     Invoke-Go -Arguments @("test", "./...")
 }
 
+function Get-PostgresConnectionString {
+    $port = if ([string]::IsNullOrWhiteSpace($env:QUARRY_POSTGRES_PORT)) {
+        "5432"
+    }
+    else {
+        $env:QUARRY_POSTGRES_PORT
+    }
+
+    return "postgres://quarry:quarry@localhost:$port/quarry?sslmode=disable"
+}
+
+function Invoke-Goose {
+    param(
+        [Parameter(Mandatory)]
+        [string]$MigrationCommand
+    )
+
+    $migrationDirectory = Join-Path $repositoryRoot "internal/store/postgres/migrations"
+    Invoke-Go -Arguments @(
+        "tool", "goose", "-dir", $migrationDirectory,
+        "postgres", (Get-PostgresConnectionString), $MigrationCommand
+    )
+}
+
 $script:GoExecutable = Find-GoExecutable
 $script:DockerExecutable = $null
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
@@ -111,6 +139,18 @@ try {
         }
         "db-down" {
             Invoke-Docker -Arguments @("compose", "down")
+        }
+        "migrate-up" {
+            Invoke-Goose -MigrationCommand "up"
+        }
+        "migrate-down" {
+            Invoke-Goose -MigrationCommand "down"
+        }
+        "migrate-status" {
+            Invoke-Goose -MigrationCommand "status"
+        }
+        "migration-test" {
+            Invoke-Go -Arguments @("test", "-count=1", "./internal/store/postgres/migrations")
         }
     }
 }
