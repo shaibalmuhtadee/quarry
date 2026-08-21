@@ -157,7 +157,7 @@ Create reviewable Goose migrations for `jobs` and `job_attempts`, then prove the
 
 ## Slice 4: pgx, sqlc, and application connectivity
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -198,6 +198,14 @@ Generate database code with sqlc and prove that `cmd/api` can connect to Postgre
 - produce generated database code
 - prove that the application can connect
 - prove that generated code is current
+
+### Validation result
+
+- `pwsh ./scripts/dev.ps1 generate` produced pgx/v5 query code from the migration and health query.
+- `pwsh ./scripts/dev.ps1 generate-check` used `sqlc diff` to confirm that regeneration produces no changes.
+- `go vet ./...`, `go test ./...`, and `pwsh ./scripts/dev.ps1 build` passed.
+- `pwsh ./scripts/dev.ps1 api-connect` ran `cmd/api` against the healthy Compose database and completed the sqlc-generated health query successfully.
+- PowerShell parsing and `git diff --check` passed.
 
 ## Slice 5: CI and developer instructions
 
@@ -251,3 +259,5 @@ After all slices pass, audit the repository against the original Milestone 0 req
 - PostgreSQL 18 stores its version-specific data directory below `/var/lib/postgresql`, so the named volume mounts there instead of the pre-18 `/var/lib/postgresql/data` path.
 - The initial schema contains only job identity, payload, state, timestamps, attempt identity, and their immediate constraints. Worker, lease, retry, cancellation, idempotency, result, error, and performance-index fields remain deferred to the milestones that implement them.
 - Job states use the six V1 values from the project plan. Attempt status rejects empty values but does not define an enum because the project plan has not finalized attempt states.
+- `cmd/api` remains a one-shot connection check in Milestone 0. It reads `QUARRY_DATABASE_URL` when set and otherwise uses the local Compose connection string.
+- Generated database code uses sqlc's pgx/v5 target and remains committed under `internal/store/postgres/generated`.

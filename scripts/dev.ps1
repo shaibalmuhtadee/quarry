@@ -2,7 +2,8 @@ param(
     [ValidateSet(
         "check", "test", "tools",
         "db-config", "db-up", "db-ready", "db-down",
-        "migrate-up", "migrate-down", "migrate-status", "migration-test"
+        "migrate-up", "migrate-down", "migrate-status", "migration-test",
+        "generate", "generate-check", "build", "api-connect"
     )]
     [string]$Command = "check"
 )
@@ -107,6 +108,38 @@ function Invoke-Goose {
     )
 }
 
+function Invoke-Sqlc {
+    param(
+        [Parameter(Mandatory)]
+        [string]$SqlcCommand
+    )
+
+    Invoke-Go -Arguments @("tool", "sqlc", $SqlcCommand)
+}
+
+function Test-ApiConnection {
+    $hadDatabaseURL = Test-Path Env:QUARRY_DATABASE_URL
+    $previousDatabaseURL = if ($hadDatabaseURL) {
+        $env:QUARRY_DATABASE_URL
+    }
+    else {
+        $null
+    }
+
+    try {
+        $env:QUARRY_DATABASE_URL = Get-PostgresConnectionString
+        Invoke-Go -Arguments @("run", "./cmd/api")
+    }
+    finally {
+        if ($hadDatabaseURL) {
+            $env:QUARRY_DATABASE_URL = $previousDatabaseURL
+        }
+        else {
+            Remove-Item Env:QUARRY_DATABASE_URL -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 $script:GoExecutable = Find-GoExecutable
 $script:DockerExecutable = $null
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
@@ -151,6 +184,18 @@ try {
         }
         "migration-test" {
             Invoke-Go -Arguments @("test", "-count=1", "./internal/store/postgres/migrations")
+        }
+        "generate" {
+            Invoke-Sqlc -SqlcCommand "generate"
+        }
+        "generate-check" {
+            Invoke-Sqlc -SqlcCommand "diff"
+        }
+        "build" {
+            Invoke-Go -Arguments @("build", "./...")
+        }
+        "api-connect" {
+            Test-ApiConnection
         }
     }
 }
