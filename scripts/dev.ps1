@@ -4,7 +4,7 @@ param(
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test",
         "generate", "generate-check", "format-check", "vet", "build",
-        "api-connect", "smoke-test"
+        "smoke-test"
     )]
     [string]$Command = "check"
 )
@@ -154,37 +154,207 @@ function Invoke-Sqlc {
     Invoke-Go -Arguments @("tool", "sqlc", $SqlcCommand)
 }
 
-function Test-ApiConnection {
-    $hadDatabaseURL = Test-Path Env:QUARRY_DATABASE_URL
-    $previousDatabaseURL = if ($hadDatabaseURL) {
-        $env:QUARRY_DATABASE_URL
-    }
-    else {
-        $null
-    }
-
+function Get-AvailableLoopbackPort {
+    $listener = [System.Net.Sockets.TcpListener]::new(
+        [System.Net.IPAddress]::Loopback,
+        0
+    )
     try {
-        $env:QUARRY_DATABASE_URL = Get-PostgresConnectionString
-        Invoke-Go -Arguments @("run", "./cmd/api")
+        $listener.Start()
+        return ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
     }
     finally {
-        if ($hadDatabaseURL) {
-            $env:QUARRY_DATABASE_URL = $previousDatabaseURL
-        }
-        else {
-            Remove-Item Env:QUARRY_DATABASE_URL -ErrorAction SilentlyContinue
-        }
+        $listener.Stop()
     }
 }
 
-function Test-ComposeSmoke {
-    Invoke-Docker -Arguments @("compose", "up", "--detach", "--wait", "postgres")
+function Start-ApiSmokeProcess {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ApiBinary,
+
+        [Parameter(Mandatory)]
+        [string]$HttpAddress
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $ApiBinary
+    $startInfo.WorkingDirectory = $repositoryRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.Environment["QUARRY_DATABASE_URL"] = Get-PostgresConnectionString
+    $startInfo.Environment["QUARRY_HTTP_ADDR"] = $HttpAddress
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        $process.Dispose()
+        throw "Failed to start the API smoke-test process."
+    }
+
+    return $process
+}
+
+function Wait-ApiReady {
+    param(
+        [Parameter(Mandatory)]
+        [System.Diagnostics.Process]$Process,
+
+        [Parameter(Mandatory)]
+        [string]$BaseURL
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($Process.HasExited) {
+            throw "API exited before becoming ready with code $($Process.ExitCode)."
+        }
+
+        try {
+            $response = Invoke-RestMethod -Method Get -Uri "$BaseURL/readyz" -TimeoutSec 2
+            if ($response.status -eq "ready") {
+                return
+            }
+        }
+        catch {
+        }
+
+        Start-Sleep -Milliseconds 200
+    }
+
+    throw "API did not become ready within 30 seconds."
+}
+
+function Test-ApiRoundTrip {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL
+    )
+
+    $health = Invoke-RestMethod -Method Get -Uri "$BaseURL/healthz" -TimeoutSec 10
+    if ($health.status -ne "ok") {
+        throw "API health status was '$($health.status)', expected 'ok'."
+    }
+
+    $body = @{
+        type = "smoke.test"
+        payload = @{
+            message = "hello"
+        }
+        max_attempts = 3
+        timeout_ms = 30000
+    } | ConvertTo-Json -Compress -Depth 4
+    $submitted = Invoke-RestMethod `
+        -Method Post `
+        -Uri "$BaseURL/v1/jobs" `
+        -ContentType "application/json" `
+        -Body $body `
+        -TimeoutSec 10
+    if ([string]::IsNullOrWhiteSpace($submitted.id) -or $submitted.status -ne "queued") {
+        throw "API submission did not return a queued job with an ID."
+    }
+
+    $retrieved = Invoke-RestMethod `
+        -Method Get `
+        -Uri "$BaseURL/v1/jobs/$($submitted.id)" `
+        -TimeoutSec 10
+    if ($retrieved.id -ne $submitted.id) {
+        throw "Retrieved job ID '$($retrieved.id)' did not match '$($submitted.id)'."
+    }
+    if ($retrieved.type -ne "smoke.test" -or $retrieved.status -ne "queued") {
+        throw "Retrieved job did not retain its type and queued status."
+    }
+    if ($retrieved.attempt_count -ne 0 -or $retrieved.max_attempts -ne 3) {
+        throw "Retrieved job did not retain its attempt values."
+    }
+    if ($retrieved.timeout_ms -ne 30000) {
+        throw "Retrieved job timeout was '$($retrieved.timeout_ms)', expected 30000."
+    }
+    if ($retrieved.PSObject.Properties.Name -contains "payload") {
+        throw "Retrieved job exposed its stored payload."
+    }
+}
+
+function Stop-ApiSmokeProcess {
+    param(
+        [Parameter(Mandatory)]
+        [System.Diagnostics.Process]$Process
+    )
+
     try {
-        Invoke-Goose -MigrationCommand "up"
-        Test-ApiConnection
+        if ($Process.HasExited) {
+            return
+        }
+
+        if (-not $IsWindows) {
+            & kill -TERM $Process.Id
+            if ($LASTEXITCODE -eq 0 -and $Process.WaitForExit(10000)) {
+                return
+            }
+        }
+
+        $Process.Kill($true)
+        if (-not $Process.WaitForExit(10000)) {
+            throw "API smoke-test process did not exit."
+        }
     }
     finally {
-        Invoke-Docker -Arguments @("compose", "down")
+        $Process.Dispose()
+    }
+}
+
+function Remove-ApiSmokeBinary {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ApiBinary
+    )
+
+    if (-not (Test-Path -LiteralPath $ApiBinary)) {
+        return
+    }
+
+    $resolvedBinary = [System.IO.Path]::GetFullPath($ApiBinary)
+    $resolvedTemp = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+    if (-not $resolvedBinary.StartsWith($resolvedTemp, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove API smoke-test binary outside the temporary directory: $resolvedBinary"
+    }
+
+    Remove-Item -LiteralPath $resolvedBinary -Force
+}
+
+function Test-ComposeSmoke {
+    $binaryExtension = if ($IsWindows) { ".exe" } else { "" }
+    $apiBinary = Join-Path `
+        ([System.IO.Path]::GetTempPath()) `
+        "quarry-api-smoke-$([Guid]::NewGuid().ToString('N'))$binaryExtension"
+    $apiProcess = $null
+
+    try {
+        Invoke-Docker -Arguments @("compose", "up", "--detach", "--wait", "postgres")
+        Invoke-Goose -MigrationCommand "up"
+        Invoke-Go -Arguments @("build", "-o", $apiBinary, "./cmd/api")
+
+        $port = Get-AvailableLoopbackPort
+        $httpAddress = "127.0.0.1:$port"
+        $baseURL = "http://$httpAddress"
+        $apiProcess = Start-ApiSmokeProcess -ApiBinary $apiBinary -HttpAddress $httpAddress
+        Wait-ApiReady -Process $apiProcess -BaseURL $baseURL
+        Test-ApiRoundTrip -BaseURL $baseURL
+    }
+    finally {
+        try {
+            if ($null -ne $apiProcess) {
+                Stop-ApiSmokeProcess -Process $apiProcess
+            }
+        }
+        finally {
+            try {
+                Remove-ApiSmokeBinary -ApiBinary $apiBinary
+            }
+            finally {
+                Invoke-Docker -Arguments @("compose", "down")
+            }
+        }
     }
 }
 
@@ -254,9 +424,6 @@ try {
         }
         "build" {
             Test-GoBuild
-        }
-        "api-connect" {
-            Test-ApiConnection
         }
         "smoke-test" {
             Test-ComposeSmoke

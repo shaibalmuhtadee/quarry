@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -29,6 +30,17 @@ func (store *fakeJobStore) GetJob(ctx context.Context, id domain.JobID) (domain.
 	return store.getJob(ctx, id)
 }
 
+type readinessCheckerFunc func(context.Context) error
+
+func (check readinessCheckerFunc) Ping(ctx context.Context) error {
+	return check(ctx)
+}
+
+func newTestHandler(store api.JobStore) http.Handler {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return api.NewHandler(store, readinessCheckerFunc(func(context.Context) error { return nil }), logger)
+}
+
 func TestCreateJobUsesDefaultsAndReturnsCreatedJob(t *testing.T) {
 	createdAt := time.Date(2026, time.August, 22, 12, 30, 0, 123456000, time.UTC)
 	var captured domain.JobSubmission
@@ -38,7 +50,7 @@ func TestCreateJobUsesDefaultsAndReturnsCreatedJob(t *testing.T) {
 			return jobFromSubmission(submission, createdAt), nil
 		},
 	}
-	handler := api.NewHandler(store)
+	handler := newTestHandler(store)
 	request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(
 		`{"type":"email.send","payload":{"recipient":"user@example.com"},"timeout_ms":30000}`,
 	))
@@ -97,7 +109,7 @@ func TestCreateJobAcceptsExplicitLimitsAndNullPayload(t *testing.T) {
 			return jobFromSubmission(submission, time.Now().UTC()), nil
 		},
 	}
-	handler := api.NewHandler(store)
+	handler := newTestHandler(store)
 	request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(
 		`{"type":"example","payload":null,"max_attempts":7,"timeout_ms":1}`,
 	))
@@ -156,7 +168,7 @@ func TestCreateJobRejectsInvalidRequests(t *testing.T) {
 					return domain.Job{}, errors.New("unexpected store call")
 				},
 			}
-			handler := api.NewHandler(store)
+			handler := newTestHandler(store)
 			request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(test.body))
 			response := httptest.NewRecorder()
 
@@ -176,7 +188,7 @@ func TestCreateJobReturnsGenericInternalError(t *testing.T) {
 			return domain.Job{}, errors.New("database password secret")
 		},
 	}
-	handler := api.NewHandler(store)
+	handler := newTestHandler(store)
 	request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(
 		`{"type":"example","payload":{},"timeout_ms":1}`,
 	))
@@ -200,7 +212,7 @@ func TestGetJobReturnsStoredStateWithoutPayload(t *testing.T) {
 			return job, nil
 		},
 	}
-	handler := api.NewHandler(store)
+	handler := newTestHandler(store)
 	request := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+job.ID.String(), nil)
 	response := httptest.NewRecorder()
 
@@ -235,7 +247,7 @@ func TestGetJobRejectsMalformedID(t *testing.T) {
 			return domain.Job{}, errors.New("unexpected store call")
 		},
 	}
-	handler := api.NewHandler(store)
+	handler := newTestHandler(store)
 	request := httptest.NewRequest(http.MethodGet, "/v1/jobs/not-a-uuid", nil)
 	response := httptest.NewRecorder()
 
@@ -254,7 +266,7 @@ func TestGetJobReturnsNotFound(t *testing.T) {
 			return domain.Job{}, fmt.Errorf("lookup failed: %w", domain.ErrJobNotFound)
 		},
 	}
-	handler := api.NewHandler(store)
+	handler := newTestHandler(store)
 	request := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+id.String(), nil)
 	response := httptest.NewRecorder()
 
@@ -270,7 +282,7 @@ func TestGetJobReturnsGenericInternalError(t *testing.T) {
 			return domain.Job{}, errors.New("database password secret")
 		},
 	}
-	handler := api.NewHandler(store)
+	handler := newTestHandler(store)
 	request := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+id.String(), nil)
 	response := httptest.NewRecorder()
 

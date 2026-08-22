@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -22,16 +23,22 @@ type JobStore interface {
 }
 
 type handler struct {
-	store JobStore
+	store     JobStore
+	readiness ReadinessChecker
 }
 
-func NewHandler(store JobStore) http.Handler {
-	handler := &handler{store: store}
+func NewHandler(store JobStore, readiness ReadinessChecker, logger *slog.Logger) http.Handler {
+	handler := &handler{
+		store:     store,
+		readiness: readiness,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/jobs", handler.createJob)
 	mux.HandleFunc("GET /v1/jobs/{id}", handler.getJob)
+	mux.HandleFunc("GET /healthz", handler.health)
+	mux.HandleFunc("GET /readyz", handler.ready)
 
-	return mux
+	return logRequests(logger, mux)
 }
 
 type createJobRequest struct {
@@ -113,6 +120,7 @@ func (handler *handler) createJob(writer http.ResponseWriter, request *http.Requ
 		writeError(writer, http.StatusBadRequest, "invalid_request", "job submission is invalid")
 		return
 	}
+	setRequestJobID(request, submission.ID().String())
 
 	job, err := handler.store.CreateJob(request.Context(), submission)
 	if err != nil {
@@ -155,6 +163,7 @@ func (handler *handler) getJob(writer http.ResponseWriter, request *http.Request
 		writeError(writer, http.StatusBadRequest, "invalid_job_id", "job ID must be a valid UUID")
 		return
 	}
+	setRequestJobID(request, id.String())
 
 	job, err := handler.store.GetJob(request.Context(), id)
 	if errors.Is(err, domain.ErrJobNotFound) {

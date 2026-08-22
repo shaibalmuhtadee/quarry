@@ -213,7 +213,7 @@ Implement `POST /v1/jobs` and `GET /v1/jobs/{id}` with `net/http`, strict bounda
 
 ## Slice 4: runnable API and operational endpoints
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -265,7 +265,21 @@ Replace the one-shot connection check with the HTTP service, wire PostgreSQL int
 
 ### Decisions and deviations discovered during implementation
 
-- None yet.
+- `api.NewHandler` now requires a `JobStore`, a PostgreSQL readiness checker, and an `slog.Logger`. All internal callers moved to the new constructor, and no compatibility constructor remains.
+- `/healthz` returns process liveness without calling PostgreSQL. `/readyz` calls `pgxpool.Pool.Ping` with a two-second deadline and returns `503 Service Unavailable` when the call fails.
+- The request logger records method, path, status, outcome, duration, and a validated job ID when a request has one. It uses info, warning, or error level based on the response status.
+- `cmd/api` owns environment parsing, the PostgreSQL pool lifetime, HTTP listener setup, bounded server timeouts, SIGINT and SIGTERM handling, and a ten-second graceful-shutdown deadline. It listens on `:8080` unless `QUARRY_HTTP_ADDR` overrides the address.
+- `pwsh ./scripts/dev.ps1 smoke-test` builds a temporary API binary, starts PostgreSQL, applies migrations, selects an available loopback port, waits for readiness, submits a job, reads it back, and cleans up the process, binary, and Compose resources. The obsolete `api-connect` command was removed.
+- On Unix, smoke-test cleanup sends SIGTERM before using forced termination as a fallback. Windows does not provide the same child-signal path, so smoke-test cleanup terminates the child process directly. `TestServeStartsAndShutsDownWithoutLeakingListener` supplies the Windows evidence for graceful context cancellation, server-goroutine completion, and listener closure.
+- Slice 4 does not add restart-durability coverage or README instructions. Those remain deferred to Slice 5.
+- No Milestone 1 architecture deviation was required.
+
+### Validation result
+
+- `go test -count=1 ./cmd/api ./internal/api` passed configuration, timeout, startup, shutdown, health, readiness, request logging, and job-handler tests.
+- `pwsh ./scripts/dev.ps1 smoke-test` passed the real PostgreSQL and API binary round trip for health, readiness, job submission, and job retrieval.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned-tool checks, sqlc consistency, vet, uncached tests, builds, Compose rendering, migrations through version 2, and the real HTTP smoke test.
+- `git diff --check` passed.
 
 ## Slice 5: restart durability and developer flow
 
