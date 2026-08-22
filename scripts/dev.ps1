@@ -2,7 +2,7 @@ param(
     [ValidateSet(
         "check", "test", "tools",
         "db-config", "db-up", "db-ready", "db-down",
-        "migrate-up", "migrate-down", "migrate-status", "migration-test",
+        "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
         "generate", "generate-check", "format-check", "vet", "build",
         "smoke-test"
     )]
@@ -409,6 +409,13 @@ try {
         }
         "migration-test" {
             Invoke-Go -Arguments @("test", "-count=1", "./internal/store/postgres/migrations")
+        }
+        "restart-test" {
+            Invoke-Go -Arguments @(
+                "test", "-count=1",
+                "-run", "^TestAPIJobSurvivesServerAndPoolRestart$",
+                "./internal/store/postgres"
+            )
         }
         "generate" {
             Invoke-Sqlc -SqlcCommand "generate"

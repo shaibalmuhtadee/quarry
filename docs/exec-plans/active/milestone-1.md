@@ -283,7 +283,7 @@ Replace the one-shot connection check with the HTTP service, wire PostgreSQL int
 
 ## Slice 5: restart durability and developer flow
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -331,7 +331,18 @@ Prove that an HTTP-created job survives loss of API process memory, then documen
 
 ### Decisions and deviations discovered during implementation
 
-- None yet.
+- `TestAPIJobSurvivesServerAndPoolRestart` uses the existing fresh-PostgreSQL test setup, which starts PostgreSQL 18.6 and applies all migrations before the HTTP lifecycle begins.
+- Each call to `useFreshAPIInstance` constructs a new PostgreSQL pool, concrete job store, HTTP handler, and `httptest` server. The helper closes the server and pool before returning and does not expose the handler, store, or pool to the caller.
+- The test confirms that API instance A no longer accepts requests before it constructs instance B. Instance B retrieves the submitted job and verifies its ID, type, timestamps, queued status, zero attempt count, maximum attempts, timeout, and omitted payload.
+- `pwsh ./scripts/dev.ps1 restart-test` runs the restart durability test directly. The README now documents the implemented API startup, submission, lookup, health, readiness, smoke-test, restart-test, and generation commands without describing later-milestone behavior as available.
+- No Milestone 1 architecture deviation was required.
+
+### Validation result
+
+- `go test -count=1 -run '^TestAPIJobSurvivesServerAndPoolRestart$' ./internal/store/postgres` passed against fresh PostgreSQL 18.6.
+- `pwsh ./scripts/dev.ps1 restart-test` passed the same restart lifecycle through the documented command.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned-tool checks, sqlc consistency, vet, all uncached tests, builds, Compose rendering, migrations through version 2, and the real HTTP smoke test.
+- `git diff --check` passed.
 
 ## Milestone audit
 
