@@ -257,9 +257,19 @@ Make local and CI validation use the same commands, then document the Milestone 
 
 ## Milestone audit
 
-Status: not started
+Status: complete
 
 After all slices pass, audit the repository against the original Milestone 0 requirements and definition of done in `docs/project-plan.md`. Check the diff for later-milestone work. If the audit passes, update `docs/current-status.md` and move this file to `docs/exec-plans/completed/milestone-0.md`.
+
+### Audit result
+
+- The repository contains every Milestone 0 build item: the Go module and pinned Go version, `cmd/api`, PostgreSQL Compose service, Goose migration tooling, the initial job and attempt schema, pgx and sqlc configuration, common PowerShell commands, basic CI, and `docs/current-status.md`.
+- The repository contains no worker, dispatcher, HTTP server, or other Milestone 1 implementation.
+- The migration integration test applied migration 00001 to fresh PostgreSQL, verified the schema constraints, rolled back to version 0, and reapplied the migration.
+- `sqlc diff` confirmed that the committed generated code is current.
+- An isolated `pwsh ./scripts/dev.ps1 check` run used a new Compose project and volume. It started PostgreSQL, applied migration 00001 from an empty database, ran the `cmd/api` connection check, and passed the repository validation.
+- No Milestone 0 defects, unresolved blockers, or architecture deviations remain.
+- The one-shot `cmd/api` behavior and minimal schema are intentional Milestone 0 limits. Later milestones add the HTTP API and execution-state fields.
 
 ## Decisions and deviations discovered during implementation
 
