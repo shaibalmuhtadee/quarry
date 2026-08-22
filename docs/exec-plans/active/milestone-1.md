@@ -148,7 +148,7 @@ Extend the schema only as far as Milestone 1 needs, then add visible SQL and a c
 
 ## Slice 3: public job HTTP handlers
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -196,7 +196,20 @@ Implement `POST /v1/jobs` and `GET /v1/jobs/{id}` with `net/http`, strict bounda
 
 ### Decisions and deviations discovered during implementation
 
-- None yet.
+- `api.NewHandler` returns a `net/http` handler backed by a two-method `api.JobStore` interface. The interface lives in the consuming package and matches the concrete PostgreSQL store without adding an adapter layer.
+- The create handler decodes transport fields as `json.RawMessage` where omission matters. It accepts a JSON `null` payload, defaults only an omitted `max_attempts`, and rejects an explicit `null`, zero, negative, fractional, or overflowing limit.
+- Request validation rejects unknown fields, trailing JSON values, malformed bodies, and bodies larger than 1 MiB before the store runs.
+- Error responses use an `error` object with stable codes. Internal store errors return `internal_error` without exposing their messages.
+- `POST /v1/jobs` returns the persisted ID, queued status, `deduplicated: false`, creation timestamp, and `Location`. `GET /v1/jobs/{id}` returns the stored state and timeout but omits the payload.
+- Slice 3 does not wire the handler into `cmd/api`. Health, readiness, logs, server lifecycle, and the HTTP smoke path remain deferred to Slice 4.
+- No Milestone 1 architecture deviation was required.
+
+### Validation result
+
+- `go test -count=1 ./internal/api` passed all handler contract tests.
+- The first `pwsh ./scripts/dev.ps1 check` attempt hit the previously observed transient Windows Docker provider discovery failure in one Testcontainers package. The API, domain, store, and generated packages passed during that attempt.
+- The final `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned-tool checks, sqlc consistency, vet, uncached tests, builds, Compose rendering, migrations through version 2, and the Compose connection smoke test.
+- `git diff --check` passed.
 
 ## Slice 4: runnable API and operational endpoints
 
