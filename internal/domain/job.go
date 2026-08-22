@@ -22,6 +22,7 @@ var (
 	ErrInvalidJobStatus   = errors.New("invalid job status")
 	ErrInvalidMaxAttempts = errors.New("invalid maximum attempts")
 	ErrInvalidTimeout     = errors.New("invalid timeout")
+	ErrJobNotFound        = errors.New("job not found")
 
 	jobTypePattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$`)
 )
@@ -167,8 +168,8 @@ func NewJobSubmission(
 	if maxAttempts <= 0 {
 		return JobSubmission{}, fmt.Errorf("%w: must be positive", ErrInvalidMaxAttempts)
 	}
-	if timeout <= 0 {
-		return JobSubmission{}, fmt.Errorf("%w: must be positive", ErrInvalidTimeout)
+	if timeout <= 0 || timeout%time.Millisecond != 0 {
+		return JobSubmission{}, fmt.Errorf("%w: must be a positive whole number of milliseconds", ErrInvalidTimeout)
 	}
 
 	return JobSubmission{

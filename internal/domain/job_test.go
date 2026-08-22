@@ -254,6 +254,22 @@ func TestNewJobSubmissionRejectsInvalidValues(t *testing.T) {
 			timeout:     -time.Second,
 			wantError:   domain.ErrInvalidTimeout,
 		},
+		{
+			name:        "sub-millisecond timeout",
+			jobType:     jobType,
+			payload:     payload,
+			maxAttempts: 1,
+			timeout:     time.Nanosecond,
+			wantError:   domain.ErrInvalidTimeout,
+		},
+		{
+			name:        "fractional-millisecond timeout",
+			jobType:     jobType,
+			payload:     payload,
+			maxAttempts: 1,
+			timeout:     time.Millisecond + time.Nanosecond,
+			wantError:   domain.ErrInvalidTimeout,
+		},
 	}
 
 	for _, test := range tests {

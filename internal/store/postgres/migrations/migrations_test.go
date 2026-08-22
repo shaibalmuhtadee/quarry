@@ -89,7 +89,7 @@ func applyMigrations(t *testing.T, ctx context.Context, db *sql.DB, directory st
 	if err := goose.UpContext(ctx, db, directory); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
-	verifyVersion(t, ctx, db, 1)
+	verifyVersion(t, ctx, db, 2)
 }
 
 func verifyVersion(t *testing.T, ctx context.Context, db *sql.DB, want int64) {
@@ -119,8 +119,8 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 
 	const jobID = "00000000-0000-0000-0000-000000000001"
 	if _, err := db.ExecContext(ctx, `
-		INSERT INTO jobs (id, job_type, payload, status)
-		VALUES ($1, 'test', '{}', 'queued')
+		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
+		VALUES ($1, 'test', '{}', 'queued', 3, 30000)
 	`, jobID); err != nil {
 		t.Fatalf("insert valid job: %v", err)
 	}
@@ -132,20 +132,40 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 	}
 
 	expectConstraintError(t, ctx, db, "23514", `
-		INSERT INTO jobs (id, job_type, payload, status)
-		VALUES ('00000000-0000-0000-0000-000000000002', 'test', '{}', 'unknown')
+		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
+		VALUES ('00000000-0000-0000-0000-000000000002', 'test', '{}', 'unknown', 3, 30000)
 	`)
 	expectConstraintError(t, ctx, db, "23514", `
-		INSERT INTO jobs (id, job_type, payload, status)
-		VALUES ('00000000-0000-0000-0000-000000000003', '', '{}', 'queued')
+		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
+		VALUES ('00000000-0000-0000-0000-000000000003', '', '{}', 'queued', 3, 30000)
 	`)
 	expectConstraintError(t, ctx, db, "23502", `
-		INSERT INTO jobs (id, job_type, payload, status)
-		VALUES ('00000000-0000-0000-0000-000000000004', 'test', NULL, 'queued')
+		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
+		VALUES ('00000000-0000-0000-0000-000000000004', 'test', NULL, 'queued', 3, 30000)
 	`)
 	expectConstraintError(t, ctx, db, "23505", `
-		INSERT INTO jobs (id, job_type, payload, status)
-		VALUES ('00000000-0000-0000-0000-000000000001', 'duplicate', '{}', 'queued')
+		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
+		VALUES ('00000000-0000-0000-0000-000000000001', 'duplicate', '{}', 'queued', 3, 30000)
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO jobs (id, job_type, payload, status, attempt_count, max_attempts, timeout_ms)
+		VALUES ('00000000-0000-0000-0000-000000000005', 'test', '{}', 'queued', -1, 3, 30000)
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
+		VALUES ('00000000-0000-0000-0000-000000000006', 'test', '{}', 'queued', 0, 30000)
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO jobs (id, job_type, payload, status, attempt_count, max_attempts, timeout_ms)
+		VALUES ('00000000-0000-0000-0000-000000000007', 'test', '{}', 'queued', 4, 3, 30000)
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
+		VALUES ('00000000-0000-0000-0000-000000000008', 'test', '{}', 'queued', 3, 0)
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
+		VALUES ('00000000-0000-0000-0000-000000000009', 'test', '{}', 'queued', 3, 9223372036855)
 	`)
 	expectConstraintError(t, ctx, db, "23514", `
 		INSERT INTO job_attempts (job_id, attempt_no, status, started_at)

@@ -77,7 +77,7 @@ Define the Milestone 1 `Job` model, job identity, queued state, submission value
 
 ## Slice 2: durable job persistence
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -130,7 +130,21 @@ Extend the schema only as far as Milestone 1 needs, then add visible SQL and a c
 
 ### Decisions and deviations discovered during implementation
 
-- None yet.
+- Migration `00002_add_job_submission_fields.sql` adds only `attempt_count`, `max_attempts`, and `timeout_ms`. Database checks keep attempt counts nonnegative and within `max_attempts`, require positive limits, and cap `timeout_ms` at the largest millisecond value that converts safely to `time.Duration`.
+- `JobSubmission` now requires a whole positive millisecond timeout. This preserves the approved `timeout_ms` contract and prevents persistence from truncating a valid domain value.
+- sqlc maps PostgreSQL UUIDs to `github.com/google/uuid.UUID`. `JobStore` maps generated rows into domain values and returns `domain.ErrJobNotFound` for `pgx.ErrNoRows`.
+- The store integration test closes its first pool before opening a second pool against the same PostgreSQL instance. It verifies that all job fields survive the pool restart and that missing IDs return the domain not-found error.
+- No Milestone 1 architecture deviation was required.
+
+### Validation result
+
+- `pwsh ./scripts/dev.ps1 generate` and `pwsh ./scripts/dev.ps1 generate-check` passed.
+- `pwsh ./scripts/dev.ps1 migration-test` passed migration apply, rollback to version zero, and reapplication against PostgreSQL 18.6.
+- `go test -count=1 ./internal/store/postgres/...` passed the store and migration integration tests against PostgreSQL 18.6.
+- `go test -count=1 ./internal/domain` passed.
+- The first full `pwsh ./scripts/dev.ps1 check` attempt hit a transient Docker provider discovery failure in one Testcontainers package while the other package passed. A standalone full Go test and five consecutive PostgreSQL package test runs then passed.
+- The final `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned-tool checks, sqlc consistency, vet, uncached tests, builds, Compose rendering, migrations through version 2, and the Compose connection smoke test.
+- `git diff --check` passed.
 
 ## Slice 3: public job HTTP handlers
 
