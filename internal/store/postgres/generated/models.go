@@ -5,20 +5,24 @@
 package postgresdb
 
 import (
+	uuid "github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Job struct {
-	ID        pgtype.UUID
-	JobType   string
-	Payload   []byte
-	Status    string
-	CreatedAt pgtype.Timestamptz
-	UpdatedAt pgtype.Timestamptz
+	ID           uuid.UUID
+	JobType      string
+	Payload      []byte
+	Status       string
+	CreatedAt    pgtype.Timestamptz
+	UpdatedAt    pgtype.Timestamptz
+	AttemptCount int32
+	MaxAttempts  int32
+	TimeoutMs    int64
 }
 
 type JobAttempt struct {
-	JobID     pgtype.UUID
+	JobID     uuid.UUID
 	AttemptNo int32
 	Status    string
 	StartedAt pgtype.Timestamptz
