@@ -140,6 +140,7 @@ func TestCreateJobRejectsInvalidRequests(t *testing.T) {
 	}{
 		{name: "empty body", wantCode: "invalid_request"},
 		{name: "non-object body", body: `[]`, wantCode: "invalid_request"},
+		{name: "null body", body: `null`, wantCode: "invalid_request"},
 		{name: "unknown field", body: `{"type":"example","payload":{},"timeout_ms":1,"extra":true}`, wantCode: "invalid_request"},
 		{name: "trailing JSON value", body: `{"type":"example","payload":{},"timeout_ms":1} {}`, wantCode: "invalid_request"},
 		{name: "body larger than one MiB", body: largeBody, wantCode: "invalid_request"},

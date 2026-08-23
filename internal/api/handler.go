@@ -142,8 +142,8 @@ func decodeCreateJobRequest(writer http.ResponseWriter, request *http.Request) (
 	decoder := json.NewDecoder(limitedBody)
 	decoder.DisallowUnknownFields()
 
-	var input createJobRequest
-	if err := decoder.Decode(&input); err != nil {
+	var input *createJobRequest
+	if err := decoder.Decode(&input); err != nil || input == nil {
 		writeError(writer, http.StatusBadRequest, "invalid_request", "request body must contain one JSON object")
 		return createJobRequest{}, false
 	}
@@ -154,7 +154,7 @@ func decodeCreateJobRequest(writer http.ResponseWriter, request *http.Request) (
 		return createJobRequest{}, false
 	}
 
-	return input, true
+	return *input, true
 }
 
 func (handler *handler) getJob(writer http.ResponseWriter, request *http.Request) {

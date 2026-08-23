@@ -346,7 +346,7 @@ Prove that an HTTP-created job survives loss of API process memory, then documen
 
 ## Milestone audit
 
-Status: not started
+Status: complete
 
 After all slices pass, audit the implementation against the original Milestone 1 requirements and definition of done in `docs/project-plan.md`.
 
@@ -359,6 +359,20 @@ The audit must:
 - record any deviation from the project plan,
 - update `docs/current-status.md`,
 - move this plan to `docs/exec-plans/completed/milestone-1.md` only if the definition of done passes.
+
+### Audit result
+
+- The audit inspected the Milestone 1 requirements in `docs/project-plan.md`, the domain model, HTTP handlers, API process lifecycle, PostgreSQL migrations and queries, concrete store, tests, developer commands, and README.
+- The audit found one request-boundary defect: a JSON `null` request body reached field validation instead of failing the one-object request contract. The HTTP decoder now rejects it as `invalid_request`, and the handler test covers the case.
+- `go test -count=1 ./internal/domain ./internal/api ./cmd/api` passed the domain, HTTP contract, health, readiness, logging, configuration, and server-lifecycle tests before the audit fix. `go test -count=1 ./internal/api` passed after the fix.
+- `go test -count=1 -v ./internal/store/postgres/...` passed against disposable PostgreSQL 18.6 containers. It covered migration apply, rollback, and reapplication; job submission and lookup; missing jobs; pool replacement; and replacement of both the API server and PostgreSQL pool.
+- `pwsh ./scripts/dev.ps1 restart-test` passed the documented API restart-persistence test.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned-tool checks, sqlc consistency, vet, all uncached Go tests, builds, Compose rendering, PostgreSQL integration tests, and the real API-binary HTTP smoke test.
+- A manual process-level audit started API instance A against the Compose database, submitted and retrieved a queued job, then shut down the process. Invalid job type, malformed JSON, and JSON `null` requests returned the expected `400` error codes. API instance B retrieved the same job ID with its type, limits, timestamps, `queued` status, and zero attempts.
+- The HTTP and persistence tests confirm that valid jobs receive stable UUIDs, enter `queued` with zero attempts, retain their payload and submission settings in PostgreSQL, and remain retrievable after the first API server and pool close.
+- Invalid job types, malformed JSON, non-object and `null` bodies, missing payloads, unknown fields, trailing JSON, oversized bodies, and invalid limits return `400` without calling the store. A valid missing job ID returns `404`.
+- The scope inspection found no dispatcher or worker command, gRPC or Protocol Buffer definition, acquisition or claim query, lease or retry behavior, execution handler, or state-transition code. The schema and domain name future V1 statuses and attempts, but no code creates attempts or moves a job out of `queued`.
+- No architecture deviation was required. PowerShell remains the documented equivalent to GNU Make. GitHub-hosted CI was not run during this local audit.
 
 ## Deferred work
 
