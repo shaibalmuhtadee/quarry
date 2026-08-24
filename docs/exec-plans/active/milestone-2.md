@@ -318,7 +318,7 @@ Expose dispatcher persistence through a runnable, stateless gRPC process.
 
 ## Slice 5: bounded worker and demonstration handlers
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -372,11 +372,28 @@ Build a worker process that registers, pulls supported jobs based on free capaci
 
 ### Decisions and deviations discovered during implementation
 
-- None yet.
+- `internal/worker.Worker` owns one acquisition loop, a work channel bounded to configured concurrency, and exactly that many executor goroutines. The acquisition loop alone tracks acquired but unacknowledged work, so buffered, executing, and reporting jobs all reduce advertised capacity.
+- Executors release capacity only after `ReportAttempt` succeeds. `Unavailable`, `DeadlineExceeded`, `ResourceExhausted`, `Aborted`, and `Internal` report errors use a short local jittered retry delay; permanent gRPC errors stop the worker without falsely releasing the slot.
+- Empty and transiently failed acquisition calls use an exponential local backoff from 50 milliseconds to one second with jitter. A non-empty acquisition resets the backoff. This is local polling behavior, not durable job retry scheduling.
+- The gRPC client applies a five-second deadline to each unary call and converts acquired Protocol Buffer values into validated domain IDs, attempt numbers, job types, payloads, and durations before execution.
+- Supported handler types are validated and sorted once at worker construction. The worker advertises only `demo.echo` and `demo.payload_size`; an acquired unsupported type is treated as a dispatcher contract violation.
+- `demo.echo` returns the received JSON value unchanged. `demo.payload_size` returns `{"bytes":N}`, where `N` is the byte length of the valid JSON received from the dispatcher. Both accept objects, arrays, strings, numbers, booleans, and `null`.
+- `cmd/worker` generates a new UUID and start time on every process start. Its dispatcher address, hostname, version, and positive concurrency are configurable through environment variables; defaults are `localhost:9090`, the operating-system hostname, `dev`, and four executors.
+- Process cancellation stops acquisition and local executors but does not promise to drain acquired work. Timeout enforcement, panic recovery, heartbeat, lease, failure outcome, cancellation RPC, and graceful draining remain deferred as planned.
+- No architecture deviation was required.
 
 ### Validation result
 
-- Not run yet.
+- Bounded-runtime tests reached exactly the configured handler concurrency, never exceeded it, advertised only free capacity, and proved that a blocked success report prevents reacquisition of that slot.
+- Report tests proved that a transient gRPC failure retries the same worker ID, job ID, attempt number, and result, while the Protocol Buffer client test verified those identities at the wire boundary.
+- Handler tests passed every JSON shape for `demo.echo`, deterministic byte counting for `demo.payload_size`, and the exact two-entry registry.
+- Worker process tests passed default and overridden configuration, invalid-concurrency rejection, registration and acquisition through a real gRPC listener, cancellation-driven shutdown, and distinct UUIDs across two process starts.
+- `go test -count=1 ./internal/worker ./cmd/worker` passed. `go test -count=1 ./internal/worker/... ./cmd/worker` also passed the handler subpackage.
+- The native Windows race command could not start because the host has no C compiler for CGO. The same required test, `go test -race -count=1 ./internal/worker`, passed in the official Linux `golang:1.27` container.
+- `pwsh ./scripts/dev.ps1 build` passed, including the new worker binary.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned tool checks, generated-code checks, vet, all uncached tests, builds, Compose rendering, PostgreSQL integration tests, migrations through version 3, and the real API HTTP smoke test.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
 
 ## Slice 6: distributed process acceptance test and developer flow
 
