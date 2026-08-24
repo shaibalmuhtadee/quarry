@@ -137,12 +137,14 @@ type Job struct {
 	ID           JobID
 	Type         JobType
 	Payload      Payload
+	Result       *Result
 	Status       JobStatus
 	AttemptCount int32
 	MaxAttempts  int32
 	Timeout      time.Duration
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	FinishedAt   *time.Time
 }
 
 type JobSubmission struct {

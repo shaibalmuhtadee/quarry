@@ -20,6 +20,7 @@ const (
 type JobStore interface {
 	CreateJob(context.Context, domain.JobSubmission) (domain.Job, error)
 	GetJob(context.Context, domain.JobID) (domain.Job, error)
+	ListJobAttempts(context.Context, domain.JobID) ([]domain.Attempt, error)
 }
 
 type handler struct {
@@ -35,6 +36,7 @@ func NewHandler(store JobStore, readiness ReadinessChecker, logger *slog.Logger)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/jobs", handler.createJob)
 	mux.HandleFunc("GET /v1/jobs/{id}", handler.getJob)
+	mux.HandleFunc("GET /v1/jobs/{id}/attempts", handler.getJobAttempts)
 	mux.HandleFunc("GET /healthz", handler.health)
 	mux.HandleFunc("GET /readyz", handler.ready)
 
@@ -62,8 +64,22 @@ type jobResponse struct {
 	AttemptCount int32            `json:"attempt_count"`
 	MaxAttempts  int32            `json:"max_attempts"`
 	TimeoutMS    int64            `json:"timeout_ms"`
+	Result       json.RawMessage  `json:"result"`
 	CreatedAt    time.Time        `json:"created_at"`
 	UpdatedAt    time.Time        `json:"updated_at"`
+	FinishedAt   *time.Time       `json:"finished_at"`
+}
+
+type jobAttemptsResponse struct {
+	Attempts []attemptResponse `json:"attempts"`
+}
+
+type attemptResponse struct {
+	Number     int32                `json:"attempt_no"`
+	WorkerID   string               `json:"worker_id"`
+	Status     domain.AttemptStatus `json:"status"`
+	StartedAt  time.Time            `json:"started_at"`
+	FinishedAt *time.Time           `json:"finished_at"`
 }
 
 type errorResponse struct {
@@ -175,6 +191,10 @@ func (handler *handler) getJob(writer http.ResponseWriter, request *http.Request
 		return
 	}
 
+	var result json.RawMessage
+	if job.Result != nil {
+		result = job.Result.JSON()
+	}
 	writeJSON(writer, http.StatusOK, jobResponse{
 		ID:           job.ID.String(),
 		Type:         job.Type.String(),
@@ -182,9 +202,45 @@ func (handler *handler) getJob(writer http.ResponseWriter, request *http.Request
 		AttemptCount: job.AttemptCount,
 		MaxAttempts:  job.MaxAttempts,
 		TimeoutMS:    job.Timeout.Milliseconds(),
+		Result:       result,
 		CreatedAt:    job.CreatedAt,
 		UpdatedAt:    job.UpdatedAt,
+		FinishedAt:   job.FinishedAt,
 	})
+}
+
+func (handler *handler) getJobAttempts(writer http.ResponseWriter, request *http.Request) {
+	id, err := domain.ParseJobID(request.PathValue("id"))
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_job_id", "job ID must be a valid UUID")
+		return
+	}
+	setRequestJobID(request, id.String())
+
+	attempts, err := handler.store.ListJobAttempts(request.Context(), id)
+	if errors.Is(err, domain.ErrJobNotFound) {
+		writeError(writer, http.StatusNotFound, "job_not_found", "job not found")
+		return
+	}
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+
+	response := jobAttemptsResponse{
+		Attempts: make([]attemptResponse, 0, len(attempts)),
+	}
+	for _, attempt := range attempts {
+		response.Attempts = append(response.Attempts, attemptResponse{
+			Number:     attempt.Number.Int32(),
+			WorkerID:   attempt.WorkerID.String(),
+			Status:     attempt.Status,
+			StartedAt:  attempt.StartedAt,
+			FinishedAt: attempt.FinishedAt,
+		})
+	}
+
+	writeJSON(writer, http.StatusOK, response)
 }
 
 func writeError(writer http.ResponseWriter, status int, code, message string) {

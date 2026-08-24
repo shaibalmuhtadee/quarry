@@ -169,7 +169,7 @@ Implement durable worker registration and the transaction that claims eligible j
 
 ## Slice 3: successful completion and attempt history
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -219,11 +219,25 @@ Complete the successful execution transition and expose attempt history through 
 
 ### Decisions and deviations discovered during implementation
 
-- None yet.
+- `domain.Result` owns a defensive copy of one valid JSON value. `domain.Job` now carries an optional result and finish time, and `domain.Attempt` carries its job, attempt, worker, status, start time, and optional finish time.
+- `ReportSuccess` locks the matching job and attempt before checking the current attempt number, worker ID, and both stored statuses. A valid report updates the attempt and job in one transaction, stores the JSONB result, uses one finish timestamp for both rows, and clears `current_worker_id` because the terminal job has no active worker.
+- A repeated success report returns success only when the same worker and attempt already succeeded with a JSONB-equal result. A different worker, job, attempt number, result, or stored state returns `ErrAttemptReportConflict` without changing either row.
+- `GetJobAttempts` uses one left join to distinguish a missing job from a job with no attempts. The store returns attempts ordered by attempt number.
+- `GET /v1/jobs/{id}` now always returns `result` and `finished_at`; unfinished jobs return `null` for both fields. `GET /v1/jobs/{id}/attempts` returns an `attempts` array with attempt number, worker ID, status, start time, and finish time. A missing job returns `404`, and a job without attempts returns an empty array.
+- No architecture deviation was required. Slice 3 added no gRPC service, worker runtime, failure outcome, replacement attempt, lease, heartbeat, recovery, retry, cancellation, metrics, or tracing behavior.
 
 ### Validation result
 
-- Not run yet.
+- `pwsh ./scripts/dev.ps1 generate-check` passed sqlc and Protocol Buffer generated-code verification.
+- `go vet ./internal/domain ./internal/api ./internal/store/postgres/...` passed.
+- `go test -count=1 ./internal/domain ./internal/api ./internal/store/postgres/...` passed all domain, HTTP, PostgreSQL, and migration tests.
+- PostgreSQL tests verified the successful job and attempt updates, stored results and finish times, JSONB-equal duplicate reports, conflicting result reports, mismatched worker, job, and attempt reports, missing and empty attempt histories, and ascending attempt order.
+- The atomicity test installed a PostgreSQL trigger that rejected the job completion update after the attempt update. `ReportSuccess` returned an error, and direct reads confirmed that both the job and attempt remained `running` with no result or finish time.
+- `TestSuccessfulJobAndAttemptHistoryThroughHTTP` submitted a job through HTTP, claimed and completed it through the PostgreSQL dispatcher store, then read the successful result and attempt history through HTTP.
+- HTTP handler tests passed successful job lookup, empty and populated attempt arrays, missing-job `404`, malformed-ID rejection, and generic internal errors without exposing store details.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned tool checks, sqlc and Protocol Buffer generated-code checks, vet, all uncached tests, builds, Compose rendering, PostgreSQL integration tests, and the real API HTTP smoke test.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
 
 ## Slice 4: dispatcher gRPC service and process
 

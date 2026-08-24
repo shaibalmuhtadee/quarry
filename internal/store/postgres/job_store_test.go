@@ -85,6 +85,57 @@ func TestJobStorePersistsJobAcrossPoolRestart(t *testing.T) {
 	}
 }
 
+func TestJobStoreListsAttemptsInAttemptNumberOrder(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := newDispatcherTestPool(t, ctx)
+	dispatcherStore := postgres.NewDispatcherStore(pool)
+	jobStore := postgres.NewJobStore(pool)
+	worker := registerTestWorker(t, ctx, dispatcherStore, 1)
+	job := createTestJob(t, ctx, jobStore, "history.test", `{}`)
+
+	empty, err := jobStore.ListJobAttempts(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("list empty attempt history: %v", err)
+	}
+	if empty == nil || len(empty) != 0 {
+		t.Fatalf("empty attempt history = %#v, want non-nil empty slice", empty)
+	}
+	_, err = jobStore.ListJobAttempts(ctx, domain.NewJobID())
+	if !errors.Is(err, domain.ErrJobNotFound) {
+		t.Fatalf("missing job attempt history error = %v, want ErrJobNotFound", err)
+	}
+
+	firstStartedAt := time.Date(2026, time.August, 24, 12, 0, 0, 0, time.UTC)
+	secondStartedAt := firstStartedAt.Add(time.Minute)
+	for _, attempt := range []struct {
+		number    int32
+		startedAt time.Time
+	}{
+		{number: 2, startedAt: secondStartedAt},
+		{number: 1, startedAt: firstStartedAt},
+	} {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at, finished_at)
+			VALUES ($1, $2, $3, 'succeeded', $4, $4)
+		`, job.ID.UUID(), attempt.number, worker.UUID(), attempt.startedAt)
+		if err != nil {
+			t.Fatalf("insert attempt %d: %v", attempt.number, err)
+		}
+	}
+
+	attempts, err := jobStore.ListJobAttempts(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("list stored attempts: %v", err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("stored attempt count = %d, want 2", len(attempts))
+	}
+	if attempts[0].Number.Int32() != 1 || attempts[1].Number.Int32() != 2 {
+		t.Fatalf("stored attempt order = [%d, %d], want [1, 2]", attempts[0].Number.Int32(), attempts[1].Number.Int32())
+	}
+}
+
 func startMigratedPostgres(t *testing.T) string {
 	t.Helper()
 
@@ -169,6 +220,12 @@ func assertStoredJob(t *testing.T, job domain.Job, submission domain.JobSubmissi
 	}
 	if job.UpdatedAt.IsZero() {
 		t.Fatal("job updated timestamp is zero")
+	}
+	if job.Result != nil {
+		t.Fatalf("queued job result = %s, want nil", job.Result.JSON())
+	}
+	if job.FinishedAt != nil {
+		t.Fatalf("queued job finish timestamp = %s, want nil", *job.FinishedAt)
 	}
 }
 

@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 var (
@@ -45,4 +46,13 @@ func ParseAttemptStatus(value string) (AttemptStatus, error) {
 	default:
 		return "", fmt.Errorf("%w: %q", ErrInvalidAttemptStatus, value)
 	}
+}
+
+type Attempt struct {
+	JobID      JobID
+	Number     AttemptNumber
+	WorkerID   WorkerID
+	Status     AttemptStatus
+	StartedAt  time.Time
+	FinishedAt *time.Time
 }

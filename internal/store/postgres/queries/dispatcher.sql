@@ -79,3 +79,38 @@ SELECT
 FROM claimed
 JOIN attempts ON attempts.job_id = claimed.id
 ORDER BY claimed.available_at, claimed.created_at;
+
+-- name: LockAttemptReport :one
+SELECT
+    jobs.status AS job_status,
+    jobs.attempt_count,
+    CAST(COALESCE(jobs.result = sqlc.arg(result_json)::jsonb, false) AS boolean) AS result_matches,
+    job_attempts.worker_id,
+    job_attempts.status AS attempt_status
+FROM jobs
+JOIN job_attempts
+  ON job_attempts.job_id = jobs.id
+ AND job_attempts.attempt_no = sqlc.arg(attempt_no)
+WHERE jobs.id = sqlc.arg(job_id)
+FOR UPDATE OF jobs, job_attempts;
+
+-- name: FinishAttemptSuccess :execrows
+UPDATE job_attempts
+SET status = 'succeeded',
+    finished_at = sqlc.arg(finished_at)
+WHERE job_id = sqlc.arg(job_id)
+  AND attempt_no = sqlc.arg(attempt_no)
+  AND worker_id = sqlc.arg(worker_id)
+  AND status = 'running';
+
+-- name: FinishJobSuccess :execrows
+UPDATE jobs
+SET status = 'succeeded',
+    result = sqlc.arg(result_json)::jsonb,
+    current_worker_id = NULL,
+    finished_at = sqlc.arg(finished_at),
+    updated_at = sqlc.arg(finished_at)
+WHERE id = sqlc.arg(job_id)
+  AND attempt_count = sqlc.arg(attempt_no)
+  AND current_worker_id = sqlc.arg(worker_id)
+  AND status = 'running';

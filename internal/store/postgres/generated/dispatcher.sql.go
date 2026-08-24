@@ -120,6 +120,113 @@ func (q *Queries) CountWorkerRunningJobs(ctx context.Context, currentWorkerID pg
 	return count, err
 }
 
+const finishAttemptSuccess = `-- name: FinishAttemptSuccess :execrows
+UPDATE job_attempts
+SET status = 'succeeded',
+    finished_at = $1
+WHERE job_id = $2
+  AND attempt_no = $3
+  AND worker_id = $4
+  AND status = 'running'
+`
+
+type FinishAttemptSuccessParams struct {
+	FinishedAt pgtype.Timestamptz
+	JobID      uuid.UUID
+	AttemptNo  int32
+	WorkerID   uuid.UUID
+}
+
+func (q *Queries) FinishAttemptSuccess(ctx context.Context, arg FinishAttemptSuccessParams) (int64, error) {
+	result, err := q.db.Exec(ctx, finishAttemptSuccess,
+		arg.FinishedAt,
+		arg.JobID,
+		arg.AttemptNo,
+		arg.WorkerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const finishJobSuccess = `-- name: FinishJobSuccess :execrows
+UPDATE jobs
+SET status = 'succeeded',
+    result = $1::jsonb,
+    current_worker_id = NULL,
+    finished_at = $2,
+    updated_at = $2
+WHERE id = $3
+  AND attempt_count = $4
+  AND current_worker_id = $5
+  AND status = 'running'
+`
+
+type FinishJobSuccessParams struct {
+	ResultJson []byte
+	FinishedAt pgtype.Timestamptz
+	JobID      uuid.UUID
+	AttemptNo  int32
+	WorkerID   pgtype.UUID
+}
+
+func (q *Queries) FinishJobSuccess(ctx context.Context, arg FinishJobSuccessParams) (int64, error) {
+	result, err := q.db.Exec(ctx, finishJobSuccess,
+		arg.ResultJson,
+		arg.FinishedAt,
+		arg.JobID,
+		arg.AttemptNo,
+		arg.WorkerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const lockAttemptReport = `-- name: LockAttemptReport :one
+SELECT
+    jobs.status AS job_status,
+    jobs.attempt_count,
+    CAST(COALESCE(jobs.result = $1::jsonb, false) AS boolean) AS result_matches,
+    job_attempts.worker_id,
+    job_attempts.status AS attempt_status
+FROM jobs
+JOIN job_attempts
+  ON job_attempts.job_id = jobs.id
+ AND job_attempts.attempt_no = $2
+WHERE jobs.id = $3
+FOR UPDATE OF jobs, job_attempts
+`
+
+type LockAttemptReportParams struct {
+	ResultJson []byte
+	AttemptNo  int32
+	JobID      uuid.UUID
+}
+
+type LockAttemptReportRow struct {
+	JobStatus     string
+	AttemptCount  int32
+	ResultMatches bool
+	WorkerID      uuid.UUID
+	AttemptStatus string
+}
+
+func (q *Queries) LockAttemptReport(ctx context.Context, arg LockAttemptReportParams) (LockAttemptReportRow, error) {
+	row := q.db.QueryRow(ctx, lockAttemptReport, arg.ResultJson, arg.AttemptNo, arg.JobID)
+	var i LockAttemptReportRow
+	err := row.Scan(
+		&i.JobStatus,
+		&i.AttemptCount,
+		&i.ResultMatches,
+		&i.WorkerID,
+		&i.AttemptStatus,
+	)
+	return i, err
+}
+
 const lockWorker = `-- name: LockWorker :one
 SELECT concurrency
 FROM workers

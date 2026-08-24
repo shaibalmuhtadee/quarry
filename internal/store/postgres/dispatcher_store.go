@@ -16,6 +16,7 @@ import (
 var (
 	ErrWorkerNotRegistered        = errors.New("worker is not registered")
 	ErrWorkerRegistrationConflict = errors.New("worker registration conflicts with the stored registration")
+	ErrAttemptReportConflict      = errors.New("attempt report conflicts with the stored attempt")
 )
 
 type WorkerRegistration struct {
@@ -132,6 +133,90 @@ func (store *DispatcherStore) AcquireJobs(
 	}
 
 	return jobs, nil
+}
+
+func (store *DispatcherStore) ReportSuccess(
+	ctx context.Context,
+	workerID domain.WorkerID,
+	jobID domain.JobID,
+	attemptNumber domain.AttemptNumber,
+	result domain.Result,
+) error {
+	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin successful attempt report: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	queries := postgresdb.New(tx)
+	report, err := queries.LockAttemptReport(ctx, postgresdb.LockAttemptReportParams{
+		ResultJson: result.JSON(),
+		AttemptNo:  attemptNumber.Int32(),
+		JobID:      jobID.UUID(),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrAttemptReportConflict
+	}
+	if err != nil {
+		return fmt.Errorf("lock successful attempt report: %w", err)
+	}
+	if report.AttemptCount != attemptNumber.Int32() || report.WorkerID != workerID.UUID() {
+		return ErrAttemptReportConflict
+	}
+
+	if report.JobStatus == string(domain.JobStatusSucceeded) {
+		if report.AttemptStatus != string(domain.AttemptStatusSucceeded) || !report.ResultMatches {
+			return ErrAttemptReportConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit repeated successful attempt report: %w", err)
+		}
+		return nil
+	}
+	if report.JobStatus != string(domain.JobStatusRunning) ||
+		report.AttemptStatus != string(domain.AttemptStatusRunning) {
+		return ErrAttemptReportConflict
+	}
+
+	finishedAt := pgtype.Timestamptz{
+		Time:  time.Now().UTC(),
+		Valid: true,
+	}
+	attemptRows, err := queries.FinishAttemptSuccess(ctx, postgresdb.FinishAttemptSuccessParams{
+		FinishedAt: finishedAt,
+		JobID:      jobID.UUID(),
+		AttemptNo:  attemptNumber.Int32(),
+		WorkerID:   workerID.UUID(),
+	})
+	if err != nil {
+		return fmt.Errorf("finish successful attempt: %w", err)
+	}
+	if attemptRows != 1 {
+		return errors.New("finish successful attempt updated an unexpected number of rows")
+	}
+
+	jobRows, err := queries.FinishJobSuccess(ctx, postgresdb.FinishJobSuccessParams{
+		ResultJson: result.JSON(),
+		FinishedAt: finishedAt,
+		JobID:      jobID.UUID(),
+		AttemptNo:  attemptNumber.Int32(),
+		WorkerID: pgtype.UUID{
+			Bytes: workerID.UUID(),
+			Valid: true,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("finish successful job: %w", err)
+	}
+	if jobRows != 1 {
+		return errors.New("finish successful job updated an unexpected number of rows")
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit successful attempt report: %w", err)
+	}
+
+	return nil
 }
 
 func mapAcquiredJob(row postgresdb.ClaimJobsRow) (AcquiredJob, error) {

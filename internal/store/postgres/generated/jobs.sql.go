@@ -22,7 +22,7 @@ INSERT INTO jobs (
     timeout_ms
 )
 VALUES ($1, $2, $3, 'queued', $4, $5)
-RETURNING id, job_type, payload, status, attempt_count, max_attempts, timeout_ms, created_at, updated_at
+RETURNING id, job_type, payload, result, status, attempt_count, max_attempts, timeout_ms, created_at, updated_at, finished_at
 `
 
 type CreateJobParams struct {
@@ -37,12 +37,14 @@ type CreateJobRow struct {
 	ID           uuid.UUID
 	JobType      string
 	Payload      []byte
+	Result       []byte
 	Status       string
 	AttemptCount int32
 	MaxAttempts  int32
 	TimeoutMs    int64
 	CreatedAt    pgtype.Timestamptz
 	UpdatedAt    pgtype.Timestamptz
+	FinishedAt   pgtype.Timestamptz
 }
 
 func (q *Queries) CreateJob(ctx context.Context, arg CreateJobParams) (CreateJobRow, error) {
@@ -58,18 +60,20 @@ func (q *Queries) CreateJob(ctx context.Context, arg CreateJobParams) (CreateJob
 		&i.ID,
 		&i.JobType,
 		&i.Payload,
+		&i.Result,
 		&i.Status,
 		&i.AttemptCount,
 		&i.MaxAttempts,
 		&i.TimeoutMs,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.FinishedAt,
 	)
 	return i, err
 }
 
 const getJob = `-- name: GetJob :one
-SELECT id, job_type, payload, status, attempt_count, max_attempts, timeout_ms, created_at, updated_at
+SELECT id, job_type, payload, result, status, attempt_count, max_attempts, timeout_ms, created_at, updated_at, finished_at
 FROM jobs
 WHERE id = $1
 `
@@ -78,12 +82,14 @@ type GetJobRow struct {
 	ID           uuid.UUID
 	JobType      string
 	Payload      []byte
+	Result       []byte
 	Status       string
 	AttemptCount int32
 	MaxAttempts  int32
 	TimeoutMs    int64
 	CreatedAt    pgtype.Timestamptz
 	UpdatedAt    pgtype.Timestamptz
+	FinishedAt   pgtype.Timestamptz
 }
 
 func (q *Queries) GetJob(ctx context.Context, id uuid.UUID) (GetJobRow, error) {
@@ -93,12 +99,64 @@ func (q *Queries) GetJob(ctx context.Context, id uuid.UUID) (GetJobRow, error) {
 		&i.ID,
 		&i.JobType,
 		&i.Payload,
+		&i.Result,
 		&i.Status,
 		&i.AttemptCount,
 		&i.MaxAttempts,
 		&i.TimeoutMs,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.FinishedAt,
 	)
 	return i, err
+}
+
+const getJobAttempts = `-- name: GetJobAttempts :many
+SELECT
+    jobs.id AS job_id,
+    job_attempts.attempt_no,
+    job_attempts.worker_id,
+    job_attempts.status,
+    job_attempts.started_at,
+    job_attempts.finished_at
+FROM jobs
+LEFT JOIN job_attempts ON job_attempts.job_id = jobs.id
+WHERE jobs.id = $1
+ORDER BY job_attempts.attempt_no
+`
+
+type GetJobAttemptsRow struct {
+	JobID      uuid.UUID
+	AttemptNo  pgtype.Int4
+	WorkerID   pgtype.UUID
+	Status     pgtype.Text
+	StartedAt  pgtype.Timestamptz
+	FinishedAt pgtype.Timestamptz
+}
+
+func (q *Queries) GetJobAttempts(ctx context.Context, id uuid.UUID) ([]GetJobAttemptsRow, error) {
+	rows, err := q.db.Query(ctx, getJobAttempts, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetJobAttemptsRow
+	for rows.Next() {
+		var i GetJobAttemptsRow
+		if err := rows.Scan(
+			&i.JobID,
+			&i.AttemptNo,
+			&i.WorkerID,
+			&i.Status,
+			&i.StartedAt,
+			&i.FinishedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
