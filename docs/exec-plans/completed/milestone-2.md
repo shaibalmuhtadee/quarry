@@ -465,7 +465,7 @@ Prove the Milestone 2 definition of done with real API, dispatcher, worker, and 
 
 ## Milestone audit
 
-Status: not started
+Status: complete
 
 After all slices pass, audit the implementation against the original Milestone 2 requirements and definition of done in `docs/project-plan.md`.
 
@@ -480,3 +480,35 @@ The audit must:
 - record decisions and deviations,
 - update `docs/current-status.md`,
 - move this plan to `docs/exec-plans/completed/milestone-2.md` only if the definition of done passes.
+
+### Audit findings
+
+- The Protocol Buffer contract defines `RegisterWorker`, `AcquireJobs`, and success-only `ReportAttempt`. It has no heartbeat or lease RPC.
+- `cmd/dispatcher` runs the gRPC server. The dispatcher service validates RPC input and delegates durable state changes to PostgreSQL.
+- `DispatcherStore.AcquireJobs` locks the registered worker row, enforces remaining worker capacity, and runs the claim in one transaction. The SQL uses `FOR UPDATE SKIP LOCKED`, moves eligible supported jobs to `running`, increments `attempt_count`, assigns the worker, and inserts one matching attempt.
+- `cmd/worker` creates a fresh worker ID for each process start. The worker registers, advertises free capacity and supported job types, polls with bounded backoff, feeds a bounded channel, and runs a fixed executor pool.
+- The worker registry contains exactly two deterministic handlers: `demo.echo` and `demo.payload_size`.
+- Successful reports preserve the worker, job, and attempt identity. PostgreSQL finishes the attempt and job atomically, stores the result, and accepts an identical repeated report.
+- `GET /v1/jobs/{id}/attempts` returns ordered attempt history. It returns an empty array for a job without attempts and `404` for a missing job.
+- Real PostgreSQL tests cover worker registration, ordering, supported-type filtering, worker capacity, concurrent claims, unique attempt creation, successful completion, report conflicts, and transaction rollback.
+- The multi-process test starts one API, one dispatcher, and two workers with concurrency two. It processes 40 jobs across both handlers, requires both workers to complete jobs, checks every result and attempt through HTTP, and checks every demonstrated job-attempt pair directly in PostgreSQL.
+- Later-milestone behavior remains absent. The implementation has no heartbeat, lease, recovery, durable retry, failure outcome, timeout enforcement, cancellation, idempotency, metrics, or tracing path. The existing `retry_wait`, `dead_lettered`, and `cancelled` job-status values predate Milestone 2 and have no Milestone 2 transitions.
+
+### Defects and omissions fixed during the audit
+
+- No Milestone 2 execution defect was found.
+- `distributed-test` checked attempt persistence only through HTTP. The audit added a direct PostgreSQL assertion for every demonstrated job and attempt, then updated the README description.
+
+### Audit validation result
+
+- `go test -count=1 -p=1 -run '^(TestConcurrentAcquireJobsThroughGRPCAndPostgres|TestDispatcherStoreConcurrentClaimersCreateOneAttemptPerJob|TestDispatcherStoreEnforcesConcurrencyAcrossConcurrentAcquisitions)$' ./internal/dispatcher ./internal/store/postgres` passed. The tests exercised 100 jobs, eight concurrent workers, concurrent gRPC acquisition calls, one unique attempt per job, and per-worker capacity enforcement.
+- The Windows host had `CGO_ENABLED=0` and no C compiler, so the host race command could not start. `docker run --rm --volume "C:\Users\shai\Documents\Code\quarry:/src" --workdir /src golang:1.27.0-bookworm go test -race -count=1 ./internal/worker/... ./cmd/worker` passed.
+- `pwsh ./scripts/dev.ps1 distributed-test` passed. It processed 40 jobs with two worker processes at concurrency two and directly verified all 40 job-attempt pairs in PostgreSQL.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned tools, generated-code checks, vet, all uncached tests, builds, Compose rendering, migrations, the API smoke path, and another enhanced distributed process test.
+- Both successful distributed runs removed their isolated processes, containers, networks, and PostgreSQL volumes. A direct Docker inspection found no remaining `quarry-m2-*` containers or volumes.
+- `git diff --check` passed before the completion-document updates and after the plan move.
+- GitHub-hosted CI did not run. The audit claims local validation only.
+
+### Audit decision
+
+Milestone 2 satisfies every build item, required concurrency behavior, highest-priority test, and definition-of-done statement in `docs/project-plan.md`. No architecture deviation was required. Milestone 3 remains unstarted.

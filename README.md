@@ -103,7 +103,7 @@ Run the distributed process test by itself:
 pwsh ./scripts/dev.ps1 distributed-test
 ```
 
-The distributed test builds temporary binaries and starts an isolated PostgreSQL database, one API process, one dispatcher process, and two worker processes with concurrency two. It submits 40 jobs across both demonstration handlers, waits for every job to succeed, checks every result and attempt through HTTP, and requires both workers to complete work. The test removes its processes, binaries, Compose volume, and network before it exits.
+The distributed test builds temporary binaries and starts an isolated PostgreSQL database, one API process, one dispatcher process, and two worker processes with concurrency two. It submits 40 jobs across both demonstration handlers, waits for every job to succeed, checks every result and attempt through HTTP and directly in PostgreSQL, and requires both workers to complete work. The test removes its processes, binaries, Compose volume, and network before it exits.
 
 Run the HTTP smoke test by itself:
 

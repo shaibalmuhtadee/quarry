@@ -640,6 +640,89 @@ function Wait-DistributedJobs {
     }
 }
 
+function Assert-DistributedPostgresState {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Jobs,
+
+        [Parameter(Mandatory)]
+        [string[]]$WorkerIDs
+    )
+
+    $expectedJobs = @{}
+    $quotedJobIDs = foreach ($job in $Jobs) {
+        if ($job.id -notmatch '^[0-9a-f-]{36}$') {
+            throw "Distributed job has invalid ID '$($job.id)'."
+        }
+        $expectedJobs[$job.id] = $true
+        "'$($job.id)'::uuid"
+    }
+    $expectedWorkers = @{}
+    foreach ($workerID in $WorkerIDs) {
+        if ($workerID -notmatch '^[0-9a-f-]{36}$') {
+            throw "Distributed worker has invalid ID '$workerID'."
+        }
+        $expectedWorkers[$workerID] = $true
+    }
+
+    $query = @"
+SELECT
+    jobs.id::text,
+    jobs.status,
+    jobs.attempt_count,
+    jobs.current_worker_id IS NULL,
+    jobs.result IS NOT NULL,
+    jobs.finished_at IS NOT NULL,
+    job_attempts.attempt_no,
+    job_attempts.worker_id::text,
+    job_attempts.status,
+    job_attempts.finished_at IS NOT NULL,
+    jobs.finished_at = job_attempts.finished_at
+FROM jobs
+JOIN job_attempts ON job_attempts.job_id = jobs.id
+WHERE jobs.id IN ($($quotedJobIDs -join ','))
+ORDER BY jobs.id, job_attempts.attempt_no;
+"@
+    $rows = @(
+        Invoke-PostgresRows -Query $query |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -match '\|' }
+    )
+    if ($rows.Count -ne $Jobs.Count) {
+        throw "PostgreSQL returned $($rows.Count) job-attempt rows, expected $($Jobs.Count)."
+    }
+
+    $inspectedJobs = @{}
+    foreach ($row in $rows) {
+        $columns = $row.Split('|')
+        if ($columns.Count -ne 11) {
+            throw "PostgreSQL returned an unexpected distributed job-attempt row: '$row'."
+        }
+
+        $jobID = $columns[0]
+        $workerID = $columns[7]
+        if (-not $expectedJobs.ContainsKey($jobID) -or $inspectedJobs.ContainsKey($jobID)) {
+            throw "PostgreSQL returned a missing, duplicate, or unexpected job-attempt row for '$jobID'."
+        }
+        if (-not $expectedWorkers.ContainsKey($workerID)) {
+            throw "PostgreSQL assigned job '$jobID' to unexpected worker '$workerID'."
+        }
+        if ($columns[1] -ne 'succeeded' -or $columns[2] -ne '1' -or
+            $columns[3] -ne 't' -or $columns[4] -ne 't' -or $columns[5] -ne 't' -or
+            $columns[6] -ne '1' -or $columns[8] -ne 'succeeded' -or
+            $columns[9] -ne 't' -or $columns[10] -ne 't') {
+            throw "PostgreSQL stored invalid completed state for distributed job '$jobID': '$row'."
+        }
+        $inspectedJobs[$jobID] = $true
+    }
+
+    foreach ($jobID in $expectedJobs.Keys) {
+        if (-not $inspectedJobs.ContainsKey($jobID)) {
+            throw "PostgreSQL did not return distributed job '$jobID' with one completed attempt."
+        }
+    }
+}
+
 function Remove-DistributedTestDirectory {
     param(
         [Parameter(Mandatory)]
@@ -723,7 +806,8 @@ function Test-DistributedProcesses {
             -Jobs $jobs `
             -WorkerIDs $workerIDs `
             -Processes $allProcesses
-        Write-Host "Distributed test passed: $($jobs.Count) jobs, $($workerIDs.Count) workers, concurrency 2."
+        Assert-DistributedPostgresState -Jobs $jobs -WorkerIDs $workerIDs
+        Write-Host "Distributed test passed: $($jobs.Count) jobs, $($workerIDs.Count) workers, concurrency 2, PostgreSQL state verified."
     }
     finally {
         try {
