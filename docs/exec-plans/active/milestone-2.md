@@ -241,7 +241,7 @@ Complete the successful execution transition and expose attempt history through 
 
 ## Slice 4: dispatcher gRPC service and process
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -293,11 +293,28 @@ Expose dispatcher persistence through a runnable, stateless gRPC process.
 
 ### Decisions and deviations discovered during implementation
 
-- None yet.
+- `internal/dispatcher.Service` is a stateless gRPC adapter over the PostgreSQL dispatcher store. A private store interface provides the test seam; the service keeps no authoritative worker, job, or attempt state in memory.
+- Each RPC validates and converts Protocol Buffer values at the network boundary. The store receives domain IDs, job types, payloads, results, attempt numbers, and process metadata rather than Protocol Buffer messages.
+- Invalid requests return `InvalidArgument`. Conflicting worker registration returns `AlreadyExists`. Acquisition by an unregistered worker and mismatched attempt reports return `FailedPrecondition`. Wrapped context cancellation and deadline errors retain `Canceled` and `DeadlineExceeded`; other store errors return a generic `Internal` message.
+- `AcquireJobs` returns stored job IDs, attempt numbers, types, JSON payloads, and execution timeouts. `ReportAttempt` accepts only the successful outcome defined for Milestone 2.
+- `cmd/dispatcher` listens on plaintext gRPC at `localhost:9090` by default. `QUARRY_DISPATCHER_ADDR` and `QUARRY_DATABASE_URL` override the listener and PostgreSQL addresses.
+- Process cancellation starts `GracefulStop`. The process waits up to ten seconds before calling `Stop`, then waits for `Serve` to exit and closes the PostgreSQL pool.
+- No architecture deviation was required. Slice 4 added no worker polling, execution handlers, heartbeat, lease, recovery, retry, failure outcome, cancellation, metrics, or tracing behavior.
 
 ### Validation result
 
-- Not run yet.
+- RPC unit tests passed valid conversions and rejected malformed worker IDs, job IDs, timestamps, concurrency, capacity, job types, attempt numbers, outcomes, and JSON results before calling the store.
+- Status-code tests passed `InvalidArgument`, `AlreadyExists`, `FailedPrecondition`, `DeadlineExceeded`, and generic `Internal` mappings without exposing store errors.
+- `TestConcurrentAcquireJobsThroughGRPCAndPostgres` ran a gRPC server against fresh PostgreSQL 18.6. Eight registered workers issued concurrent acquisition RPCs, claimed 100 unique jobs, and created 100 attempts. The test completed one claimed attempt through `ReportAttempt` and read its successful state from PostgreSQL.
+- Dispatcher process tests passed default and overridden configuration, listener startup, cancellation-driven shutdown, listener closure, and expected `Serve` error handling.
+- `go test -count=1 ./internal/dispatcher ./cmd/dispatcher` passed.
+- `go test -count=1 ./internal/store/postgres/...` passed the unchanged PostgreSQL store and migration suites.
+- `go vet ./internal/dispatcher ./cmd/dispatcher` passed.
+- `pwsh ./scripts/dev.ps1 generate-check` passed sqlc and Protocol Buffer generated-code verification.
+- `pwsh ./scripts/dev.ps1 build` passed, including the new dispatcher binary.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned tool checks, generated-code checks, vet, all uncached tests, builds, Compose rendering, PostgreSQL integration tests, and the real API HTTP smoke test.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
 
 ## Slice 5: bounded worker and demonstration handlers
 
