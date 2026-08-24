@@ -397,7 +397,7 @@ Build a worker process that registers, pulls supported jobs based on free capaci
 
 ## Slice 6: distributed process acceptance test and developer flow
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -446,11 +446,22 @@ Prove the Milestone 2 definition of done with real API, dispatcher, worker, and 
 
 ### Decisions and deviations discovered during implementation
 
-- None yet.
+- `pwsh ./scripts/dev.ps1 distributed-test` builds temporary API, dispatcher, and worker binaries. It starts an isolated Compose project on an available PostgreSQL port, applies every migration, and starts one API, one dispatcher, and two workers with concurrency two.
+- The test queues 40 jobs before starting the workers. Half use `demo.echo`, and half use `demo.payload_size`. Starting both workers against one existing backlog avoids an idle-poll timing bias and gives both processes concurrent claim opportunities.
+- The first implementation started idle workers before submitting jobs. One worker woke first and completed all 40 short handlers before the second worker's next poll, so the test correctly failed its two-worker assertion. Queuing the batch first removed that test-design race without adding production delays or test-only handler behavior.
+- The test waits for both worker registrations in PostgreSQL, then treats the HTTP API as the verification boundary for job state, handler results, and attempt history. Every demonstrated job must have one finished successful attempt from one of the two current worker IDs, and both worker IDs must appear in the batch.
+- Every readiness wait, HTTP request, and batch poll has a deadline. Cleanup stops all child processes even if one stop fails, removes only the unique Compose volume and network created for the run, deletes only the unique temporary binary directory, and restores the caller's Compose project and PostgreSQL port environment variables.
+- On Unix, cleanup first sends `SIGTERM` and then uses a process-tree kill as a bounded fallback. On Windows, where these detached test processes cannot receive a console control event through `System.Diagnostics.Process`, cleanup uses the process-tree kill directly.
+- The canonical `check` command now runs the distributed process test after the existing HTTP smoke test. `README.md` documents how to run the three processes, supported handlers, process configuration, the distributed test, and current Milestone 2 limits.
+- No architecture deviation was required. The test uses PostgreSQL as the only queue and adds no lease, heartbeat, recovery, retry, cancellation, timeout enforcement, or observability behavior.
 
 ### Validation result
 
-- Not run yet.
+- The corrected `pwsh ./scripts/dev.ps1 distributed-test` passed twice as a standalone command. Each run started two workers with concurrency two, processed 40 jobs across both handlers, verified every result and single successful attempt through HTTP, and confirmed work from both worker identities.
+- `pwsh ./scripts/dev.ps1 check` passed twice after the distributed path was added. The final run passed module consistency, formatting, pinned tool checks, generated-code checks, vet, all uncached tests, builds, Compose rendering, the HTTP smoke test, and the distributed process test.
+- All successful distributed runs removed their temporary binaries, child processes, isolated containers, network, and PostgreSQL volume. A direct Docker inspection found no leftover `quarry-m2-*` containers or volumes before the final check.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
 
 ## Milestone audit
 
