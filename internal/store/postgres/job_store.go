@@ -38,12 +38,14 @@ func (store *JobStore) CreateJob(ctx context.Context, submission domain.JobSubmi
 		id:           row.ID,
 		jobType:      row.JobType,
 		payload:      row.Payload,
+		result:       row.Result,
 		status:       row.Status,
 		attemptCount: row.AttemptCount,
 		maxAttempts:  row.MaxAttempts,
 		timeoutMS:    row.TimeoutMs,
 		createdAt:    row.CreatedAt,
 		updatedAt:    row.UpdatedAt,
+		finishedAt:   row.FinishedAt,
 	})
 	if err != nil {
 		return domain.Job{}, fmt.Errorf("map created job: %w", err)
@@ -65,12 +67,14 @@ func (store *JobStore) GetJob(ctx context.Context, id domain.JobID) (domain.Job,
 		id:           row.ID,
 		jobType:      row.JobType,
 		payload:      row.Payload,
+		result:       row.Result,
 		status:       row.Status,
 		attemptCount: row.AttemptCount,
 		maxAttempts:  row.MaxAttempts,
 		timeoutMS:    row.TimeoutMs,
 		createdAt:    row.CreatedAt,
 		updatedAt:    row.UpdatedAt,
+		finishedAt:   row.FinishedAt,
 	})
 	if err != nil {
 		return domain.Job{}, fmt.Errorf("map stored job: %w", err)
@@ -79,16 +83,42 @@ func (store *JobStore) GetJob(ctx context.Context, id domain.JobID) (domain.Job,
 	return job, nil
 }
 
+func (store *JobStore) ListJobAttempts(ctx context.Context, id domain.JobID) ([]domain.Attempt, error) {
+	rows, err := store.queries.GetJobAttempts(ctx, id.UUID())
+	if err != nil {
+		return nil, fmt.Errorf("get job attempts: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, domain.ErrJobNotFound
+	}
+	if !rows[0].AttemptNo.Valid {
+		return []domain.Attempt{}, nil
+	}
+
+	attempts := make([]domain.Attempt, 0, len(rows))
+	for _, row := range rows {
+		attempt, err := mapAttempt(row)
+		if err != nil {
+			return nil, fmt.Errorf("map stored attempt: %w", err)
+		}
+		attempts = append(attempts, attempt)
+	}
+
+	return attempts, nil
+}
+
 type jobRecord struct {
 	id           uuid.UUID
 	jobType      string
 	payload      []byte
+	result       []byte
 	status       string
 	attemptCount int32
 	maxAttempts  int32
 	timeoutMS    int64
 	createdAt    pgtype.Timestamptz
 	updatedAt    pgtype.Timestamptz
+	finishedAt   pgtype.Timestamptz
 }
 
 func mapJob(record jobRecord) (domain.Job, error) {
@@ -111,16 +141,65 @@ func mapJob(record jobRecord) (domain.Job, error) {
 	if !record.createdAt.Valid || !record.updatedAt.Valid {
 		return domain.Job{}, errors.New("job timestamps are null")
 	}
+	var result *domain.Result
+	if record.result != nil {
+		parsedResult, err := domain.ParseResult(record.result)
+		if err != nil {
+			return domain.Job{}, err
+		}
+		result = &parsedResult
+	}
+	var finishedAt *time.Time
+	if record.finishedAt.Valid {
+		finishedAt = &record.finishedAt.Time
+	}
 
 	return domain.Job{
 		ID:           id,
 		Type:         jobType,
 		Payload:      payload,
+		Result:       result,
 		Status:       status,
 		AttemptCount: record.attemptCount,
 		MaxAttempts:  record.maxAttempts,
 		Timeout:      time.Duration(record.timeoutMS) * time.Millisecond,
 		CreatedAt:    record.createdAt.Time,
 		UpdatedAt:    record.updatedAt.Time,
+		FinishedAt:   finishedAt,
+	}, nil
+}
+
+func mapAttempt(row postgresdb.GetJobAttemptsRow) (domain.Attempt, error) {
+	jobID, err := domain.ParseJobID(row.JobID.String())
+	if err != nil {
+		return domain.Attempt{}, err
+	}
+	if !row.AttemptNo.Valid || !row.WorkerID.Valid || !row.Status.Valid || !row.StartedAt.Valid {
+		return domain.Attempt{}, errors.New("attempt has null required fields")
+	}
+	number, err := domain.NewAttemptNumber(row.AttemptNo.Int32)
+	if err != nil {
+		return domain.Attempt{}, err
+	}
+	workerID, err := domain.ParseWorkerID(uuid.UUID(row.WorkerID.Bytes).String())
+	if err != nil {
+		return domain.Attempt{}, err
+	}
+	status, err := domain.ParseAttemptStatus(row.Status.String)
+	if err != nil {
+		return domain.Attempt{}, err
+	}
+	var finishedAt *time.Time
+	if row.FinishedAt.Valid {
+		finishedAt = &row.FinishedAt.Time
+	}
+
+	return domain.Attempt{
+		JobID:      jobID,
+		Number:     number,
+		WorkerID:   workerID,
+		Status:     status,
+		StartedAt:  row.StartedAt.Time,
+		FinishedAt: finishedAt,
 	}, nil
 }

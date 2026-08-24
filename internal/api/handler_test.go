@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -18,8 +19,9 @@ import (
 )
 
 type fakeJobStore struct {
-	createJob func(context.Context, domain.JobSubmission) (domain.Job, error)
-	getJob    func(context.Context, domain.JobID) (domain.Job, error)
+	createJob       func(context.Context, domain.JobSubmission) (domain.Job, error)
+	getJob          func(context.Context, domain.JobID) (domain.Job, error)
+	listJobAttempts func(context.Context, domain.JobID) ([]domain.Attempt, error)
 }
 
 func (store *fakeJobStore) CreateJob(ctx context.Context, submission domain.JobSubmission) (domain.Job, error) {
@@ -28,6 +30,10 @@ func (store *fakeJobStore) CreateJob(ctx context.Context, submission domain.JobS
 
 func (store *fakeJobStore) GetJob(ctx context.Context, id domain.JobID) (domain.Job, error) {
 	return store.getJob(ctx, id)
+}
+
+func (store *fakeJobStore) ListJobAttempts(ctx context.Context, id domain.JobID) ([]domain.Attempt, error) {
+	return store.listJobAttempts(ctx, id)
 }
 
 type readinessCheckerFunc func(context.Context) error
@@ -236,8 +242,207 @@ func TestGetJobReturnsStoredStateWithoutPayload(t *testing.T) {
 	assertJSONField(t, fields, "attempt_count", job.AttemptCount)
 	assertJSONField(t, fields, "max_attempts", job.MaxAttempts)
 	assertJSONField(t, fields, "timeout_ms", job.Timeout.Milliseconds())
+	if got := string(fields["result"]); got != "null" {
+		t.Fatalf("response result = %s, want null", got)
+	}
 	assertJSONField(t, fields, "created_at", job.CreatedAt.Format(time.RFC3339Nano))
 	assertJSONField(t, fields, "updated_at", job.UpdatedAt.Format(time.RFC3339Nano))
+	if got := string(fields["finished_at"]); got != "null" {
+		t.Fatalf("response finish time = %s, want null", got)
+	}
+}
+
+func TestGetJobReturnsSuccessfulResult(t *testing.T) {
+	job := testJob(t)
+	result, err := domain.ParseResult(json.RawMessage(`{"echo":{"message":"done"}}`))
+	if err != nil {
+		t.Fatalf("parse test result: %v", err)
+	}
+	finishedAt := job.UpdatedAt.Add(time.Second)
+	job.Result = &result
+	job.Status = domain.JobStatusSucceeded
+	job.AttemptCount = 1
+	job.FinishedAt = &finishedAt
+	store := &fakeJobStore{
+		getJob: func(context.Context, domain.JobID) (domain.Job, error) {
+			return job, nil
+		},
+	}
+	handler := newTestHandler(store)
+	request := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+job.ID.String(), nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("response status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var fields map[string]json.RawMessage
+	decodeJSONResponse(t, response, &fields)
+	var gotResult map[string]any
+	if err := json.Unmarshal(fields["result"], &gotResult); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	wantResult := map[string]any{"echo": map[string]any{"message": "done"}}
+	if !reflect.DeepEqual(gotResult, wantResult) {
+		t.Fatalf("result = %#v, want %#v", gotResult, wantResult)
+	}
+	assertJSONField(t, fields, "finished_at", finishedAt.Format(time.RFC3339Nano))
+}
+
+func TestGetJobAttemptsReturnsEmptyArray(t *testing.T) {
+	id := domain.NewJobID()
+	store := &fakeJobStore{
+		listJobAttempts: func(_ context.Context, gotID domain.JobID) ([]domain.Attempt, error) {
+			if gotID != id {
+				t.Fatalf("store job ID = %s, want %s", gotID, id)
+			}
+			return []domain.Attempt{}, nil
+		},
+	}
+	handler := newTestHandler(store)
+	request := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+id.String()+"/attempts", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("response status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var body struct {
+		Attempts []json.RawMessage `json:"attempts"`
+	}
+	decodeJSONResponse(t, response, &body)
+	if body.Attempts == nil || len(body.Attempts) != 0 {
+		t.Fatalf("attempts = %#v, want empty array", body.Attempts)
+	}
+}
+
+func TestGetJobAttemptsReturnsAttemptsInStoreOrder(t *testing.T) {
+	id := domain.NewJobID()
+	workerID := domain.NewWorkerID()
+	firstNumber, err := domain.NewAttemptNumber(1)
+	if err != nil {
+		t.Fatalf("create first attempt number: %v", err)
+	}
+	secondNumber, err := domain.NewAttemptNumber(2)
+	if err != nil {
+		t.Fatalf("create second attempt number: %v", err)
+	}
+	firstStartedAt := time.Date(2026, time.August, 24, 12, 0, 0, 0, time.UTC)
+	firstFinishedAt := firstStartedAt.Add(time.Second)
+	secondStartedAt := firstFinishedAt.Add(time.Second)
+	secondFinishedAt := secondStartedAt.Add(time.Second)
+	store := &fakeJobStore{
+		listJobAttempts: func(context.Context, domain.JobID) ([]domain.Attempt, error) {
+			return []domain.Attempt{
+				{
+					JobID:      id,
+					Number:     firstNumber,
+					WorkerID:   workerID,
+					Status:     domain.AttemptStatusSucceeded,
+					StartedAt:  firstStartedAt,
+					FinishedAt: &firstFinishedAt,
+				},
+				{
+					JobID:      id,
+					Number:     secondNumber,
+					WorkerID:   workerID,
+					Status:     domain.AttemptStatusSucceeded,
+					StartedAt:  secondStartedAt,
+					FinishedAt: &secondFinishedAt,
+				},
+			}, nil
+		},
+	}
+	handler := newTestHandler(store)
+	request := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+id.String()+"/attempts", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("response status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var body struct {
+		Attempts []struct {
+			Number     int32                `json:"attempt_no"`
+			WorkerID   string               `json:"worker_id"`
+			Status     domain.AttemptStatus `json:"status"`
+			StartedAt  time.Time            `json:"started_at"`
+			FinishedAt *time.Time           `json:"finished_at"`
+		} `json:"attempts"`
+	}
+	decodeJSONResponse(t, response, &body)
+	if len(body.Attempts) != 2 {
+		t.Fatalf("attempt count = %d, want 2", len(body.Attempts))
+	}
+	if body.Attempts[0].Number != 1 || body.Attempts[1].Number != 2 {
+		t.Fatalf("attempt order = [%d, %d], want [1, 2]", body.Attempts[0].Number, body.Attempts[1].Number)
+	}
+	for i, attempt := range body.Attempts {
+		if attempt.WorkerID != workerID.String() || attempt.Status != domain.AttemptStatusSucceeded {
+			t.Fatalf("attempt %d identity or status = (%q, %q)", i, attempt.WorkerID, attempt.Status)
+		}
+		if attempt.FinishedAt == nil {
+			t.Fatalf("attempt %d has null finish time", i)
+		}
+	}
+}
+
+func TestGetJobAttemptsReturnsNotFound(t *testing.T) {
+	id := domain.NewJobID()
+	store := &fakeJobStore{
+		listJobAttempts: func(context.Context, domain.JobID) ([]domain.Attempt, error) {
+			return nil, fmt.Errorf("lookup failed: %w", domain.ErrJobNotFound)
+		},
+	}
+	handler := newTestHandler(store)
+	request := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+id.String()+"/attempts", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	assertErrorResponse(t, response, http.StatusNotFound, "job_not_found")
+}
+
+func TestGetJobAttemptsRejectsMalformedID(t *testing.T) {
+	listCalls := 0
+	store := &fakeJobStore{
+		listJobAttempts: func(context.Context, domain.JobID) ([]domain.Attempt, error) {
+			listCalls++
+			return nil, errors.New("unexpected store call")
+		},
+	}
+	handler := newTestHandler(store)
+	request := httptest.NewRequest(http.MethodGet, "/v1/jobs/not-a-uuid/attempts", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	assertErrorResponse(t, response, http.StatusBadRequest, "invalid_job_id")
+	if listCalls != 0 {
+		t.Fatalf("store list calls = %d, want 0", listCalls)
+	}
+}
+
+func TestGetJobAttemptsReturnsGenericInternalError(t *testing.T) {
+	id := domain.NewJobID()
+	store := &fakeJobStore{
+		listJobAttempts: func(context.Context, domain.JobID) ([]domain.Attempt, error) {
+			return nil, errors.New("database password secret")
+		},
+	}
+	handler := newTestHandler(store)
+	request := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+id.String()+"/attempts", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	assertErrorResponse(t, response, http.StatusInternalServerError, "internal_error")
+	if strings.Contains(response.Body.String(), "database password secret") {
+		t.Fatal("response exposed the internal store error")
+	}
 }
 
 func TestGetJobRejectsMalformedID(t *testing.T) {

@@ -1,8 +1,8 @@
 # Quarry
 
-Quarry is a distributed job execution system written in Go. The current implementation provides a durable HTTP control plane backed by PostgreSQL. It accepts jobs and retrieves their queued state.
+Quarry is a distributed job execution system written in Go. PostgreSQL stores jobs and attempts, the HTTP API accepts and reads jobs, the gRPC dispatcher claims work, and bounded worker processes run registered handlers.
 
-The dispatcher and workers are not implemented yet. Submitted jobs remain queued and are not executed.
+The current successful path provides at-least-once execution without crash recovery. A worker crash after acquisition can leave a job in `running` until Milestone 3 adds leases and recovery.
 
 ## Requirements
 
@@ -14,21 +14,28 @@ Install these tools before you run the repository:
 
 You do not need a host PostgreSQL installation. Go runs the pinned Goose and sqlc versions from `go.mod`.
 
-## Run the API locally
+## Run Quarry locally
 
-Start PostgreSQL, apply the migrations, and run the API from the repository root:
+Start PostgreSQL and apply the migrations from the repository root:
 
 ```powershell
 pwsh ./scripts/dev.ps1 db-up
 pwsh ./scripts/dev.ps1 migrate-up
-go run ./cmd/api
 ```
 
-The API listens on `:8080` by default. In another terminal, submit and retrieve a job:
+Run the API, dispatcher, and at least one worker in separate terminals:
+
+```powershell
+go run ./cmd/api
+go run ./cmd/dispatcher
+go run ./cmd/worker
+```
+
+The API listens on `:8080`, and the dispatcher listens on `localhost:9090`. Submit a supported job from another terminal:
 
 ```powershell
 $body = @{
-    type = "example"
+    type = "demo.echo"
     payload = @{ message = "hello" }
     max_attempts = 3
     timeout_ms = 30000
@@ -41,8 +48,16 @@ $job = Invoke-RestMethod `
     -Body $body
 
 $job
-Invoke-RestMethod -Uri "http://localhost:8080/v1/jobs/$($job.id)"
+do {
+    Start-Sleep -Milliseconds 100
+    $state = Invoke-RestMethod -Uri "http://localhost:8080/v1/jobs/$($job.id)"
+} while ($state.status -ne "succeeded")
+
+$state
+Invoke-RestMethod -Uri "http://localhost:8080/v1/jobs/$($job.id)/attempts"
 ```
+
+Workers also register `demo.payload_size`. It returns the number of bytes in the JSON value received from the dispatcher.
 
 The API also exposes liveness and readiness endpoints:
 
@@ -61,10 +76,14 @@ The development PostgreSQL volume is retained across `db-down` and `db-up`.
 
 ## Configuration
 
-The API accepts these environment variables:
+The processes accept these environment variables:
 
 - `QUARRY_DATABASE_URL`: PostgreSQL connection string. The default connects to the development database on port 5432.
 - `QUARRY_HTTP_ADDR`: HTTP listen address. The default is `:8080`.
+- `QUARRY_DISPATCHER_ADDR`: dispatcher gRPC listen address for the dispatcher and target address for workers. The default is `localhost:9090`.
+- `QUARRY_WORKER_CONCURRENCY`: positive worker executor count. The default is `4`.
+- `QUARRY_WORKER_HOSTNAME`: worker registration hostname. The default is the operating-system hostname.
+- `QUARRY_WORKER_VERSION`: worker registration version. The default is `dev`.
 
 The development script also accepts `QUARRY_POSTGRES_PORT` to change the host port used by Docker Compose and migration commands. Set `QUARRY_DATABASE_URL` to the matching port when you run the API.
 
@@ -76,7 +95,15 @@ Run the complete local validation:
 pwsh ./scripts/dev.ps1 check
 ```
 
-This checks formatting, dependencies, pinned tools, generated sqlc code, static analysis, tests, builds, and the Compose configuration. It also runs an HTTP smoke test against the Compose PostgreSQL service.
+This checks formatting, dependencies, pinned tools, generated code, static analysis, tests, builds, and the Compose configuration. It runs both the HTTP smoke test and the distributed process test against PostgreSQL.
+
+Run the distributed process test by itself:
+
+```powershell
+pwsh ./scripts/dev.ps1 distributed-test
+```
+
+The distributed test builds temporary binaries and starts an isolated PostgreSQL database, one API process, one dispatcher process, and two worker processes with concurrency two. It submits 40 jobs across both demonstration handlers, waits for every job to succeed, checks every result and attempt through HTTP and directly in PostgreSQL, and requires both workers to complete work. The test removes its processes, binaries, Compose volume, and network before it exits.
 
 Run the HTTP smoke test by itself:
 
@@ -105,4 +132,4 @@ pwsh ./scripts/dev.ps1 generate-check
 
 ## Current limits
 
-Quarry does not yet dispatch or execute jobs. It also does not yet provide retries, leases, cancellation, idempotent submission, metrics, or tracing. These capabilities belong to later milestones.
+Quarry does not yet recover jobs after worker crashes. It also does not yet provide failure outcomes, durable retries, timeout enforcement, panic recovery, cancellation, idempotent submission, metrics, or tracing. These capabilities belong to later milestones.

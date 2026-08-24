@@ -89,7 +89,7 @@ func applyMigrations(t *testing.T, ctx context.Context, db *sql.DB, directory st
 	if err := goose.UpContext(ctx, db, directory); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
-	verifyVersion(t, ctx, db, 2)
+	verifyVersion(t, ctx, db, 3)
 }
 
 func verifyVersion(t *testing.T, ctx context.Context, db *sql.DB, want int64) {
@@ -107,7 +107,7 @@ func verifyVersion(t *testing.T, ctx context.Context, db *sql.DB, want int64) {
 func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 	t.Helper()
 
-	for _, table := range []string{"jobs", "job_attempts"} {
+	for _, table := range []string{"jobs", "job_attempts", "workers"} {
 		var exists bool
 		if err := db.QueryRowContext(ctx, `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
 			t.Fatalf("check table %q: %v", table, err)
@@ -118,6 +118,13 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 	}
 
 	const jobID = "00000000-0000-0000-0000-000000000001"
+	const workerID = "00000000-0000-0000-0000-000000000010"
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO workers (id, hostname, version, concurrency, started_at)
+		VALUES ($1, 'worker-a', 'test', 4, now())
+	`, workerID); err != nil {
+		t.Fatalf("insert valid worker: %v", err)
+	}
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
 		VALUES ($1, 'test', '{}', 'queued', 3, 30000)
@@ -125,11 +132,24 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 		t.Fatalf("insert valid job: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, `
-		INSERT INTO job_attempts (job_id, attempt_no, status, started_at)
-		VALUES ($1, 1, 'running', now())
-	`, jobID); err != nil {
+		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)
+		VALUES ($1, 1, $2, 'running', now())
+	`, jobID, workerID); err != nil {
 		t.Fatalf("insert valid attempt: %v", err)
 	}
+
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO workers (id, hostname, version, concurrency, started_at)
+		VALUES ('00000000-0000-0000-0000-000000000011', '', 'test', 4, now())
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO workers (id, hostname, version, concurrency, started_at)
+		VALUES ('00000000-0000-0000-0000-000000000012', 'worker-b', '', 4, now())
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO workers (id, hostname, version, concurrency, started_at)
+		VALUES ('00000000-0000-0000-0000-000000000013', 'worker-c', 'test', 0, now())
+	`)
 
 	expectConstraintError(t, ctx, db, "23514", `
 		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
@@ -168,24 +188,28 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 		VALUES ('00000000-0000-0000-0000-000000000009', 'test', '{}', 'queued', 3, 9223372036855)
 	`)
 	expectConstraintError(t, ctx, db, "23514", `
-		INSERT INTO job_attempts (job_id, attempt_no, status, started_at)
-		VALUES ('00000000-0000-0000-0000-000000000001', 0, 'running', now())
+		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)
+		VALUES ('00000000-0000-0000-0000-000000000001', 0, '00000000-0000-0000-0000-000000000010', 'running', now())
 	`)
 	expectConstraintError(t, ctx, db, "23514", `
-		INSERT INTO job_attempts (job_id, attempt_no, status, started_at)
-		VALUES ('00000000-0000-0000-0000-000000000001', 2, '', now())
+		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)
+		VALUES ('00000000-0000-0000-0000-000000000001', 2, '00000000-0000-0000-0000-000000000010', '', now())
 	`)
 	expectConstraintError(t, ctx, db, "23502", `
-		INSERT INTO job_attempts (job_id, attempt_no, status, started_at)
-		VALUES ('00000000-0000-0000-0000-000000000001', 2, 'running', NULL)
+		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)
+		VALUES ('00000000-0000-0000-0000-000000000001', 2, '00000000-0000-0000-0000-000000000010', 'running', NULL)
 	`)
 	expectConstraintError(t, ctx, db, "23505", `
-		INSERT INTO job_attempts (job_id, attempt_no, status, started_at)
-		VALUES ('00000000-0000-0000-0000-000000000001', 1, 'running', now())
+		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)
+		VALUES ('00000000-0000-0000-0000-000000000001', 1, '00000000-0000-0000-0000-000000000010', 'running', now())
 	`)
 	expectConstraintError(t, ctx, db, "23503", `
-		INSERT INTO job_attempts (job_id, attempt_no, status, started_at)
-		VALUES ('00000000-0000-0000-0000-000000000099', 1, 'running', now())
+		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)
+		VALUES ('00000000-0000-0000-0000-000000000099', 1, '00000000-0000-0000-0000-000000000010', 'running', now())
+	`)
+	expectConstraintError(t, ctx, db, "23503", `
+		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)
+		VALUES ('00000000-0000-0000-0000-000000000001', 2, '00000000-0000-0000-0000-000000000099', 'running', now())
 	`)
 }
 
@@ -215,7 +239,7 @@ func expectConstraintError(
 func verifyTablesAbsent(t *testing.T, ctx context.Context, db *sql.DB) {
 	t.Helper()
 
-	for _, table := range []string{"jobs", "job_attempts"} {
+	for _, table := range []string{"jobs", "job_attempts", "workers"} {
 		var exists bool
 		if err := db.QueryRowContext(ctx, `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
 			t.Fatalf("check dropped table %q: %v", table, err)
