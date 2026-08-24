@@ -1,0 +1,13 @@
+version: v2
+clean: true
+plugins:
+  - remote: buf.build/protocolbuffers/go:v1.36.11
+    out: internal/rpc/generated
+    opt:
+      - module=github.com/shaibalmuhtadee/quarry/internal/rpc/generated
+  - remote: buf.build/grpc/go:v1.5.1
+    out: internal/rpc/generated
+    opt:
+      - module=github.com/shaibalmuhtadee/quarry/internal/rpc/generated
+inputs:
+  - directory: proto

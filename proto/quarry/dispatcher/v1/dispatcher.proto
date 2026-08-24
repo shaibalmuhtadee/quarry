@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package quarry.dispatcher.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1;dispatcherv1";
+
+// DispatcherService coordinates worker registration, job acquisition, and
+// successful attempt reporting.
+service DispatcherService {
+  // RegisterWorker records one worker process identity.
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+
+  // AcquireJobs claims jobs that the worker can execute.
+  rpc AcquireJobs(AcquireJobsRequest) returns (AcquireJobsResponse);
+
+  // ReportAttempt records the outcome of one acquired attempt.
+  rpc ReportAttempt(ReportAttemptRequest) returns (ReportAttemptResponse);
+}
+
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  string hostname = 2;
+  string version = 3;
+  uint32 concurrency = 4;
+  google.protobuf.Timestamp started_at = 5;
+}
+
+message RegisterWorkerResponse {}
+
+message AcquireJobsRequest {
+  string worker_id = 1;
+  uint32 available_capacity = 2;
+  repeated string supported_job_types = 3;
+}
+
+message AcquireJobsResponse {
+  repeated AcquiredJob jobs = 1;
+}
+
+message AcquiredJob {
+  string job_id = 1;
+  uint32 attempt_no = 2;
+  string job_type = 3;
+  bytes payload_json = 4;
+  int64 timeout_ms = 5;
+}
+
+message ReportAttemptRequest {
+  string worker_id = 1;
+  string job_id = 2;
+  uint32 attempt_no = 3;
+
+  oneof outcome {
+    AttemptSucceeded succeeded = 4;
+  }
+}
+
+message AttemptSucceeded {
+  bytes result_json = 1;
+}
+
+message ReportAttemptResponse {}

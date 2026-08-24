@@ -10,21 +10,36 @@ import (
 )
 
 type Job struct {
-	ID           uuid.UUID
-	JobType      string
-	Payload      []byte
-	Status       string
-	CreatedAt    pgtype.Timestamptz
-	UpdatedAt    pgtype.Timestamptz
-	AttemptCount int32
-	MaxAttempts  int32
-	TimeoutMs    int64
+	ID              uuid.UUID
+	JobType         string
+	Payload         []byte
+	Status          string
+	CreatedAt       pgtype.Timestamptz
+	UpdatedAt       pgtype.Timestamptz
+	AttemptCount    int32
+	MaxAttempts     int32
+	TimeoutMs       int64
+	Result          []byte
+	AvailableAt     pgtype.Timestamptz
+	CurrentWorkerID pgtype.UUID
+	FinishedAt      pgtype.Timestamptz
 }
 
 type JobAttempt struct {
-	JobID     uuid.UUID
-	AttemptNo int32
-	Status    string
-	StartedAt pgtype.Timestamptz
-	CreatedAt pgtype.Timestamptz
+	JobID      uuid.UUID
+	AttemptNo  int32
+	Status     string
+	StartedAt  pgtype.Timestamptz
+	CreatedAt  pgtype.Timestamptz
+	WorkerID   uuid.UUID
+	FinishedAt pgtype.Timestamptz
+}
+
+type Worker struct {
+	ID           uuid.UUID
+	Hostname     string
+	Version      string
+	Concurrency  int32
+	StartedAt    pgtype.Timestamptz
+	RegisteredAt pgtype.Timestamptz
 }

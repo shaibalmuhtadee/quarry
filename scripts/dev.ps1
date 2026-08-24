@@ -77,6 +77,7 @@ function Invoke-Docker {
 
 function Test-Tools {
     Invoke-Go -Arguments @("version")
+    Invoke-Go -Arguments @("tool", "buf", "--version")
     Invoke-Go -Arguments @("tool", "goose", "-version")
     Invoke-Go -Arguments @("tool", "sqlc", "version")
 }
@@ -152,6 +153,57 @@ function Invoke-Sqlc {
     )
 
     Invoke-Go -Arguments @("tool", "sqlc", $SqlcCommand)
+}
+
+function Invoke-Buf {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    Invoke-Go -Arguments (@("tool", "buf") + $Arguments)
+}
+
+function Test-BufGeneratedCode {
+    Invoke-Buf -Arguments @("lint")
+    Invoke-Buf -Arguments @("format", "--diff", "--exit-code")
+
+    $temporaryRoot = Join-Path `
+        ([System.IO.Path]::GetTempPath()) `
+        "quarry-buf-check-$([Guid]::NewGuid().ToString('N'))"
+    $committedOutput = Join-Path $repositoryRoot "internal/rpc/generated"
+
+    try {
+        New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
+        Invoke-Buf -Arguments @("generate", "--output", $temporaryRoot)
+
+        $generatedOutput = Join-Path $temporaryRoot "internal/rpc/generated"
+        if (-not (Test-Path -LiteralPath $committedOutput)) {
+            throw "Committed Protocol Buffer output does not exist. Run 'pwsh ./scripts/dev.ps1 generate'."
+        }
+        if (-not (Test-Path -LiteralPath $generatedOutput)) {
+            throw "Buf did not create the expected generated output at $generatedOutput."
+        }
+
+        & git diff --no-index --exit-code --no-ext-diff -- $committedOutput $generatedOutput
+        if ($LASTEXITCODE -ne 0) {
+            throw "Generated Protocol Buffer code is stale. Run 'pwsh ./scripts/dev.ps1 generate'."
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryRoot) {
+            $resolvedTemporaryRoot = [System.IO.Path]::GetFullPath($temporaryRoot)
+            $resolvedSystemTemp = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+            if (-not $resolvedTemporaryRoot.StartsWith(
+                $resolvedSystemTemp,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+                throw "Refusing to remove Protocol Buffer check output outside the temporary directory: $resolvedTemporaryRoot"
+            }
+
+            Remove-Item -LiteralPath $resolvedTemporaryRoot -Recurse -Force
+        }
+    }
 }
 
 function Get-AvailableLoopbackPort {
@@ -377,6 +429,7 @@ try {
             Test-GoFormatting
             Test-Tools
             Invoke-Sqlc -SqlcCommand "diff"
+            Test-BufGeneratedCode
             Test-GoVet
             Test-GoPackages
             Test-GoBuild
@@ -419,9 +472,11 @@ try {
         }
         "generate" {
             Invoke-Sqlc -SqlcCommand "generate"
+            Invoke-Buf -Arguments @("generate")
         }
         "generate-check" {
             Invoke-Sqlc -SqlcCommand "diff"
+            Test-BufGeneratedCode
         }
         "format-check" {
             Test-GoFormatting
