@@ -24,6 +24,8 @@ type Job struct {
 	CurrentWorkerID pgtype.UUID
 	FinishedAt      pgtype.Timestamptz
 	LeaseExpiresAt  pgtype.Timestamptz
+	IdempotencyKey  pgtype.Text
+	RequestHash     []byte
 }
 
 type JobAttempt struct {

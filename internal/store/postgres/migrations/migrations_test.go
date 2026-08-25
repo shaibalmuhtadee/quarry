@@ -69,8 +69,12 @@ func TestMigrationsApplyRollbackAndReapply(t *testing.T) {
 	}
 	verifyLeaseMigrationBackfill(t, ctx, db)
 	seedPreFailureDetailsAbandonedAttempt(t, ctx, db)
-	applyMigrations(t, ctx, db, migrationDirectory)
+	if err := goose.UpToContext(ctx, db, migrationDirectory, 5); err != nil {
+		t.Fatalf("apply migration 5: %v", err)
+	}
 	verifyAttemptFailureBackfill(t, ctx, db)
+	applyMigrations(t, ctx, db, migrationDirectory)
+	verifyIdempotencyMigrationExistingJob(t, ctx, db)
 	verifySchema(t, ctx, db)
 
 	if err := goose.DownToContext(ctx, db, migrationDirectory, 0); err != nil {
@@ -100,7 +104,7 @@ func applyMigrations(t *testing.T, ctx context.Context, db *sql.DB, directory st
 	if err := goose.UpContext(ctx, db, directory); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
-	verifyVersion(t, ctx, db, 5)
+	verifyVersion(t, ctx, db, 6)
 }
 
 func seedPreLeaseRunningJob(t *testing.T, ctx context.Context, db *sql.DB) {
@@ -182,6 +186,21 @@ func verifyAttemptFailureBackfill(t *testing.T, ctx context.Context, db *sql.DB)
 	}
 }
 
+func verifyIdempotencyMigrationExistingJob(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+	var keyIsNull, hashIsNull bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT idempotency_key IS NULL, request_hash IS NULL
+		FROM jobs
+		WHERE id = '00000000-0000-0000-0000-000000000021'
+	`).Scan(&keyIsNull, &hashIsNull); err != nil {
+		t.Fatalf("read existing job after idempotency migration: %v", err)
+	}
+	if !keyIsNull || !hashIsNull {
+		t.Fatalf("existing job idempotency fields null = key %t, hash %t", keyIsNull, hashIsNull)
+	}
+}
+
 func verifyVersion(t *testing.T, ctx context.Context, db *sql.DB, want int64) {
 	t.Helper()
 
@@ -206,6 +225,13 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 			t.Fatalf("table %q does not exist", table)
 		}
 	}
+	var idempotencyIndexExists bool
+	if err := db.QueryRowContext(ctx, `SELECT to_regclass('jobs_idempotency_idx') IS NOT NULL`).Scan(&idempotencyIndexExists); err != nil {
+		t.Fatalf("check idempotency index: %v", err)
+	}
+	if !idempotencyIndexExists {
+		t.Fatal("submission idempotency index does not exist")
+	}
 
 	const jobID = "00000000-0000-0000-0000-000000000001"
 	const workerID = "00000000-0000-0000-0000-000000000010"
@@ -220,6 +246,20 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 		VALUES ($1, 'test', '{}', 'queued', 3, 30000)
 	`, jobID); err != nil {
 		t.Fatalf("insert valid job: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO jobs (
+			id, job_type, payload, status, max_attempts, timeout_ms, idempotency_key, request_hash
+		)
+		VALUES (
+			'00000000-0000-0000-0000-000000000030', 'idempotency.test', '{}', 'queued', 3, 30000,
+			'request-1', decode(repeat('ab', 32), 'hex')
+		), (
+			'00000000-0000-0000-0000-000000000031', 'idempotency.other', '{}', 'queued', 3, 30000,
+			'request-1', decode(repeat('cd', 32), 'hex')
+		)
+	`); err != nil {
+		t.Fatalf("insert valid idempotent jobs: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)
@@ -272,6 +312,35 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 	expectConstraintError(t, ctx, db, "23514", `
 		INSERT INTO jobs (id, job_type, payload, status, attempt_count, max_attempts, timeout_ms)
 		VALUES ('00000000-0000-0000-0000-000000000005', 'test', '{}', 'queued', -1, 3, 30000)
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms, idempotency_key)
+		VALUES ('00000000-0000-0000-0000-000000000032', 'idempotency.test', '{}', 'queued', 3, 30000, 'missing-hash')
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms, request_hash)
+		VALUES (
+			'00000000-0000-0000-0000-000000000033', 'idempotency.test', '{}', 'queued', 3, 30000,
+			decode(repeat('ab', 32), 'hex')
+		)
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO jobs (
+			id, job_type, payload, status, max_attempts, timeout_ms, idempotency_key, request_hash
+		)
+		VALUES (
+			'00000000-0000-0000-0000-000000000034', 'idempotency.test', '{}', 'queued', 3, 30000,
+			'wrong-hash-size', decode('ab', 'hex')
+		)
+	`)
+	expectConstraintError(t, ctx, db, "23505", `
+		INSERT INTO jobs (
+			id, job_type, payload, status, max_attempts, timeout_ms, idempotency_key, request_hash
+		)
+		VALUES (
+			'00000000-0000-0000-0000-000000000035', 'idempotency.test', '{}', 'queued', 3, 30000,
+			'request-1', decode(repeat('ef', 32), 'hex')
+		)
 	`)
 	expectConstraintError(t, ctx, db, "23514", `
 		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)

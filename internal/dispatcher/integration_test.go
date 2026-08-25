@@ -77,7 +77,7 @@ func TestConcurrentAcquireJobsThroughGRPCAndPostgres(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create job %d submission: %v", i, err)
 		}
-		if _, err := jobStore.CreateJob(ctx, submission); err != nil {
+		if _, err := jobStore.SubmitJob(ctx, submission); err != nil {
 			t.Fatalf("create job %d: %v", i, err)
 		}
 	}
@@ -258,10 +258,11 @@ func TestStaleAttemptReportAfterRecoveryThroughGRPCAndPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create recovery submission: %v", err)
 	}
-	job, err := jobStore.CreateJob(ctx, submission)
+	created, err := jobStore.SubmitJob(ctx, submission)
 	if err != nil {
 		t.Fatalf("create recovery job: %v", err)
 	}
+	job := created.Job
 
 	workers := []domain.WorkerID{domain.NewWorkerID(), domain.NewWorkerID()}
 	for index, workerID := range workers {

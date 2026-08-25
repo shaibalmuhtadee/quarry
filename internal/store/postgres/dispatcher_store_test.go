@@ -830,11 +830,11 @@ func createTestJob(
 	if err != nil {
 		t.Fatalf("create test submission: %v", err)
 	}
-	job, err := store.CreateJob(ctx, submission)
+	created, err := store.SubmitJob(ctx, submission)
 	if err != nil {
 		t.Fatalf("create test job: %v", err)
 	}
-	return job
+	return created.Job
 }
 
 func acquireOneTestJob(

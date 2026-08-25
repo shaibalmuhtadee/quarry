@@ -1,14 +1,55 @@
--- name: CreateJob :one
+-- name: SubmitJob :one
 INSERT INTO jobs (
     id,
     job_type,
     payload,
     status,
     max_attempts,
-    timeout_ms
+    timeout_ms,
+    idempotency_key,
+    request_hash
 )
-VALUES ($1, $2, $3, 'queued', $4, $5)
-RETURNING id, job_type, payload, result, status, attempt_count, max_attempts, timeout_ms, created_at, updated_at, finished_at;
+VALUES (
+    sqlc.arg(id),
+    sqlc.arg(job_type),
+    sqlc.arg(payload),
+    'queued',
+    sqlc.arg(max_attempts),
+    sqlc.arg(timeout_ms),
+    sqlc.narg(idempotency_key),
+    sqlc.narg(request_hash)
+)
+ON CONFLICT (job_type, idempotency_key) WHERE idempotency_key IS NOT NULL
+DO NOTHING
+RETURNING
+    id,
+    job_type,
+    payload,
+    result,
+    status,
+    attempt_count,
+    max_attempts,
+    timeout_ms,
+    created_at,
+    updated_at,
+    finished_at;
+
+-- name: GetJobByIdempotencyKey :one
+SELECT
+    id,
+    job_type,
+    payload,
+    result,
+    status,
+    attempt_count,
+    max_attempts,
+    timeout_ms,
+    created_at,
+    updated_at,
+    finished_at,
+    request_hash
+FROM jobs
+WHERE job_type = $1 AND idempotency_key = $2;
 
 -- name: GetJob :one
 SELECT id, job_type, payload, result, status, attempt_count, max_attempts, timeout_ms, created_at, updated_at, finished_at

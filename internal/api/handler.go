@@ -18,7 +18,7 @@ const (
 )
 
 type JobStore interface {
-	CreateJob(context.Context, domain.JobSubmission) (domain.Job, error)
+	SubmitJob(context.Context, domain.JobSubmission) (domain.JobSubmissionResult, error)
 	GetJob(context.Context, domain.JobID) (domain.Job, error)
 	ListJobAttempts(context.Context, domain.JobID) ([]domain.Attempt, error)
 }
@@ -138,19 +138,44 @@ func (handler *handler) createJob(writer http.ResponseWriter, request *http.Requ
 		writeError(writer, http.StatusBadRequest, "invalid_request", "job submission is invalid")
 		return
 	}
-	setRequestJobID(request, submission.ID().String())
+	if values, exists := request.Header[http.CanonicalHeaderKey("Idempotency-Key")]; exists {
+		if len(values) != 1 {
+			writeError(writer, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key must contain one non-empty value of at most 255 bytes")
+			return
+		}
+		key, err := domain.ParseIdempotencyKey(values[0])
+		if err != nil {
+			writeError(writer, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key must contain one non-empty value of at most 255 bytes")
+			return
+		}
+		submission, err = submission.WithIdempotencyKey(key)
+		if err != nil {
+			writeError(writer, http.StatusBadRequest, "invalid_request", "job submission is invalid")
+			return
+		}
+	}
 
-	job, err := handler.store.CreateJob(request.Context(), submission)
+	result, err := handler.store.SubmitJob(request.Context(), submission)
+	if errors.Is(err, domain.ErrIdempotencyConflict) {
+		writeError(writer, http.StatusConflict, "idempotency_conflict", "Idempotency-Key was already used for a different job submission")
+		return
+	}
 	if err != nil {
 		writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
 		return
 	}
+	job := result.Job
+	setRequestJobID(request, job.ID.String())
 
 	writer.Header().Set("Location", "/v1/jobs/"+job.ID.String())
-	writeJSON(writer, http.StatusCreated, createJobResponse{
+	status := http.StatusCreated
+	if result.Deduplicated {
+		status = http.StatusOK
+	}
+	writeJSON(writer, status, createJobResponse{
 		ID:           job.ID.String(),
 		Status:       job.Status,
-		Deduplicated: false,
+		Deduplicated: result.Deduplicated,
 		CreatedAt:    job.CreatedAt,
 	})
 }

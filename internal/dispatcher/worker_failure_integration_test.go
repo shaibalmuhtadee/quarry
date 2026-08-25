@@ -103,10 +103,11 @@ func testWorkerFailureThroughGRPCAndPostgres(
 	if err != nil {
 		t.Fatalf("create job submission: %v", err)
 	}
-	job, err := jobStore.CreateJob(ctx, submission)
+	created, err := jobStore.SubmitJob(ctx, submission)
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
+	job := created.Job
 
 	workerID := domain.NewWorkerID()
 	runtime, err := workerruntime.New(client, map[string]workerruntime.Handler{jobType.String(): handler}, workerruntime.Config{

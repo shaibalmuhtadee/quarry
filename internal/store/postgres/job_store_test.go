@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -50,10 +51,11 @@ func TestJobStorePersistsJobAcrossPoolRestart(t *testing.T) {
 			t.Fatalf("ping first PostgreSQL pool: %v", err)
 		}
 
-		created, err = postgres.NewJobStore(firstPool).CreateJob(ctx, submission)
+		result, err := postgres.NewJobStore(firstPool).SubmitJob(ctx, submission)
 		if err != nil {
 			t.Fatalf("create job: %v", err)
 		}
+		created = result.Job
 		assertStoredJob(t, created, submission)
 	}()
 
@@ -82,6 +84,149 @@ func TestJobStorePersistsJobAcrossPoolRestart(t *testing.T) {
 	_, err = store.GetJob(ctx, domain.NewJobID())
 	if !errors.Is(err, domain.ErrJobNotFound) {
 		t.Fatalf("get missing job error = %v, want ErrJobNotFound", err)
+	}
+}
+
+func TestJobStoreSubmissionIdempotency(t *testing.T) {
+	connectionString := startMigratedPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := postgres.NewPool(ctx, connectionString)
+	if err != nil {
+		t.Fatalf("create PostgreSQL pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	store := postgres.NewJobStore(pool)
+
+	firstPlain := newSubmission(t, "plain.test", `{"value":1}`, 3, 30*time.Second, "")
+	secondPlain := newSubmission(t, "plain.test", `{"value":1}`, 3, 30*time.Second, "")
+	firstPlainResult, err := store.SubmitJob(ctx, firstPlain)
+	if err != nil {
+		t.Fatalf("submit first non-idempotent job: %v", err)
+	}
+	secondPlainResult, err := store.SubmitJob(ctx, secondPlain)
+	if err != nil {
+		t.Fatalf("submit second non-idempotent job: %v", err)
+	}
+	if firstPlainResult.Deduplicated || secondPlainResult.Deduplicated || firstPlainResult.Job.ID == secondPlainResult.Job.ID {
+		t.Fatalf("non-idempotent results = %#v, %#v", firstPlainResult, secondPlainResult)
+	}
+
+	first := newSubmission(t, "idempotency.test", `{"b":2,"a":1}`, 3, 30*time.Second, "request-1")
+	created, err := store.SubmitJob(ctx, first)
+	if err != nil {
+		t.Fatalf("submit idempotent job: %v", err)
+	}
+	if created.Deduplicated {
+		t.Fatal("first idempotent submission was marked deduplicated")
+	}
+	sameObjectReplay, err := store.SubmitJob(ctx, first)
+	if err != nil {
+		t.Fatalf("replay same submission value: %v", err)
+	}
+	if !sameObjectReplay.Deduplicated || sameObjectReplay.Job.ID != created.Job.ID {
+		t.Fatalf("same-value replay = %#v, created = %#v", sameObjectReplay, created)
+	}
+	replay := newSubmission(t, "idempotency.test", ` { "a" : 1, "b" : 2 } `, 3, 30*time.Second, "request-1")
+	deduplicated, err := store.SubmitJob(ctx, replay)
+	if err != nil {
+		t.Fatalf("replay identical job: %v", err)
+	}
+	if !deduplicated.Deduplicated || deduplicated.Job.ID != created.Job.ID || !deduplicated.Job.CreatedAt.Equal(created.Job.CreatedAt) {
+		t.Fatalf("deduplicated result = %#v, created = %#v", deduplicated, created)
+	}
+
+	for _, changed := range []domain.JobSubmission{
+		newSubmission(t, "idempotency.test", `{"a":1,"b":3}`, 3, 30*time.Second, "request-1"),
+		newSubmission(t, "idempotency.test", `{"a":1,"b":2}`, 4, 30*time.Second, "request-1"),
+		newSubmission(t, "idempotency.test", `{"a":1,"b":2}`, 3, 31*time.Second, "request-1"),
+	} {
+		if _, err := store.SubmitJob(ctx, changed); !errors.Is(err, domain.ErrIdempotencyConflict) {
+			t.Fatalf("changed submission error = %v, want ErrIdempotencyConflict", err)
+		}
+	}
+
+	differentType := newSubmission(t, "idempotency.other", `{"a":1,"b":2}`, 3, 30*time.Second, "request-1")
+	differentTypeResult, err := store.SubmitJob(ctx, differentType)
+	if err != nil {
+		t.Fatalf("submit same key under another job type: %v", err)
+	}
+	if differentTypeResult.Deduplicated || differentTypeResult.Job.ID == created.Job.ID {
+		t.Fatalf("different-type result = %#v", differentTypeResult)
+	}
+
+	const concurrentSubmissions = 32
+	concurrentType, err := domain.ParseJobType("idempotency.concurrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	concurrentPayload, err := domain.ParsePayload(json.RawMessage(`{"same":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	concurrentKey, err := domain.ParseIdempotencyKey("concurrent-request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan domain.JobSubmissionResult, concurrentSubmissions)
+	errorsFound := make(chan error, concurrentSubmissions)
+	var waitGroup sync.WaitGroup
+	for range concurrentSubmissions {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			submission, err := domain.NewJobSubmission(concurrentType, concurrentPayload, 3, 30*time.Second)
+			if err != nil {
+				errorsFound <- err
+				return
+			}
+			submission, err = submission.WithIdempotencyKey(concurrentKey)
+			if err != nil {
+				errorsFound <- err
+				return
+			}
+			result, err := store.SubmitJob(ctx, submission)
+			if err != nil {
+				errorsFound <- err
+				return
+			}
+			results <- result
+		}()
+	}
+	waitGroup.Wait()
+	close(results)
+	close(errorsFound)
+	for err := range errorsFound {
+		t.Fatalf("concurrent submission: %v", err)
+	}
+	var winningID domain.JobID
+	createdCount := 0
+	resultCount := 0
+	for result := range results {
+		resultCount++
+		if resultCount == 1 {
+			winningID = result.Job.ID
+		}
+		if !result.Deduplicated {
+			createdCount++
+		}
+		if result.Job.ID != winningID {
+			t.Fatalf("concurrent result job ID = %s, want %s", result.Job.ID, winningID)
+		}
+	}
+	if resultCount != concurrentSubmissions || createdCount != 1 {
+		t.Fatalf("concurrent results = %d, newly created = %d", resultCount, createdCount)
+	}
+	var storedCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM jobs
+		WHERE job_type = 'idempotency.concurrent' AND idempotency_key = 'concurrent-request'
+	`).Scan(&storedCount); err != nil {
+		t.Fatalf("count concurrent jobs: %v", err)
+	}
+	if storedCount != 1 {
+		t.Fatalf("stored concurrent jobs = %d, want 1", storedCount)
 	}
 }
 
@@ -240,6 +385,41 @@ func assertStoredJob(t *testing.T, job domain.Job, submission domain.JobSubmissi
 	if job.FinishedAt != nil {
 		t.Fatalf("queued job finish timestamp = %s, want nil", *job.FinishedAt)
 	}
+}
+
+func newSubmission(
+	t *testing.T,
+	jobTypeValue string,
+	payloadValue string,
+	maxAttempts int32,
+	timeout time.Duration,
+	idempotencyKeyValue string,
+) domain.JobSubmission {
+	t.Helper()
+	jobType, err := domain.ParseJobType(jobTypeValue)
+	if err != nil {
+		t.Fatalf("parse job type: %v", err)
+	}
+	payload, err := domain.ParsePayload(json.RawMessage(payloadValue))
+	if err != nil {
+		t.Fatalf("parse payload: %v", err)
+	}
+	submission, err := domain.NewJobSubmission(jobType, payload, maxAttempts, timeout)
+	if err != nil {
+		t.Fatalf("create submission: %v", err)
+	}
+	if idempotencyKeyValue == "" {
+		return submission
+	}
+	key, err := domain.ParseIdempotencyKey(idempotencyKeyValue)
+	if err != nil {
+		t.Fatalf("parse idempotency key: %v", err)
+	}
+	submission, err = submission.WithIdempotencyKey(key)
+	if err != nil {
+		t.Fatalf("add idempotency key: %v", err)
+	}
+	return submission
 }
 
 func assertJSONEqual(t *testing.T, got, want json.RawMessage) {

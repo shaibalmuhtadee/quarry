@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -22,16 +23,55 @@ func NewJobStore(pool *pgxpool.Pool) *JobStore {
 	return &JobStore{queries: postgresdb.New(pool)}
 }
 
-func (store *JobStore) CreateJob(ctx context.Context, submission domain.JobSubmission) (domain.Job, error) {
-	row, err := store.queries.CreateJob(ctx, postgresdb.CreateJobParams{
-		ID:          submission.ID().UUID(),
-		JobType:     submission.Type().String(),
-		Payload:     submission.Payload().JSON(),
-		MaxAttempts: submission.MaxAttempts(),
-		TimeoutMs:   submission.Timeout().Milliseconds(),
+func (store *JobStore) SubmitJob(ctx context.Context, submission domain.JobSubmission) (domain.JobSubmissionResult, error) {
+	var idempotencyKey pgtype.Text
+	requestHash, idempotent := submission.RequestHash()
+	if key, ok := submission.IdempotencyKey(); ok {
+		idempotencyKey = pgtype.Text{String: key.String(), Valid: true}
+	}
+	row, err := store.queries.SubmitJob(ctx, postgresdb.SubmitJobParams{
+		ID:             submission.ID().UUID(),
+		JobType:        submission.Type().String(),
+		Payload:        submission.Payload().JSON(),
+		MaxAttempts:    submission.MaxAttempts(),
+		TimeoutMs:      submission.Timeout().Milliseconds(),
+		IdempotencyKey: idempotencyKey,
+		RequestHash:    requestHash,
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		if !idempotent {
+			return domain.JobSubmissionResult{}, errors.New("non-idempotent submission unexpectedly conflicted")
+		}
+		existing, lookupErr := store.queries.GetJobByIdempotencyKey(ctx, postgresdb.GetJobByIdempotencyKeyParams{
+			JobType:        submission.Type().String(),
+			IdempotencyKey: idempotencyKey,
+		})
+		if lookupErr != nil {
+			return domain.JobSubmissionResult{}, fmt.Errorf("get idempotent submission: %w", lookupErr)
+		}
+		if !bytes.Equal(existing.RequestHash, requestHash) {
+			return domain.JobSubmissionResult{}, domain.ErrIdempotencyConflict
+		}
+		job, mapErr := mapJob(jobRecord{
+			id:           existing.ID,
+			jobType:      existing.JobType,
+			payload:      existing.Payload,
+			result:       existing.Result,
+			status:       existing.Status,
+			attemptCount: existing.AttemptCount,
+			maxAttempts:  existing.MaxAttempts,
+			timeoutMS:    existing.TimeoutMs,
+			createdAt:    existing.CreatedAt,
+			updatedAt:    existing.UpdatedAt,
+			finishedAt:   existing.FinishedAt,
+		})
+		if mapErr != nil {
+			return domain.JobSubmissionResult{}, fmt.Errorf("map deduplicated job: %w", mapErr)
+		}
+		return domain.JobSubmissionResult{Job: job, Deduplicated: true}, nil
+	}
 	if err != nil {
-		return domain.Job{}, fmt.Errorf("create job: %w", err)
+		return domain.JobSubmissionResult{}, fmt.Errorf("submit job: %w", err)
 	}
 
 	job, err := mapJob(jobRecord{
@@ -48,10 +88,10 @@ func (store *JobStore) CreateJob(ctx context.Context, submission domain.JobSubmi
 		finishedAt:   row.FinishedAt,
 	})
 	if err != nil {
-		return domain.Job{}, fmt.Errorf("map created job: %w", err)
+		return domain.JobSubmissionResult{}, fmt.Errorf("map submitted job: %w", err)
 	}
 
-	return job, nil
+	return domain.JobSubmissionResult{Job: job}, nil
 }
 
 func (store *JobStore) GetJob(ctx context.Context, id domain.JobID) (domain.Job, error) {

@@ -19,13 +19,19 @@ import (
 )
 
 type fakeJobStore struct {
-	createJob       func(context.Context, domain.JobSubmission) (domain.Job, error)
+	submitJob       func(context.Context, domain.JobSubmission) (domain.JobSubmissionResult, error)
 	getJob          func(context.Context, domain.JobID) (domain.Job, error)
 	listJobAttempts func(context.Context, domain.JobID) ([]domain.Attempt, error)
 }
 
-func (store *fakeJobStore) CreateJob(ctx context.Context, submission domain.JobSubmission) (domain.Job, error) {
-	return store.createJob(ctx, submission)
+type createJobBody struct {
+	ID           string    `json:"id"`
+	Deduplicated bool      `json:"deduplicated"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+func (store *fakeJobStore) SubmitJob(ctx context.Context, submission domain.JobSubmission) (domain.JobSubmissionResult, error) {
+	return store.submitJob(ctx, submission)
 }
 
 func (store *fakeJobStore) GetJob(ctx context.Context, id domain.JobID) (domain.Job, error) {
@@ -51,9 +57,9 @@ func TestCreateJobUsesDefaultsAndReturnsCreatedJob(t *testing.T) {
 	createdAt := time.Date(2026, time.August, 22, 12, 30, 0, 123456000, time.UTC)
 	var captured domain.JobSubmission
 	store := &fakeJobStore{
-		createJob: func(_ context.Context, submission domain.JobSubmission) (domain.Job, error) {
+		submitJob: func(_ context.Context, submission domain.JobSubmission) (domain.JobSubmissionResult, error) {
 			captured = submission
-			return jobFromSubmission(submission, createdAt), nil
+			return domain.JobSubmissionResult{Job: jobFromSubmission(submission, createdAt)}, nil
 		},
 	}
 	handler := newTestHandler(store)
@@ -85,6 +91,12 @@ func TestCreateJobUsesDefaultsAndReturnsCreatedJob(t *testing.T) {
 	if got := captured.Timeout(); got != 30*time.Second {
 		t.Fatalf("stored timeout = %s, want 30s", got)
 	}
+	if _, ok := captured.IdempotencyKey(); ok {
+		t.Fatal("submission without Idempotency-Key became idempotent")
+	}
+	if _, ok := captured.RequestHash(); ok {
+		t.Fatal("submission without Idempotency-Key has a request hash")
+	}
 
 	var body struct {
 		ID           string           `json:"id"`
@@ -107,12 +119,124 @@ func TestCreateJobUsesDefaultsAndReturnsCreatedJob(t *testing.T) {
 	}
 }
 
+func TestCreateJobReturnsDeduplicatedReplay(t *testing.T) {
+	createdAt := time.Date(2026, time.August, 24, 12, 30, 0, 0, time.UTC)
+	existing := testJob(t)
+	existing.CreatedAt = createdAt
+	var captured domain.JobSubmission
+	store := &fakeJobStore{
+		submitJob: func(_ context.Context, submission domain.JobSubmission) (domain.JobSubmissionResult, error) {
+			captured = submission
+			return domain.JobSubmissionResult{Job: existing, Deduplicated: true}, nil
+		},
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(
+		`{"type":"email.send","payload":{"b":2,"a":1},"timeout_ms":30000}`,
+	))
+	request.Header.Set("Idempotency-Key", "customer-order-42")
+	response := httptest.NewRecorder()
+
+	newTestHandler(store).ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("response status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	key, ok := captured.IdempotencyKey()
+	if !ok || key.String() != "customer-order-42" {
+		t.Fatalf("captured idempotency key = %q, present %t", key.String(), ok)
+	}
+	if hash, ok := captured.RequestHash(); !ok || len(hash) != 32 {
+		t.Fatalf("captured request hash length = %d, present %t", len(hash), ok)
+	}
+	if got, want := response.Header().Get("Location"), "/v1/jobs/"+existing.ID.String(); got != want {
+		t.Fatalf("Location = %q, want %q", got, want)
+	}
+	var body createJobBody
+	decodeJSONResponse(t, response, &body)
+	if body.ID != existing.ID.String() || !body.Deduplicated || !body.CreatedAt.Equal(createdAt) {
+		t.Fatalf("deduplicated response = %#v", body)
+	}
+}
+
+func TestCreateJobReturnsIdempotencyConflict(t *testing.T) {
+	store := &fakeJobStore{
+		submitJob: func(context.Context, domain.JobSubmission) (domain.JobSubmissionResult, error) {
+			return domain.JobSubmissionResult{}, fmt.Errorf("submit: %w", domain.ErrIdempotencyConflict)
+		},
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(
+		`{"type":"email.send","payload":{},"timeout_ms":30000}`,
+	))
+	request.Header.Set("Idempotency-Key", "customer-order-42")
+	response := httptest.NewRecorder()
+
+	newTestHandler(store).ServeHTTP(response, request)
+
+	assertErrorResponse(t, response, http.StatusConflict, "idempotency_conflict")
+}
+
+func TestCreateJobHashesResolvedMaximumAttempts(t *testing.T) {
+	var hashes [][]byte
+	store := &fakeJobStore{
+		submitJob: func(_ context.Context, submission domain.JobSubmission) (domain.JobSubmissionResult, error) {
+			hash, ok := submission.RequestHash()
+			if !ok {
+				t.Fatal("idempotent submission has no request hash")
+			}
+			hashes = append(hashes, hash)
+			return domain.JobSubmissionResult{Job: jobFromSubmission(submission, time.Now().UTC())}, nil
+		},
+	}
+	handler := newTestHandler(store)
+	for _, body := range []string{
+		`{"type":"email.send","payload":{"value":1},"timeout_ms":30000}`,
+		`{"type":"email.send","payload":{"value":1},"max_attempts":3,"timeout_ms":30000}`,
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(body))
+		request.Header.Set("Idempotency-Key", "request-1")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("response status = %d, want %d: %s", response.Code, http.StatusCreated, response.Body.String())
+		}
+	}
+	if len(hashes) != 2 || !reflect.DeepEqual(hashes[0], hashes[1]) {
+		t.Fatalf("resolved-default hashes = %x", hashes)
+	}
+}
+
+func TestCreateJobRejectsInvalidIdempotencyKey(t *testing.T) {
+	for _, values := range [][]string{{""}, {strings.Repeat("a", domain.MaxIdempotencyKeyLength+1)}, {"first", "second"}} {
+		t.Run(fmt.Sprint(len(values), " values of length ", len(values[0])), func(t *testing.T) {
+			calls := 0
+			store := &fakeJobStore{
+				submitJob: func(context.Context, domain.JobSubmission) (domain.JobSubmissionResult, error) {
+					calls++
+					return domain.JobSubmissionResult{}, errors.New("unexpected store call")
+				},
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(
+				`{"type":"email.send","payload":{},"timeout_ms":30000}`,
+			))
+			request.Header["Idempotency-Key"] = values
+			response := httptest.NewRecorder()
+
+			newTestHandler(store).ServeHTTP(response, request)
+
+			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_idempotency_key")
+			if calls != 0 {
+				t.Fatalf("store calls = %d, want 0", calls)
+			}
+		})
+	}
+}
+
 func TestCreateJobAcceptsExplicitLimitsAndNullPayload(t *testing.T) {
 	var captured domain.JobSubmission
 	store := &fakeJobStore{
-		createJob: func(_ context.Context, submission domain.JobSubmission) (domain.Job, error) {
+		submitJob: func(_ context.Context, submission domain.JobSubmission) (domain.JobSubmissionResult, error) {
 			captured = submission
-			return jobFromSubmission(submission, time.Now().UTC()), nil
+			return domain.JobSubmissionResult{Job: jobFromSubmission(submission, time.Now().UTC())}, nil
 		},
 	}
 	handler := newTestHandler(store)
@@ -170,9 +294,9 @@ func TestCreateJobRejectsInvalidRequests(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			createCalls := 0
 			store := &fakeJobStore{
-				createJob: func(context.Context, domain.JobSubmission) (domain.Job, error) {
+				submitJob: func(context.Context, domain.JobSubmission) (domain.JobSubmissionResult, error) {
 					createCalls++
-					return domain.Job{}, errors.New("unexpected store call")
+					return domain.JobSubmissionResult{}, errors.New("unexpected store call")
 				},
 			}
 			handler := newTestHandler(store)
@@ -191,8 +315,8 @@ func TestCreateJobRejectsInvalidRequests(t *testing.T) {
 
 func TestCreateJobReturnsGenericInternalError(t *testing.T) {
 	store := &fakeJobStore{
-		createJob: func(context.Context, domain.JobSubmission) (domain.Job, error) {
-			return domain.Job{}, errors.New("database password secret")
+		submitJob: func(context.Context, domain.JobSubmission) (domain.JobSubmissionResult, error) {
+			return domain.JobSubmissionResult{}, errors.New("database password secret")
 		},
 	}
 	handler := newTestHandler(store)

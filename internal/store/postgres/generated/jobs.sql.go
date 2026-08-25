@@ -12,66 +12,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const createJob = `-- name: CreateJob :one
-INSERT INTO jobs (
-    id,
-    job_type,
-    payload,
-    status,
-    max_attempts,
-    timeout_ms
-)
-VALUES ($1, $2, $3, 'queued', $4, $5)
-RETURNING id, job_type, payload, result, status, attempt_count, max_attempts, timeout_ms, created_at, updated_at, finished_at
-`
-
-type CreateJobParams struct {
-	ID          uuid.UUID
-	JobType     string
-	Payload     []byte
-	MaxAttempts int32
-	TimeoutMs   int64
-}
-
-type CreateJobRow struct {
-	ID           uuid.UUID
-	JobType      string
-	Payload      []byte
-	Result       []byte
-	Status       string
-	AttemptCount int32
-	MaxAttempts  int32
-	TimeoutMs    int64
-	CreatedAt    pgtype.Timestamptz
-	UpdatedAt    pgtype.Timestamptz
-	FinishedAt   pgtype.Timestamptz
-}
-
-func (q *Queries) CreateJob(ctx context.Context, arg CreateJobParams) (CreateJobRow, error) {
-	row := q.db.QueryRow(ctx, createJob,
-		arg.ID,
-		arg.JobType,
-		arg.Payload,
-		arg.MaxAttempts,
-		arg.TimeoutMs,
-	)
-	var i CreateJobRow
-	err := row.Scan(
-		&i.ID,
-		&i.JobType,
-		&i.Payload,
-		&i.Result,
-		&i.Status,
-		&i.AttemptCount,
-		&i.MaxAttempts,
-		&i.TimeoutMs,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.FinishedAt,
-	)
-	return i, err
-}
-
 const getJob = `-- name: GetJob :one
 SELECT id, job_type, payload, result, status, attempt_count, max_attempts, timeout_ms, created_at, updated_at, finished_at
 FROM jobs
@@ -165,4 +105,150 @@ func (q *Queries) GetJobAttempts(ctx context.Context, id uuid.UUID) ([]GetJobAtt
 		return nil, err
 	}
 	return items, nil
+}
+
+const getJobByIdempotencyKey = `-- name: GetJobByIdempotencyKey :one
+SELECT
+    id,
+    job_type,
+    payload,
+    result,
+    status,
+    attempt_count,
+    max_attempts,
+    timeout_ms,
+    created_at,
+    updated_at,
+    finished_at,
+    request_hash
+FROM jobs
+WHERE job_type = $1 AND idempotency_key = $2
+`
+
+type GetJobByIdempotencyKeyParams struct {
+	JobType        string
+	IdempotencyKey pgtype.Text
+}
+
+type GetJobByIdempotencyKeyRow struct {
+	ID           uuid.UUID
+	JobType      string
+	Payload      []byte
+	Result       []byte
+	Status       string
+	AttemptCount int32
+	MaxAttempts  int32
+	TimeoutMs    int64
+	CreatedAt    pgtype.Timestamptz
+	UpdatedAt    pgtype.Timestamptz
+	FinishedAt   pgtype.Timestamptz
+	RequestHash  []byte
+}
+
+func (q *Queries) GetJobByIdempotencyKey(ctx context.Context, arg GetJobByIdempotencyKeyParams) (GetJobByIdempotencyKeyRow, error) {
+	row := q.db.QueryRow(ctx, getJobByIdempotencyKey, arg.JobType, arg.IdempotencyKey)
+	var i GetJobByIdempotencyKeyRow
+	err := row.Scan(
+		&i.ID,
+		&i.JobType,
+		&i.Payload,
+		&i.Result,
+		&i.Status,
+		&i.AttemptCount,
+		&i.MaxAttempts,
+		&i.TimeoutMs,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.FinishedAt,
+		&i.RequestHash,
+	)
+	return i, err
+}
+
+const submitJob = `-- name: SubmitJob :one
+INSERT INTO jobs (
+    id,
+    job_type,
+    payload,
+    status,
+    max_attempts,
+    timeout_ms,
+    idempotency_key,
+    request_hash
+)
+VALUES (
+    $1,
+    $2,
+    $3,
+    'queued',
+    $4,
+    $5,
+    $6,
+    $7
+)
+ON CONFLICT (job_type, idempotency_key) WHERE idempotency_key IS NOT NULL
+DO NOTHING
+RETURNING
+    id,
+    job_type,
+    payload,
+    result,
+    status,
+    attempt_count,
+    max_attempts,
+    timeout_ms,
+    created_at,
+    updated_at,
+    finished_at
+`
+
+type SubmitJobParams struct {
+	ID             uuid.UUID
+	JobType        string
+	Payload        []byte
+	MaxAttempts    int32
+	TimeoutMs      int64
+	IdempotencyKey pgtype.Text
+	RequestHash    []byte
+}
+
+type SubmitJobRow struct {
+	ID           uuid.UUID
+	JobType      string
+	Payload      []byte
+	Result       []byte
+	Status       string
+	AttemptCount int32
+	MaxAttempts  int32
+	TimeoutMs    int64
+	CreatedAt    pgtype.Timestamptz
+	UpdatedAt    pgtype.Timestamptz
+	FinishedAt   pgtype.Timestamptz
+}
+
+func (q *Queries) SubmitJob(ctx context.Context, arg SubmitJobParams) (SubmitJobRow, error) {
+	row := q.db.QueryRow(ctx, submitJob,
+		arg.ID,
+		arg.JobType,
+		arg.Payload,
+		arg.MaxAttempts,
+		arg.TimeoutMs,
+		arg.IdempotencyKey,
+		arg.RequestHash,
+	)
+	var i SubmitJobRow
+	err := row.Scan(
+		&i.ID,
+		&i.JobType,
+		&i.Payload,
+		&i.Result,
+		&i.Status,
+		&i.AttemptCount,
+		&i.MaxAttempts,
+		&i.TimeoutMs,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.FinishedAt,
+	)
+	return i, err
 }

@@ -342,7 +342,7 @@ Let handlers report retryable and permanent failures without stopping the worker
 
 ## Slice 4: concurrent submission idempotency
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -402,7 +402,28 @@ Deduplicate identical job submissions durably and reject changed submissions tha
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- `IdempotencyKey` rejects empty, whitespace-only, invalid UTF-8, and values longer than 255 bytes. The HTTP boundary rejects multiple `Idempotency-Key` values and preserves submissions that omit the header.
+- `JobSubmission.WithIdempotencyKey` computes the request hash only after the API resolves the default `max_attempts`. It hashes a deterministic JSON object containing job type, canonical payload, maximum attempts, and timeout milliseconds with SHA-256.
+- Canonical payload encoding removes insignificant whitespace and sorts object keys through the standard library JSON encoder. It decodes numbers as `json.Number`, so spellings such as `1`, `1.0`, and `1e0` remain distinct. Arrays retain their submitted order.
+- Migration 6 adds nullable `idempotency_key` and `request_hash` columns, requires both or neither, requires a 32-byte hash, and adds the approved partial unique index on `(job_type, idempotency_key)`. Existing jobs remain non-idempotent with both fields null.
+- `JobStore.SubmitJob` uses `INSERT ... ON CONFLICT DO NOTHING`. PostgreSQL's unique index chooses the concurrent winner. A conflicting caller then reads the committed row and compares its stored hash, returning the existing job for an exact replay or `ErrIdempotencyConflict` for changed input.
+- Submission results carry the job and a named `Deduplicated` value. All callers moved from the old create operation to this submission operation; no legacy store method remains.
+- The API returns `201 Created` for a new job, `200 OK` with `deduplicated: true` for an exact replay, and `409 Conflict` for a changed replay. Successful replay logging and `Location` use the stored job ID rather than the discarded candidate ID.
+- Real HTTP and PostgreSQL tests issue 32 simultaneous identical requests and verify one `201`, 31 deduplicated `200` responses, one shared job ID, and one stored row. Restart coverage replays through a fresh API server and pool, then verifies a changed replay conflicts without changing the stored job.
+- No architecture or project-plan deviation was required.
+
+### Validation result
+
+- `go test -count=1 ./internal/domain ./internal/api` passed idempotency-key validation, canonical JSON and stable hash tests, number-spelling distinction, resolved-default hashing, omitted-header behavior, and HTTP status mapping.
+- `go test -run 'TestJobStoreSubmissionIdempotency|TestAPIJobSurvivesServerAndPoolRestart|TestMigrationsApplyRollbackAndReapply' -count=1 ./internal/store/postgres/...` passed the initial focused PostgreSQL, migration, and restart tests in 5.843 seconds for the store package and 3.931 seconds for migrations.
+- `go test -run 'TestAPIConcurrentIdempotentSubmissionsCreateOneJob|TestAPIJobSurvivesServerAndPoolRestart|TestJobStoreSubmissionIdempotency' -count=1 ./internal/store/postgres` passed the final real HTTP and PostgreSQL idempotency paths in 7.649 seconds.
+- `go test -count=1 ./internal/api ./internal/domain ./internal/store/postgres/...` passed the complete focused suites in 0.536 seconds for API, 0.338 seconds for domain, 50.332 seconds for the PostgreSQL store, and 3.803 seconds for migrations.
+- `pwsh ./scripts/dev.ps1 migration-test` passed migration apply, rollback, and reapplication through version 6 in 3.825 seconds.
+- `pwsh ./scripts/dev.ps1 generate-check` passed sqlc comparison and fresh Protocol Buffer generation comparison.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned tool checks, generated-code checks, vet, all uncached tests, builds, Compose rendering, migrations through version 6, the HTTP smoke test, the 40-job distributed process test, the worker-crash recovery process test, stale-report coverage, and cleanup verification.
+- `git diff --check` passed after the completion documentation update.
+- The first restricted compile probe could not access the Windows Go build cache. The same compile check passed with normal cache access and no code change.
+- GitHub-hosted CI was not run.
 
 ## Slice 5: execution timeouts and panic recovery
 

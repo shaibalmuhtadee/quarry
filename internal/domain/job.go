@@ -148,11 +148,18 @@ type Job struct {
 }
 
 type JobSubmission struct {
-	id          JobID
-	jobType     JobType
-	payload     Payload
-	maxAttempts int32
-	timeout     time.Duration
+	id             JobID
+	jobType        JobType
+	payload        Payload
+	maxAttempts    int32
+	timeout        time.Duration
+	idempotencyKey IdempotencyKey
+	requestHash    [32]byte
+}
+
+type JobSubmissionResult struct {
+	Job          Job
+	Deduplicated bool
 }
 
 func NewJobSubmission(
