@@ -20,28 +20,51 @@ func TestLoadConfig(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
 		t.Setenv("QUARRY_DATABASE_URL", "")
 		t.Setenv("QUARRY_DISPATCHER_ADDR", "")
+		t.Setenv("QUARRY_LEASE_DURATION", "")
 
-		got := loadConfig()
+		got, err := loadConfig()
+		if err != nil {
+			t.Fatalf("load default config: %v", err)
+		}
 		if got.databaseURL != defaultDatabaseURL {
 			t.Fatalf("database URL = %q, want %q", got.databaseURL, defaultDatabaseURL)
 		}
 		if got.dispatcherAddress != defaultDispatcherAddress {
 			t.Fatalf("dispatcher address = %q, want %q", got.dispatcherAddress, defaultDispatcherAddress)
 		}
+		if got.leaseDuration != defaultLeaseDuration {
+			t.Fatalf("lease duration = %s, want %s", got.leaseDuration, defaultLeaseDuration)
+		}
 	})
 
 	t.Run("environment overrides", func(t *testing.T) {
 		t.Setenv("QUARRY_DATABASE_URL", "postgres://example/test")
 		t.Setenv("QUARRY_DISPATCHER_ADDR", "127.0.0.1:19090")
+		t.Setenv("QUARRY_LEASE_DURATION", "45s")
 
-		got := loadConfig()
+		got, err := loadConfig()
+		if err != nil {
+			t.Fatalf("load overridden config: %v", err)
+		}
 		if got.databaseURL != "postgres://example/test" {
 			t.Fatalf("database URL = %q, want environment value", got.databaseURL)
 		}
 		if got.dispatcherAddress != "127.0.0.1:19090" {
 			t.Fatalf("dispatcher address = %q, want environment value", got.dispatcherAddress)
 		}
+		if got.leaseDuration != 45*time.Second {
+			t.Fatalf("lease duration = %s, want 45s", got.leaseDuration)
+		}
 	})
+
+	for _, value := range []string{"invalid", "0s", "-1s", "500us"} {
+		t.Run("invalid lease duration "+value, func(t *testing.T) {
+			t.Setenv("QUARRY_LEASE_DURATION", value)
+			if _, err := loadConfig(); err == nil {
+				t.Fatalf("loadConfig accepted lease duration %q", value)
+			}
+		})
+	}
 }
 
 func TestServeDispatcherStartsAndShutsDownWithoutLeakingListener(t *testing.T) {

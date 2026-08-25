@@ -39,7 +39,7 @@ func TestConcurrentAcquireJobsThroughGRPCAndPostgres(t *testing.T) {
 	server := grpc.NewServer()
 	dispatcherv1.RegisterDispatcherServiceServer(
 		server,
-		dispatcher.NewService(postgres.NewDispatcherStore(pool)),
+		dispatcher.NewService(postgres.NewDispatcherStore(pool, 20*time.Second)),
 	)
 	serveDone := make(chan error, 1)
 	go func() {

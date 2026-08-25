@@ -94,7 +94,7 @@ Define the Milestone 3 worker protocol and expired-attempt domain status without
 
 ## Slice 2: lease schema, worker liveness, and leased claims
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -147,11 +147,23 @@ Make every claim establish a durable lease in the same transaction that assigns 
 
 ### Decisions and deviations discovered during implementation
 
-- Pending implementation.
+- Migration 4 adds `jobs.lease_expires_at`, the planned partial expired-lease index, and a check constraint that keeps running state, worker assignment, and lease presence consistent. It also adds worker `state` and `last_seen_at` with only `active` and `lost` as valid states.
+- Existing running jobs receive `statement_timestamp()` as their lease expiry during migration. They are immediately eligible for Slice 4 recovery instead of remaining unrecoverable.
+- Identical registration retries preserve the original registration identity and metadata while setting the worker to `active` and refreshing `last_seen_at`. Conflicting reuse of a worker ID remains rejected.
+- Claims use one PostgreSQL statement timestamp for the attempt start and lease basis. The dispatcher passes a positive whole-millisecond lease duration, with `QUARRY_LEASE_DURATION=20s` as the default.
+- The existing claim transaction still locks the worker, enforces registered capacity, claims with `FOR UPDATE SKIP LOCKED`, assigns the worker, creates the attempt, and establishes the lease atomically.
+- Successful completion clears both the active worker assignment and the lease in the existing completion transaction.
+- No architecture deviation was required. Slice 2 added no heartbeat handling, lease renewal, expired-lease recovery, worker heartbeat loop, handler retry, or execution control.
 
 ### Validation result
 
-- Pending implementation.
+- `pwsh ./scripts/dev.ps1 generate` passed and produced the committed sqlc output. The first restricted run hit `Access is denied` in the Go tool cache; the same command passed with normal cache access and required no code change.
+- `go test -count=1 ./internal/store/postgres/... ./cmd/dispatcher` passed. This covered migration upgrade backfill, rollback and reapplication, worker liveness refresh, leased claims, concurrent claims, successful lease clearing, and dispatcher lease-duration configuration. The first restricted run could not read the Go build cache; the rerun with normal cache and Docker access passed.
+- `pwsh ./scripts/dev.ps1 generate-check` passed fresh sqlc and Protocol Buffer generation comparison plus Buf checks.
+- `pwsh ./scripts/dev.ps1 migration-test` passed against PostgreSQL 18.6.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned tool checks, generated-code checks, vet, all uncached tests, builds, Compose rendering, migrations through version 4, the HTTP smoke test, and the distributed process test. The distributed test processed 40 jobs with two workers and verified PostgreSQL state.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
 
 ## Slice 3: heartbeat persistence, renewal, and gRPC handling
 

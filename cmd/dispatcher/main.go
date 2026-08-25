@@ -20,12 +20,14 @@ import (
 const (
 	defaultDatabaseURL       = "postgres://quarry:quarry@localhost:5432/quarry?sslmode=disable"
 	defaultDispatcherAddress = "localhost:9090"
+	defaultLeaseDuration     = 20 * time.Second
 	shutdownTimeout          = 10 * time.Second
 )
 
 type config struct {
 	databaseURL       string
 	dispatcherAddress string
+	leaseDuration     time.Duration
 }
 
 func main() {
@@ -33,14 +35,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, loadConfig(), logger); err != nil {
+	cfg, err := loadConfig()
+	if err == nil {
+		err = run(ctx, cfg, logger)
+	}
+	if err != nil {
 		logger.Error("dispatcher stopped", slog.Any("error", err))
 		os.Exit(1)
 	}
 	logger.Info("dispatcher stopped")
 }
 
-func loadConfig() config {
+func loadConfig() (config, error) {
 	databaseURL := os.Getenv("QUARRY_DATABASE_URL")
 	if databaseURL == "" {
 		databaseURL = defaultDatabaseURL
@@ -49,11 +55,23 @@ func loadConfig() config {
 	if dispatcherAddress == "" {
 		dispatcherAddress = defaultDispatcherAddress
 	}
+	leaseDuration := defaultLeaseDuration
+	if value := os.Getenv("QUARRY_LEASE_DURATION"); value != "" {
+		parsed, err := time.ParseDuration(value)
+		if err != nil {
+			return config{}, fmt.Errorf("parse QUARRY_LEASE_DURATION: %w", err)
+		}
+		leaseDuration = parsed
+	}
+	if leaseDuration <= 0 || leaseDuration%time.Millisecond != 0 {
+		return config{}, errors.New("QUARRY_LEASE_DURATION must be a positive whole number of milliseconds")
+	}
 
 	return config{
 		databaseURL:       databaseURL,
 		dispatcherAddress: dispatcherAddress,
-	}
+		leaseDuration:     leaseDuration,
+	}, nil
 }
 
 func run(ctx context.Context, cfg config, logger *slog.Logger) error {
@@ -70,7 +88,7 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 	server := grpc.NewServer()
 	dispatcherv1.RegisterDispatcherServiceServer(
 		server,
-		dispatcher.NewService(postgres.NewDispatcherStore(pool)),
+		dispatcher.NewService(postgres.NewDispatcherStore(pool, cfg.leaseDuration)),
 	)
 	logger.Info("dispatcher starting", slog.String("address", listener.Addr().String()))
 

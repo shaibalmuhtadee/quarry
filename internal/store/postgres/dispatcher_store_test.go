@@ -14,11 +14,13 @@ import (
 	"github.com/shaibalmuhtadee/quarry/internal/store/postgres"
 )
 
+const testLeaseDuration = 20 * time.Second
+
 func TestDispatcherStoreRegistersWorkersIdempotently(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	store := postgres.NewDispatcherStore(pool)
+	store := postgres.NewDispatcherStore(pool, testLeaseDuration)
 
 	registration := postgres.WorkerRegistration{
 		ID:          domain.NewWorkerID(),
@@ -30,8 +32,28 @@ func TestDispatcherStoreRegistersWorkersIdempotently(t *testing.T) {
 	if err := store.RegisterWorker(ctx, registration); err != nil {
 		t.Fatalf("register worker: %v", err)
 	}
+	staleLastSeen := registration.StartedAt.Add(-time.Hour)
+	if _, err := pool.Exec(ctx, `
+		UPDATE workers
+		SET state = 'lost', last_seen_at = $2
+		WHERE id = $1
+	`, registration.ID.UUID(), staleLastSeen); err != nil {
+		t.Fatalf("make registered worker stale: %v", err)
+	}
 	if err := store.RegisterWorker(ctx, registration); err != nil {
 		t.Fatalf("repeat identical registration: %v", err)
+	}
+	var state string
+	var lastSeenAt time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT state, last_seen_at
+		FROM workers
+		WHERE id = $1
+	`, registration.ID.UUID()).Scan(&state, &lastSeenAt); err != nil {
+		t.Fatalf("read refreshed worker liveness: %v", err)
+	}
+	if state != "active" || !lastSeenAt.After(staleLastSeen) {
+		t.Fatalf("refreshed worker liveness = (%q, %s), want active after %s", state, lastSeenAt, staleLastSeen)
 	}
 
 	conflicts := []struct {
@@ -72,7 +94,7 @@ func TestDispatcherStoreClaimsEligibleSupportedJobsInOrder(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool)
+	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 
 	worker := registerTestWorker(t, ctx, dispatcherStore, 5)
@@ -124,6 +146,22 @@ func TestDispatcherStoreClaimsEligibleSupportedJobsInOrder(t *testing.T) {
 		if stored.Status != domain.JobStatusRunning || stored.AttemptCount != 1 {
 			t.Fatalf("claimed job %s state = (%q, %d), want (running, 1)", stored.ID, stored.Status, stored.AttemptCount)
 		}
+		var leaseExpiresAt, attemptStartedAt time.Time
+		var workerID string
+		if err := pool.QueryRow(ctx, `
+			SELECT jobs.current_worker_id::text, jobs.lease_expires_at, job_attempts.started_at
+			FROM jobs
+			JOIN job_attempts ON job_attempts.job_id = jobs.id AND job_attempts.attempt_no = 1
+			WHERE jobs.id = $1
+		`, claimed.ID.UUID()).Scan(&workerID, &leaseExpiresAt, &attemptStartedAt); err != nil {
+			t.Fatalf("read leased claim %s: %v", claimed.ID, err)
+		}
+		if workerID != worker.String() {
+			t.Fatalf("claimed job %s worker = %s, want %s", claimed.ID, workerID, worker)
+		}
+		if got := leaseExpiresAt.Sub(attemptStartedAt); got != testLeaseDuration {
+			t.Fatalf("claimed job %s lease duration = %s, want %s", claimed.ID, got, testLeaseDuration)
+		}
 	}
 	for _, unclaimed := range []domain.Job{capacityLimited, future, unsupported} {
 		stored, err := jobStore.GetJob(ctx, unclaimed.ID)
@@ -132,6 +170,13 @@ func TestDispatcherStoreClaimsEligibleSupportedJobsInOrder(t *testing.T) {
 		}
 		if stored.Status != domain.JobStatusQueued || stored.AttemptCount != 0 {
 			t.Fatalf("unclaimed job %s state = (%q, %d), want (queued, 0)", stored.ID, stored.Status, stored.AttemptCount)
+		}
+		var hasLease bool
+		if err := pool.QueryRow(ctx, `SELECT lease_expires_at IS NOT NULL FROM jobs WHERE id = $1`, unclaimed.ID.UUID()).Scan(&hasLease); err != nil {
+			t.Fatalf("read unclaimed job lease %s: %v", unclaimed.ID, err)
+		}
+		if hasLease {
+			t.Fatalf("unclaimed job %s has a lease", unclaimed.ID)
 		}
 	}
 
@@ -152,7 +197,7 @@ func TestDispatcherStoreEnforcesConcurrencyAcrossConcurrentAcquisitions(t *testi
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool)
+	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, dispatcherStore, 3)
 	jobType := mustJobType(t, "capacity.test")
@@ -196,7 +241,7 @@ func TestDispatcherStoreEnforcesConcurrencyAcrossConcurrentAcquisitions(t *testi
 	}
 
 	var running int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE current_worker_id = $1 AND status = 'running'`, worker.UUID()).Scan(&running); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE current_worker_id = $1 AND status = 'running' AND lease_expires_at IS NOT NULL`, worker.UUID()).Scan(&running); err != nil {
 		t.Fatalf("count running jobs: %v", err)
 	}
 	if running != 3 {
@@ -208,7 +253,7 @@ func TestDispatcherStoreConcurrentClaimersCreateOneAttemptPerJob(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool)
+	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	jobType := mustJobType(t, "claim.test")
 
@@ -262,7 +307,7 @@ func TestDispatcherStoreConcurrentClaimersCreateOneAttemptPerJob(t *testing.T) {
 	}
 
 	var runningJobs, attempts, duplicateAttempts int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE status = 'running' AND attempt_count = 1`).Scan(&runningJobs); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE status = 'running' AND attempt_count = 1 AND lease_expires_at IS NOT NULL`).Scan(&runningJobs); err != nil {
 		t.Fatalf("count running jobs: %v", err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM job_attempts WHERE status = 'running'`).Scan(&attempts); err != nil {
@@ -288,7 +333,7 @@ func TestDispatcherStoreReportsSuccessAtomicallyAndIdempotently(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool)
+	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, dispatcherStore, 1)
 	job := createTestJob(t, ctx, jobStore, "success.test", `{"input":true}`)
@@ -335,12 +380,15 @@ func TestDispatcherStoreReportsSuccessAtomicallyAndIdempotently(t *testing.T) {
 		t.Fatalf("attempt finish timestamp = %s, want job finish timestamp %s", *storedAttempt.FinishedAt, *storedJob.FinishedAt)
 	}
 
-	var currentWorkerIsNull bool
-	if err := pool.QueryRow(ctx, `SELECT current_worker_id IS NULL FROM jobs WHERE id = $1`, job.ID.UUID()).Scan(&currentWorkerIsNull); err != nil {
+	var currentWorkerIsNull, leaseIsNull bool
+	if err := pool.QueryRow(ctx, `SELECT current_worker_id IS NULL, lease_expires_at IS NULL FROM jobs WHERE id = $1`, job.ID.UUID()).Scan(&currentWorkerIsNull, &leaseIsNull); err != nil {
 		t.Fatalf("read successful job worker assignment: %v", err)
 	}
 	if !currentWorkerIsNull {
 		t.Fatal("successful job retained its active worker assignment")
+	}
+	if !leaseIsNull {
+		t.Fatal("successful job retained its lease")
 	}
 }
 
@@ -348,7 +396,7 @@ func TestDispatcherStoreRejectsMismatchedSuccessWithoutChangingState(t *testing.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool)
+	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, dispatcherStore, 1)
 	otherWorker := registerTestWorker(t, ctx, dispatcherStore, 1)
@@ -386,6 +434,13 @@ func TestDispatcherStoreRejectsMismatchedSuccessWithoutChangingState(t *testing.
 	if storedJob.Status != domain.JobStatusRunning || storedJob.Result != nil || storedJob.FinishedAt != nil {
 		t.Fatalf("job changed after mismatched reports: %#v", storedJob)
 	}
+	var leaseIsPresent bool
+	if err := pool.QueryRow(ctx, `SELECT lease_expires_at IS NOT NULL FROM jobs WHERE id = $1`, job.ID.UUID()).Scan(&leaseIsPresent); err != nil {
+		t.Fatalf("read lease after rolled-back report: %v", err)
+	}
+	if !leaseIsPresent {
+		t.Fatal("rolled-back report cleared the job lease")
+	}
 	attempts, err := jobStore.ListJobAttempts(ctx, job.ID)
 	if err != nil {
 		t.Fatalf("list attempts after mismatched reports: %v", err)
@@ -399,7 +454,7 @@ func TestDispatcherStoreRollsBackAttemptWhenJobCompletionFails(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool)
+	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, dispatcherStore, 1)
 	job := createTestJob(t, ctx, jobStore, "atomic.test", `{}`)

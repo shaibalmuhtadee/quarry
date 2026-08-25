@@ -23,6 +23,7 @@ type Job struct {
 	AvailableAt     pgtype.Timestamptz
 	CurrentWorkerID pgtype.UUID
 	FinishedAt      pgtype.Timestamptz
+	LeaseExpiresAt  pgtype.Timestamptz
 }
 
 type JobAttempt struct {
@@ -42,4 +43,6 @@ type Worker struct {
 	Concurrency  int32
 	StartedAt    pgtype.Timestamptz
 	RegisteredAt pgtype.Timestamptz
+	State        string
+	LastSeenAt   pgtype.Timestamptz
 }

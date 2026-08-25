@@ -21,7 +21,7 @@ func TestSuccessfulJobAndAttemptHistoryThroughHTTP(t *testing.T) {
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
 	jobStore := postgres.NewJobStore(pool)
-	dispatcherStore := postgres.NewDispatcherStore(pool)
+	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	server := httptest.NewServer(api.NewHandler(jobStore, pool, logger))
 	t.Cleanup(server.Close)

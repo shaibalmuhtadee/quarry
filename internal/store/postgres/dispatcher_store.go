@@ -36,11 +36,12 @@ type AcquiredJob struct {
 }
 
 type DispatcherStore struct {
-	pool *pgxpool.Pool
+	pool          *pgxpool.Pool
+	leaseDuration time.Duration
 }
 
-func NewDispatcherStore(pool *pgxpool.Pool) *DispatcherStore {
-	return &DispatcherStore{pool: pool}
+func NewDispatcherStore(pool *pgxpool.Pool, leaseDuration time.Duration) *DispatcherStore {
+	return &DispatcherStore{pool: pool, leaseDuration: leaseDuration}
 }
 
 func (store *DispatcherStore) RegisterWorker(
@@ -114,6 +115,7 @@ func (store *DispatcherStore) AcquireJobs(
 		SupportedJobTypes: typeNames,
 		ClaimLimit:        claimLimit,
 		WorkerID:          databaseWorkerID,
+		LeaseDurationMs:   store.leaseDuration.Milliseconds(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("claim jobs: %w", err)

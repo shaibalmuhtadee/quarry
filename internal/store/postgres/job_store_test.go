@@ -89,7 +89,7 @@ func TestJobStoreListsAttemptsInAttemptNumberOrder(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool)
+	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, dispatcherStore, 1)
 	job := createTestJob(t, ctx, jobStore, "history.test", `{}`)

@@ -4,11 +4,14 @@ INSERT INTO workers (
     hostname,
     version,
     concurrency,
-    started_at
+    started_at,
+    state,
+    last_seen_at
 )
-VALUES ($1, $2, $3, $4, $5)
+VALUES ($1, $2, $3, $4, $5, 'active', statement_timestamp())
 ON CONFLICT (id) DO UPDATE
-SET id = EXCLUDED.id
+SET state = 'active',
+    last_seen_at = statement_timestamp()
 WHERE workers.hostname = EXCLUDED.hostname
   AND workers.version = EXCLUDED.version
   AND workers.concurrency = EXCLUDED.concurrency
@@ -42,7 +45,9 @@ WITH eligible AS (
     SET status = 'running',
         attempt_count = attempt_count + 1,
         current_worker_id = sqlc.arg(worker_id),
-        updated_at = now()
+        lease_expires_at = statement_timestamp()
+            + sqlc.arg(lease_duration_ms)::bigint * interval '1 millisecond',
+        updated_at = statement_timestamp()
     FROM eligible
     WHERE jobs.id = eligible.id
     RETURNING
@@ -66,7 +71,7 @@ WITH eligible AS (
         attempt_count,
         sqlc.arg(worker_id),
         'running',
-        now()
+        statement_timestamp()
     FROM claimed
     RETURNING job_id, attempt_no
 )
@@ -108,6 +113,7 @@ UPDATE jobs
 SET status = 'succeeded',
     result = sqlc.arg(result_json)::jsonb,
     current_worker_id = NULL,
+    lease_expires_at = NULL,
     finished_at = sqlc.arg(finished_at),
     updated_at = sqlc.arg(finished_at)
 WHERE id = sqlc.arg(job_id)

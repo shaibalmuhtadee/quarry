@@ -27,7 +27,9 @@ WITH eligible AS (
     SET status = 'running',
         attempt_count = attempt_count + 1,
         current_worker_id = $3,
-        updated_at = now()
+        lease_expires_at = statement_timestamp()
+            + $4::bigint * interval '1 millisecond',
+        updated_at = statement_timestamp()
     FROM eligible
     WHERE jobs.id = eligible.id
     RETURNING
@@ -51,7 +53,7 @@ WITH eligible AS (
         attempt_count,
         $3,
         'running',
-        now()
+        statement_timestamp()
     FROM claimed
     RETURNING job_id, attempt_no
 )
@@ -70,6 +72,7 @@ type ClaimJobsParams struct {
 	SupportedJobTypes []string
 	ClaimLimit        int32
 	WorkerID          pgtype.UUID
+	LeaseDurationMs   int64
 }
 
 type ClaimJobsRow struct {
@@ -81,7 +84,12 @@ type ClaimJobsRow struct {
 }
 
 func (q *Queries) ClaimJobs(ctx context.Context, arg ClaimJobsParams) ([]ClaimJobsRow, error) {
-	rows, err := q.db.Query(ctx, claimJobs, arg.SupportedJobTypes, arg.ClaimLimit, arg.WorkerID)
+	rows, err := q.db.Query(ctx, claimJobs,
+		arg.SupportedJobTypes,
+		arg.ClaimLimit,
+		arg.WorkerID,
+		arg.LeaseDurationMs,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -155,6 +163,7 @@ UPDATE jobs
 SET status = 'succeeded',
     result = $1::jsonb,
     current_worker_id = NULL,
+    lease_expires_at = NULL,
     finished_at = $2,
     updated_at = $2
 WHERE id = $3
@@ -247,11 +256,14 @@ INSERT INTO workers (
     hostname,
     version,
     concurrency,
-    started_at
+    started_at,
+    state,
+    last_seen_at
 )
-VALUES ($1, $2, $3, $4, $5)
+VALUES ($1, $2, $3, $4, $5, 'active', statement_timestamp())
 ON CONFLICT (id) DO UPDATE
-SET id = EXCLUDED.id
+SET state = 'active',
+    last_seen_at = statement_timestamp()
 WHERE workers.hostname = EXCLUDED.hostname
   AND workers.version = EXCLUDED.version
   AND workers.concurrency = EXCLUDED.concurrency
