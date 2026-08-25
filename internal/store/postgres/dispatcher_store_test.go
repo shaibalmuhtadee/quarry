@@ -329,6 +329,138 @@ func TestDispatcherStoreConcurrentClaimersCreateOneAttemptPerJob(t *testing.T) {
 	}
 }
 
+func TestDispatcherStoreHeartbeatRenewsOnlyCurrentUnexpiredAttempts(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := newDispatcherTestPool(t, ctx)
+	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	jobStore := postgres.NewJobStore(pool)
+	worker := registerTestWorker(t, ctx, dispatcherStore, 5)
+	otherWorker := registerTestWorker(t, ctx, dispatcherStore, 1)
+
+	expiredJob := createTestJob(t, ctx, jobStore, "heartbeat.expired", `{}`)
+	expiredAttempt := acquireOneTestJob(t, ctx, dispatcherStore, worker, "heartbeat.expired")
+	validJob := createTestJob(t, ctx, jobStore, "heartbeat.valid", `{}`)
+	validAttempt := acquireOneTestJob(t, ctx, dispatcherStore, worker, "heartbeat.valid")
+	completedJob := createTestJob(t, ctx, jobStore, "heartbeat.completed", `{}`)
+	completedAttempt := acquireOneTestJob(t, ctx, dispatcherStore, worker, "heartbeat.completed")
+	if err := dispatcherStore.ReportSuccess(ctx, worker, completedJob.ID, completedAttempt.AttemptNumber, mustResult(t, `{"ok":true}`)); err != nil {
+		t.Fatalf("complete heartbeat test job: %v", err)
+	}
+	otherJob := createTestJob(t, ctx, jobStore, "heartbeat.other", `{}`)
+	otherAttempt := acquireOneTestJob(t, ctx, dispatcherStore, otherWorker, "heartbeat.other")
+
+	staleLastSeen := time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := pool.Exec(ctx, `UPDATE workers SET state = 'lost', last_seen_at = $2 WHERE id = $1`, worker.UUID(), staleLastSeen); err != nil {
+		t.Fatalf("make worker heartbeat stale: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE jobs
+		SET lease_expires_at = statement_timestamp() - interval '1 second'
+		WHERE id = $1
+	`, expiredJob.ID.UUID()); err != nil {
+		t.Fatalf("expire heartbeat test lease: %v", err)
+	}
+
+	var expiredBefore, validBefore time.Time
+	if err := pool.QueryRow(ctx, `SELECT lease_expires_at FROM jobs WHERE id = $1`, expiredJob.ID.UUID()).Scan(&expiredBefore); err != nil {
+		t.Fatalf("read expired lease before heartbeat: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT lease_expires_at FROM jobs WHERE id = $1`, validJob.ID.UUID()).Scan(&validBefore); err != nil {
+		t.Fatalf("read valid lease before heartbeat: %v", err)
+	}
+	wrongAttempt, err := domain.NewAttemptNumber(validAttempt.AttemptNumber.Int32() + 1)
+	if err != nil {
+		t.Fatalf("create wrong attempt number: %v", err)
+	}
+	attempts := []postgres.HeartbeatAttempt{
+		{JobID: expiredJob.ID, AttemptNumber: expiredAttempt.AttemptNumber},
+		{JobID: validJob.ID, AttemptNumber: validAttempt.AttemptNumber},
+		{JobID: completedJob.ID, AttemptNumber: completedAttempt.AttemptNumber},
+		{JobID: otherJob.ID, AttemptNumber: otherAttempt.AttemptNumber},
+		{JobID: domain.NewJobID(), AttemptNumber: validAttempt.AttemptNumber},
+		{JobID: validJob.ID, AttemptNumber: wrongAttempt},
+	}
+
+	results, err := dispatcherStore.Heartbeat(ctx, worker, attempts)
+	if err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	if len(results) != len(attempts) {
+		t.Fatalf("heartbeat results = %d, want %d", len(results), len(attempts))
+	}
+	for i, result := range results {
+		wantValid := i == 1
+		if result.Attempt != attempts[i] || result.Valid != wantValid {
+			t.Fatalf("heartbeat result %d = %#v, want attempt %#v valid %t", i, result, attempts[i], wantValid)
+		}
+	}
+
+	var expiredAfter, validAfter, lastSeenAfter time.Time
+	if err := pool.QueryRow(ctx, `SELECT lease_expires_at FROM jobs WHERE id = $1`, expiredJob.ID.UUID()).Scan(&expiredAfter); err != nil {
+		t.Fatalf("read expired lease after heartbeat: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT lease_expires_at FROM jobs WHERE id = $1`, validJob.ID.UUID()).Scan(&validAfter); err != nil {
+		t.Fatalf("read valid lease after heartbeat: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT last_seen_at FROM workers WHERE id = $1`, worker.UUID()).Scan(&lastSeenAfter); err != nil {
+		t.Fatalf("read worker liveness after heartbeat: %v", err)
+	}
+	if !expiredAfter.Equal(expiredBefore) {
+		t.Fatalf("expired lease changed from %s to %s", expiredBefore, expiredAfter)
+	}
+	if !validAfter.After(validBefore) {
+		t.Fatalf("valid lease = %s, want after %s", validAfter, validBefore)
+	}
+	if !lastSeenAfter.After(staleLastSeen) {
+		t.Fatalf("last_seen_at = %s, want after %s", lastSeenAfter, staleLastSeen)
+	}
+}
+
+func TestDispatcherStoreHeartbeatWithoutAttemptsRefreshesWorkerLiveness(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := newDispatcherTestPool(t, ctx)
+	store := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	worker := registerTestWorker(t, ctx, store, 1)
+	staleLastSeen := time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := pool.Exec(ctx, `UPDATE workers SET state = 'lost', last_seen_at = $2 WHERE id = $1`, worker.UUID(), staleLastSeen); err != nil {
+		t.Fatalf("make worker heartbeat stale: %v", err)
+	}
+
+	results, err := store.Heartbeat(ctx, worker, nil)
+	if err != nil {
+		t.Fatalf("empty heartbeat: %v", err)
+	}
+	if results == nil || len(results) != 0 {
+		t.Fatalf("empty heartbeat results = %#v, want non-nil empty slice", results)
+	}
+	var state string
+	var lastSeenAfter time.Time
+	if err := pool.QueryRow(ctx, `SELECT state, last_seen_at FROM workers WHERE id = $1`, worker.UUID()).Scan(&state, &lastSeenAfter); err != nil {
+		t.Fatalf("read worker liveness: %v", err)
+	}
+	if state != "active" {
+		t.Fatalf("worker state = %q, want active", state)
+	}
+	if !lastSeenAfter.After(staleLastSeen) {
+		t.Fatalf("last_seen_at = %s, want after %s", lastSeenAfter, staleLastSeen)
+	}
+}
+
+func TestDispatcherStoreHeartbeatRejectsUnregisteredWorker(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store := postgres.NewDispatcherStore(newDispatcherTestPool(t, ctx), testLeaseDuration)
+	results, err := store.Heartbeat(ctx, domain.NewWorkerID(), nil)
+	if !errors.Is(err, postgres.ErrWorkerNotRegistered) {
+		t.Fatalf("unregistered heartbeat error = %v, want ErrWorkerNotRegistered", err)
+	}
+	if results != nil {
+		t.Fatalf("unregistered heartbeat results = %#v, want nil", results)
+	}
+}
+
 func TestDispatcherStoreReportsSuccessAtomicallyAndIdempotently(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

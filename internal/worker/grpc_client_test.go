@@ -14,8 +14,10 @@ import (
 type recordingRPCClient struct {
 	registration *dispatcherv1.RegisterWorkerRequest
 	acquisition  *dispatcherv1.AcquireJobsRequest
+	heartbeat    *dispatcherv1.HeartbeatRequest
 	report       *dispatcherv1.ReportAttemptRequest
 	jobs         []*dispatcherv1.AcquiredJob
+	heartbeats   []*dispatcherv1.HeartbeatAttemptResult
 }
 
 func (client *recordingRPCClient) RegisterWorker(
@@ -37,11 +39,12 @@ func (client *recordingRPCClient) AcquireJobs(
 }
 
 func (client *recordingRPCClient) Heartbeat(
-	context.Context,
-	*dispatcherv1.HeartbeatRequest,
-	...grpc.CallOption,
+	_ context.Context,
+	request *dispatcherv1.HeartbeatRequest,
+	_ ...grpc.CallOption,
 ) (*dispatcherv1.HeartbeatResponse, error) {
-	return &dispatcherv1.HeartbeatResponse{}, nil
+	client.heartbeat = request
+	return &dispatcherv1.HeartbeatResponse{Attempts: client.heartbeats}, nil
 }
 
 func (client *recordingRPCClient) ReportAttempt(
@@ -71,13 +74,20 @@ func TestGRPCClientPreservesRegistrationAcquisitionAndReportIdentity(t *testing.
 		t.Fatal(err)
 	}
 	startedAt := time.Now().UTC().Truncate(time.Nanosecond)
-	rpc := &recordingRPCClient{jobs: []*dispatcherv1.AcquiredJob{{
-		JobId:       jobID.String(),
-		AttemptNo:   uint32(attempt.Int32()),
-		JobType:     jobType.String(),
-		PayloadJson: []byte(`{"message":"hello"}`),
-		TimeoutMs:   2500,
-	}}}
+	rpc := &recordingRPCClient{
+		jobs: []*dispatcherv1.AcquiredJob{{
+			JobId:       jobID.String(),
+			AttemptNo:   uint32(attempt.Int32()),
+			JobType:     jobType.String(),
+			PayloadJson: []byte(`{"message":"hello"}`),
+			TimeoutMs:   2500,
+		}},
+		heartbeats: []*dispatcherv1.HeartbeatAttemptResult{{
+			JobId:     jobID.String(),
+			AttemptNo: uint32(attempt.Int32()),
+			State:     dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID,
+		}},
+	}
 	client, err := NewGRPCClient(rpc, time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -102,6 +112,17 @@ func TestGRPCClientPreservesRegistrationAcquisitionAndReportIdentity(t *testing.
 		jobs[0].Timeout != 2500*time.Millisecond {
 		t.Fatalf("acquired jobs = %#v", jobs)
 	}
+	heartbeats, err := client.Heartbeat(context.Background(), workerID, []HeartbeatAttempt{{
+		JobID:         jobID,
+		AttemptNumber: attempt,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(heartbeats) != 1 || heartbeats[0].Attempt.JobID != jobID ||
+		heartbeats[0].Attempt.AttemptNumber != attempt || !heartbeats[0].Valid {
+		t.Fatalf("heartbeat results = %#v", heartbeats)
+	}
 	if err := client.ReportSuccess(context.Background(), workerID, jobID, attempt, result); err != nil {
 		t.Fatal(err)
 	}
@@ -118,9 +139,36 @@ func TestGRPCClientPreservesRegistrationAcquisitionAndReportIdentity(t *testing.
 		!slices.Equal(rpc.acquisition.GetSupportedJobTypes(), []string{jobType.String()}) {
 		t.Fatalf("acquisition request = %#v", rpc.acquisition)
 	}
+	if rpc.heartbeat.GetWorkerId() != workerID.String() || len(rpc.heartbeat.GetActiveAttempts()) != 1 ||
+		rpc.heartbeat.GetActiveAttempts()[0].GetJobId() != jobID.String() ||
+		rpc.heartbeat.GetActiveAttempts()[0].GetAttemptNo() != uint32(attempt.Int32()) {
+		t.Fatalf("heartbeat request = %#v", rpc.heartbeat)
+	}
 	if rpc.report.GetWorkerId() != workerID.String() || rpc.report.GetJobId() != jobID.String() ||
 		rpc.report.GetAttemptNo() != uint32(attempt.Int32()) ||
 		string(rpc.report.GetSucceeded().GetResultJson()) != `{"ok":true}` {
 		t.Fatalf("report request = %#v", rpc.report)
+	}
+}
+
+func TestParseHeartbeatResultRejectsInvalidResponses(t *testing.T) {
+	jobID := domain.NewJobID().String()
+	tests := []struct {
+		name  string
+		value *dispatcherv1.HeartbeatAttemptResult
+	}{
+		{name: "nil"},
+		{name: "invalid job ID", value: &dispatcherv1.HeartbeatAttemptResult{JobId: "bad", AttemptNo: 1, State: dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID}},
+		{name: "zero attempt", value: &dispatcherv1.HeartbeatAttemptResult{JobId: jobID, State: dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID}},
+		{name: "attempt overflow", value: &dispatcherv1.HeartbeatAttemptResult{JobId: jobID, AttemptNo: uint32(^uint32(0)), State: dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID}},
+		{name: "unspecified state", value: &dispatcherv1.HeartbeatAttemptResult{JobId: jobID, AttemptNo: 1}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := parseHeartbeatResult(test.value); err == nil {
+				t.Fatal("parseHeartbeatResult accepted an invalid response")
+			}
+		})
 	}
 }

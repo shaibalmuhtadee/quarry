@@ -17,6 +17,16 @@ type GRPCClient struct {
 	timeout time.Duration
 }
 
+type HeartbeatAttempt struct {
+	JobID         domain.JobID
+	AttemptNumber domain.AttemptNumber
+}
+
+type HeartbeatResult struct {
+	Attempt HeartbeatAttempt
+	Valid   bool
+}
+
 func NewGRPCClient(client dispatcherv1.DispatcherServiceClient, timeout time.Duration) (*GRPCClient, error) {
 	if client == nil || timeout <= 0 {
 		return nil, fmt.Errorf("%w: gRPC client and positive timeout are required", ErrInvalidConfiguration)
@@ -68,6 +78,40 @@ func (client *GRPCClient) Acquire(
 		jobs[i] = job
 	}
 	return jobs, nil
+}
+
+func (client *GRPCClient) Heartbeat(
+	ctx context.Context,
+	workerID domain.WorkerID,
+	attempts []HeartbeatAttempt,
+) ([]HeartbeatResult, error) {
+	requestAttempts := make([]*dispatcherv1.HeartbeatAttempt, len(attempts))
+	for i, attempt := range attempts {
+		requestAttempts[i] = &dispatcherv1.HeartbeatAttempt{
+			JobId:     attempt.JobID.String(),
+			AttemptNo: uint32(attempt.AttemptNumber.Int32()),
+		}
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, client.timeout)
+	defer cancel()
+	response, err := client.client.Heartbeat(callCtx, &dispatcherv1.HeartbeatRequest{
+		WorkerId:       workerID.String(),
+		ActiveAttempts: requestAttempts,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]HeartbeatResult, len(response.GetAttempts()))
+	for i, value := range response.GetAttempts() {
+		result, err := parseHeartbeatResult(value)
+		if err != nil {
+			return nil, fmt.Errorf("parse heartbeat result %d: %w", i, err)
+		}
+		results[i] = result
+	}
+	return results, nil
 }
 
 func (client *GRPCClient) ReportSuccess(
@@ -122,5 +166,40 @@ func parseAcquiredJob(acquired *dispatcherv1.AcquiredJob) (Job, error) {
 		Type:          jobType,
 		Payload:       payload,
 		Timeout:       time.Duration(acquired.GetTimeoutMs()) * time.Millisecond,
+	}, nil
+}
+
+func parseHeartbeatResult(value *dispatcherv1.HeartbeatAttemptResult) (HeartbeatResult, error) {
+	if value == nil {
+		return HeartbeatResult{}, errors.New("heartbeat result is required")
+	}
+	jobID, err := domain.ParseJobID(value.GetJobId())
+	if err != nil {
+		return HeartbeatResult{}, err
+	}
+	if value.GetAttemptNo() > math.MaxInt32 {
+		return HeartbeatResult{}, domain.ErrInvalidAttemptNumber
+	}
+	attemptNumber, err := domain.NewAttemptNumber(int32(value.GetAttemptNo()))
+	if err != nil {
+		return HeartbeatResult{}, err
+	}
+
+	var valid bool
+	switch value.GetState() {
+	case dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID:
+		valid = true
+	case dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_STALE:
+		valid = false
+	default:
+		return HeartbeatResult{}, errors.New("heartbeat result state must be valid or stale")
+	}
+
+	return HeartbeatResult{
+		Attempt: HeartbeatAttempt{
+			JobID:         jobID,
+			AttemptNumber: attemptNumber,
+		},
+		Valid: valid,
 	}, nil
 }

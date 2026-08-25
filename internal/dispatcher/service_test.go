@@ -21,6 +21,7 @@ import (
 type fakeStore struct {
 	registerWorker func(context.Context, postgres.WorkerRegistration) error
 	acquireJobs    func(context.Context, domain.WorkerID, int32, []domain.JobType) ([]postgres.AcquiredJob, error)
+	heartbeat      func(context.Context, domain.WorkerID, []postgres.HeartbeatAttempt) ([]postgres.HeartbeatResult, error)
 	reportSuccess  func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.Result) error
 }
 
@@ -41,6 +42,17 @@ func (store *fakeStore) AcquireJobs(
 		return []postgres.AcquiredJob{}, nil
 	}
 	return store.acquireJobs(ctx, workerID, capacity, types)
+}
+
+func (store *fakeStore) Heartbeat(
+	ctx context.Context,
+	workerID domain.WorkerID,
+	attempts []postgres.HeartbeatAttempt,
+) ([]postgres.HeartbeatResult, error) {
+	if store.heartbeat == nil {
+		return []postgres.HeartbeatResult{}, nil
+	}
+	return store.heartbeat(ctx, workerID, attempts)
 }
 
 func (store *fakeStore) ReportSuccess(
@@ -217,6 +229,108 @@ func TestAcquireJobsRejectsInvalidRequests(t *testing.T) {
 			assertStatusCode(t, err, codes.InvalidArgument)
 		})
 	}
+}
+
+func TestHeartbeatParsesRequestAndMapsResults(t *testing.T) {
+	workerID := domain.NewWorkerID()
+	firstJobID := domain.NewJobID()
+	secondJobID := domain.NewJobID()
+	firstAttempt, err := domain.NewAttemptNumber(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondAttempt, err := domain.NewAttemptNumber(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAttempts := []postgres.HeartbeatAttempt{
+		{JobID: firstJobID, AttemptNumber: firstAttempt},
+		{JobID: secondJobID, AttemptNumber: secondAttempt},
+	}
+	service := dispatcher.NewService(&fakeStore{
+		heartbeat: func(
+			_ context.Context,
+			gotWorkerID domain.WorkerID,
+			attempts []postgres.HeartbeatAttempt,
+		) ([]postgres.HeartbeatResult, error) {
+			if gotWorkerID != workerID || !reflect.DeepEqual(attempts, wantAttempts) {
+				t.Fatalf("heartbeat = worker %s, attempts %#v", gotWorkerID, attempts)
+			}
+			return []postgres.HeartbeatResult{
+				{Attempt: attempts[0], Valid: true},
+				{Attempt: attempts[1], Valid: false},
+			}, nil
+		},
+	})
+
+	response, err := service.Heartbeat(context.Background(), &dispatcherv1.HeartbeatRequest{
+		WorkerId: workerID.String(),
+		ActiveAttempts: []*dispatcherv1.HeartbeatAttempt{
+			{JobId: firstJobID.String(), AttemptNo: 1},
+			{JobId: secondJobID.String(), AttemptNo: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	if len(response.GetAttempts()) != 2 {
+		t.Fatalf("heartbeat results = %d, want 2", len(response.GetAttempts()))
+	}
+	if response.GetAttempts()[0].GetJobId() != firstJobID.String() ||
+		response.GetAttempts()[0].GetAttemptNo() != 1 ||
+		response.GetAttempts()[0].GetState() != dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID {
+		t.Fatalf("first heartbeat result = %#v", response.GetAttempts()[0])
+	}
+	if response.GetAttempts()[1].GetJobId() != secondJobID.String() ||
+		response.GetAttempts()[1].GetAttemptNo() != 2 ||
+		response.GetAttempts()[1].GetState() != dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_STALE {
+		t.Fatalf("second heartbeat result = %#v", response.GetAttempts()[1])
+	}
+}
+
+func TestHeartbeatRejectsInvalidRequests(t *testing.T) {
+	workerID := domain.NewWorkerID().String()
+	jobID := domain.NewJobID().String()
+	tests := []struct {
+		name    string
+		request *dispatcherv1.HeartbeatRequest
+	}{
+		{name: "nil request"},
+		{name: "invalid worker ID", request: &dispatcherv1.HeartbeatRequest{WorkerId: "bad"}},
+		{name: "null attempt", request: &dispatcherv1.HeartbeatRequest{WorkerId: workerID, ActiveAttempts: []*dispatcherv1.HeartbeatAttempt{nil}}},
+		{name: "invalid job ID", request: &dispatcherv1.HeartbeatRequest{WorkerId: workerID, ActiveAttempts: []*dispatcherv1.HeartbeatAttempt{{JobId: "bad", AttemptNo: 1}}}},
+		{name: "zero attempt", request: &dispatcherv1.HeartbeatRequest{WorkerId: workerID, ActiveAttempts: []*dispatcherv1.HeartbeatAttempt{{JobId: jobID}}}},
+		{name: "attempt overflow", request: &dispatcherv1.HeartbeatRequest{WorkerId: workerID, ActiveAttempts: []*dispatcherv1.HeartbeatAttempt{{JobId: jobID, AttemptNo: math.MaxInt32 + 1}}}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			storeCalls := 0
+			service := dispatcher.NewService(&fakeStore{
+				heartbeat: func(context.Context, domain.WorkerID, []postgres.HeartbeatAttempt) ([]postgres.HeartbeatResult, error) {
+					storeCalls++
+					return nil, nil
+				},
+			})
+			_, err := service.Heartbeat(context.Background(), test.request)
+			assertStatusCode(t, err, codes.InvalidArgument)
+			if storeCalls != 0 {
+				t.Fatalf("store calls = %d, want 0", storeCalls)
+			}
+		})
+	}
+}
+
+func TestHeartbeatRequiresRegisteredWorker(t *testing.T) {
+	service := dispatcher.NewService(&fakeStore{
+		heartbeat: func(context.Context, domain.WorkerID, []postgres.HeartbeatAttempt) ([]postgres.HeartbeatResult, error) {
+			return nil, postgres.ErrWorkerNotRegistered
+		},
+	})
+	_, err := service.Heartbeat(context.Background(), &dispatcherv1.HeartbeatRequest{
+		WorkerId: domain.NewWorkerID().String(),
+	})
+	assertStatusCode(t, err, codes.FailedPrecondition)
 }
 
 func TestReportAttemptParsesSuccessfulOutcome(t *testing.T) {

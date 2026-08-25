@@ -158,6 +158,31 @@ func TestConcurrentAcquireJobsThroughGRPCAndPostgres(t *testing.T) {
 	if runningJobs != jobCount || attempts != jobCount {
 		t.Fatalf("stored claims = %d jobs and %d attempts, want %d each", runningJobs, attempts, jobCount)
 	}
+	var leaseBefore time.Time
+	if err := pool.QueryRow(ctx, `SELECT lease_expires_at FROM jobs WHERE id = $1`, firstJob.GetJobId()).Scan(&leaseBefore); err != nil {
+		t.Fatalf("read lease before heartbeat: %v", err)
+	}
+	heartbeatResponse, err := client.Heartbeat(ctx, &dispatcherv1.HeartbeatRequest{
+		WorkerId: firstWorker.String(),
+		ActiveAttempts: []*dispatcherv1.HeartbeatAttempt{{
+			JobId:     firstJob.GetJobId(),
+			AttemptNo: firstJob.GetAttemptNo(),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("heartbeat through gRPC: %v", err)
+	}
+	if len(heartbeatResponse.GetAttempts()) != 1 ||
+		heartbeatResponse.GetAttempts()[0].GetState() != dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID {
+		t.Fatalf("heartbeat response = %#v", heartbeatResponse)
+	}
+	var leaseAfter time.Time
+	if err := pool.QueryRow(ctx, `SELECT lease_expires_at FROM jobs WHERE id = $1`, firstJob.GetJobId()).Scan(&leaseAfter); err != nil {
+		t.Fatalf("read lease after heartbeat: %v", err)
+	}
+	if !leaseAfter.After(leaseBefore) {
+		t.Fatalf("renewed lease = %s, want after %s", leaseAfter, leaseBefore)
+	}
 
 	_, err = client.ReportAttempt(ctx, &dispatcherv1.ReportAttemptRequest{
 		WorkerId:  firstWorker.String(),

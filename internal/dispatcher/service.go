@@ -16,6 +16,7 @@ import (
 type store interface {
 	RegisterWorker(context.Context, postgres.WorkerRegistration) error
 	AcquireJobs(context.Context, domain.WorkerID, int32, []domain.JobType) ([]postgres.AcquiredJob, error)
+	Heartbeat(context.Context, domain.WorkerID, []postgres.HeartbeatAttempt) ([]postgres.HeartbeatResult, error)
 	ReportSuccess(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.Result) error
 }
 
@@ -120,6 +121,66 @@ func (service *Service) AcquireJobs(
 			PayloadJson: job.Payload.JSON(),
 			TimeoutMs:   job.Timeout.Milliseconds(),
 		})
+	}
+
+	return response, nil
+}
+
+func (service *Service) Heartbeat(
+	ctx context.Context,
+	request *dispatcherv1.HeartbeatRequest,
+) (*dispatcherv1.HeartbeatResponse, error) {
+	if request == nil {
+		return nil, invalidArgument("request is required")
+	}
+	workerID, err := domain.ParseWorkerID(request.GetWorkerId())
+	if err != nil {
+		return nil, invalidArgument("worker_id must be a non-zero UUID")
+	}
+
+	attempts := make([]postgres.HeartbeatAttempt, len(request.GetActiveAttempts()))
+	for i, value := range request.GetActiveAttempts() {
+		if value == nil {
+			return nil, invalidArgument("active_attempts must not contain null values")
+		}
+		jobID, err := domain.ParseJobID(value.GetJobId())
+		if err != nil {
+			return nil, invalidArgument("active_attempts job_id values must be UUIDs")
+		}
+		if value.GetAttemptNo() == 0 || value.GetAttemptNo() > math.MaxInt32 {
+			return nil, invalidArgument("active_attempts attempt_no values must be between 1 and 2147483647")
+		}
+		attemptNumber, err := domain.NewAttemptNumber(int32(value.GetAttemptNo()))
+		if err != nil {
+			return nil, invalidArgument("active_attempts attempt_no values must be positive")
+		}
+		attempts[i] = postgres.HeartbeatAttempt{
+			JobID:         jobID,
+			AttemptNumber: attemptNumber,
+		}
+	}
+
+	results, err := service.store.Heartbeat(ctx, workerID, attempts)
+	if errors.Is(err, postgres.ErrWorkerNotRegistered) {
+		return nil, status.Error(codes.FailedPrecondition, "worker must register before sending heartbeats")
+	}
+	if err != nil {
+		return nil, internalError(err)
+	}
+
+	response := &dispatcherv1.HeartbeatResponse{
+		Attempts: make([]*dispatcherv1.HeartbeatAttemptResult, len(results)),
+	}
+	for i, result := range results {
+		state := dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_STALE
+		if result.Valid {
+			state = dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID
+		}
+		response.Attempts[i] = &dispatcherv1.HeartbeatAttemptResult{
+			JobId:     result.Attempt.JobID.String(),
+			AttemptNo: uint32(result.Attempt.AttemptNumber.Int32()),
+			State:     state,
+		}
 	}
 
 	return response, nil

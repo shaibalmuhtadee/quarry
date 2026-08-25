@@ -167,7 +167,7 @@ Make every claim establish a durable lease in the same transaction that assigns 
 
 ## Slice 3: heartbeat persistence, renewal, and gRPC handling
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -217,11 +217,23 @@ Renew valid leases and update worker liveness through the dispatcher.
 
 ### Decisions and deviations discovered during implementation
 
-- Pending implementation.
+- The store processes each heartbeat in one PostgreSQL transaction. It refreshes the registered worker first, then evaluates every submitted attempt without letting a stale result block valid renewals.
+- Worker heartbeat refresh sets the worker to `active` and advances `last_seen_at`, including heartbeats with no active attempts. An unknown worker fails the transaction with `ErrWorkerNotRegistered`.
+- Lease renewal requires the current worker ID, job ID, attempt number, `running` status, and a lease strictly later than `statement_timestamp()`. Expired leases remain unchanged and cannot revive before the reaper runs.
+- Renewal sets the new expiry from PostgreSQL `statement_timestamp()` plus the configured lease duration. PostgreSQL remains the authority for both validity and the renewed timestamp.
+- Heartbeat results preserve request order and identity. Unknown, completed, reassigned, expired, and wrong-attempt entries return `stale`; matching unexpired entries return `valid`.
+- The gRPC boundary parses worker, job, and attempt identities into domain types before calling the store. It maps an unregistered worker to `FailedPrecondition` and malformed requests to `InvalidArgument`.
+- The worker gRPC client now sends typed heartbeat identities and rejects malformed response identities or unspecified states. Slice 4 remains responsible for calling this method from a heartbeat loop.
+- No architecture deviation was required. Slice 3 added no worker heartbeat loop, active-attempt registry, lease reaper, recovery transition, retry policy, or completion-after-expiry rule.
 
 ### Validation result
 
-- Pending implementation.
+- `pwsh ./scripts/dev.ps1 generate` passed and produced the committed sqlc output. The first restricted run hit `Access is denied` in the Go and Buf caches; the rerun with normal cache access passed. A malformed test-double method signature found during formatting was fixed before focused validation.
+- `go test -count=1 ./internal/dispatcher ./internal/store/postgres ./internal/worker` passed. The tests covered valid renewal, expired-lease non-revival, completed, unknown, reassigned, and wrong-attempt stale results, mixed valid and stale processing, empty heartbeats, liveness restoration, unregistered workers, gRPC validation and status codes, and worker-client request and response parsing.
+- `pwsh ./scripts/dev.ps1 generate-check` passed fresh sqlc and Protocol Buffer generation comparison plus Buf checks.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned tool checks, generated-code checks, vet, all uncached tests, builds, Compose rendering, migrations through version 4, the HTTP smoke test, and the distributed process test. The distributed test processed 40 jobs with two workers and verified PostgreSQL state.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
 
 ## Slice 4: worker heartbeat loop and active-attempt registry
 

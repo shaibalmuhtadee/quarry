@@ -35,6 +35,16 @@ type AcquiredJob struct {
 	Timeout       time.Duration
 }
 
+type HeartbeatAttempt struct {
+	JobID         domain.JobID
+	AttemptNumber domain.AttemptNumber
+}
+
+type HeartbeatResult struct {
+	Attempt HeartbeatAttempt
+	Valid   bool
+}
+
 type DispatcherStore struct {
 	pool          *pgxpool.Pool
 	leaseDuration time.Duration
@@ -135,6 +145,59 @@ func (store *DispatcherStore) AcquireJobs(
 	}
 
 	return jobs, nil
+}
+
+func (store *DispatcherStore) Heartbeat(
+	ctx context.Context,
+	workerID domain.WorkerID,
+	attempts []HeartbeatAttempt,
+) ([]HeartbeatResult, error) {
+	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("begin worker heartbeat: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	queries := postgresdb.New(tx)
+	workerRows, err := queries.RefreshWorkerHeartbeat(ctx, workerID.UUID())
+	if err != nil {
+		return nil, fmt.Errorf("refresh worker heartbeat: %w", err)
+	}
+	if workerRows == 0 {
+		return nil, ErrWorkerNotRegistered
+	}
+	if workerRows != 1 {
+		return nil, errors.New("worker heartbeat updated an unexpected number of workers")
+	}
+
+	results := make([]HeartbeatResult, len(attempts))
+	for i, attempt := range attempts {
+		renewedRows, err := queries.RenewAttemptLease(ctx, postgresdb.RenewAttemptLeaseParams{
+			LeaseDurationMs: store.leaseDuration.Milliseconds(),
+			JobID:           attempt.JobID.UUID(),
+			AttemptNo:       attempt.AttemptNumber.Int32(),
+			WorkerID: pgtype.UUID{
+				Bytes: workerID.UUID(),
+				Valid: true,
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("renew attempt lease: %w", err)
+		}
+		if renewedRows > 1 {
+			return nil, errors.New("attempt heartbeat updated an unexpected number of jobs")
+		}
+		results[i] = HeartbeatResult{
+			Attempt: attempt,
+			Valid:   renewedRows == 1,
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit worker heartbeat: %w", err)
+	}
+
+	return results, nil
 }
 
 func (store *DispatcherStore) ReportSuccess(

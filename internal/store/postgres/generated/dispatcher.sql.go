@@ -250,6 +250,21 @@ func (q *Queries) LockWorker(ctx context.Context, id uuid.UUID) (int32, error) {
 	return concurrency, err
 }
 
+const refreshWorkerHeartbeat = `-- name: RefreshWorkerHeartbeat :execrows
+UPDATE workers
+SET state = 'active',
+    last_seen_at = statement_timestamp()
+WHERE id = $1
+`
+
+func (q *Queries) RefreshWorkerHeartbeat(ctx context.Context, workerID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, refreshWorkerHeartbeat, workerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const registerWorker = `-- name: RegisterWorker :one
 INSERT INTO workers (
     id,
@@ -290,4 +305,36 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
+}
+
+const renewAttemptLease = `-- name: RenewAttemptLease :execrows
+UPDATE jobs
+SET lease_expires_at = statement_timestamp()
+        + $1::bigint * interval '1 millisecond',
+    updated_at = statement_timestamp()
+WHERE id = $2
+  AND attempt_count = $3
+  AND current_worker_id = $4
+  AND status = 'running'
+  AND lease_expires_at > statement_timestamp()
+`
+
+type RenewAttemptLeaseParams struct {
+	LeaseDurationMs int64
+	JobID           uuid.UUID
+	AttemptNo       int32
+	WorkerID        pgtype.UUID
+}
+
+func (q *Queries) RenewAttemptLease(ctx context.Context, arg RenewAttemptLeaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, renewAttemptLease,
+		arg.LeaseDurationMs,
+		arg.JobID,
+		arg.AttemptNo,
+		arg.WorkerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

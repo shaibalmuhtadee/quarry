@@ -30,6 +30,23 @@ FROM jobs
 WHERE current_worker_id = $1
   AND status = 'running';
 
+-- name: RefreshWorkerHeartbeat :execrows
+UPDATE workers
+SET state = 'active',
+    last_seen_at = statement_timestamp()
+WHERE id = sqlc.arg(worker_id);
+
+-- name: RenewAttemptLease :execrows
+UPDATE jobs
+SET lease_expires_at = statement_timestamp()
+        + sqlc.arg(lease_duration_ms)::bigint * interval '1 millisecond',
+    updated_at = statement_timestamp()
+WHERE id = sqlc.arg(job_id)
+  AND attempt_count = sqlc.arg(attempt_no)
+  AND current_worker_id = sqlc.arg(worker_id)
+  AND status = 'running'
+  AND lease_expires_at > statement_timestamp();
+
 -- name: ClaimJobs :many
 WITH eligible AS (
     SELECT id
