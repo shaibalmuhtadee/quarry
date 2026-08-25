@@ -2,7 +2,7 @@
 
 Quarry is a distributed job execution system written in Go. PostgreSQL stores jobs and attempts, the HTTP API accepts and reads jobs, the gRPC dispatcher claims work, and bounded worker processes run registered handlers.
 
-The current successful path provides at-least-once execution with leased attempts. The dispatcher recovers work after a worker crash, abandons the expired attempt, and makes the logical job eligible for another worker.
+Quarry provides at-least-once execution with leased attempts, durable retries, submission idempotency, execution timeouts, cooperative cancellation, and graceful worker draining. The dispatcher recovers unfinished work after a worker crash or forced shutdown and fences stale attempt reports.
 
 ## Requirements
 
@@ -57,10 +57,20 @@ $state
 Invoke-RestMethod -Uri "http://localhost:8080/v1/jobs/$($job.id)/attempts"
 ```
 
+The job response includes `latest_failure` when an attempt has failed. The summary contains the stable error code and safe message from the newest failed attempt. The attempts response contains the same safe details for each failed attempt.
+
 Workers also register these demonstration handlers:
 
 - `demo.payload_size` returns the number of bytes in the JSON value received from the dispatcher.
-- `demo.sleep` accepts `{"duration_ms": N}`, waits for that duration or context cancellation, and returns `{"slept_ms": N}`. It does not enforce the submitted job timeout.
+- `demo.sleep` accepts `{"duration_ms": N}`, waits for that duration or context cancellation, and returns `{"slept_ms": N}`. The worker enforces the submitted job timeout around every handler.
+
+To make a submission idempotent, send an `Idempotency-Key` header. Replaying the same job type and input returns the original job; changing the input for the same type and key returns `409 Conflict`.
+
+Request cooperative cancellation with:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/v1/jobs/$($job.id)/cancel"
+```
 
 The API also exposes liveness and readiness endpoints:
 
@@ -92,6 +102,9 @@ The processes accept these environment variables:
 - `QUARRY_WORKER_HOSTNAME`: worker registration hostname. The default is the operating-system hostname.
 - `QUARRY_WORKER_VERSION`: worker registration version. The default is `dev`.
 - `QUARRY_HEARTBEAT_INTERVAL`: worker heartbeat interval. The default is `5s`.
+- `QUARRY_WORKER_SHUTDOWN_TIMEOUT`: time allowed for active attempts to drain after SIGTERM. The default is `10s`.
+- `QUARRY_RETRY_BASE_DELAY`: dispatcher retry backoff base. The default is `1s`.
+- `QUARRY_RETRY_MAX_DELAY`: dispatcher retry backoff maximum. The default is `60s`.
 
 The development script also accepts `QUARRY_POSTGRES_PORT` to change the host port used by Docker Compose and migration commands. Set `QUARRY_DATABASE_URL` to the matching port when you run the API.
 
@@ -104,6 +117,14 @@ pwsh ./scripts/dev.ps1 check
 ```
 
 This checks formatting, dependencies, pinned tools, generated code, static analysis, tests, builds, and the Compose configuration. It runs both the HTTP smoke test and the distributed process test against PostgreSQL.
+
+Run the Milestone 4 execution-semantics proof by itself:
+
+```powershell
+pwsh ./scripts/dev.ps1 semantics-test
+```
+
+The semantics test sends SIGTERM to real Linux worker processes, proves graceful drain and acquisition shutdown, forces a shutdown deadline, and verifies lease-based replacement execution. It also runs retry, timeout, panic, idempotency, and cancellation integrations against real PostgreSQL. The test checks stored attempt outcomes, retry eligibility, cancellation state, final job state, and cleanup of every temporary process and Docker resource.
 
 Run the distributed process test by itself:
 
@@ -148,4 +169,4 @@ pwsh ./scripts/dev.ps1 generate-check
 
 ## Current limits
 
-Quarry does not yet provide handler failure outcomes, general durable retry policy or backoff, timeout enforcement, panic recovery, cancellation, graceful worker draining, idempotent submission, metrics, or tracing. These capabilities belong to later milestones.
+Cancellation and timeout are cooperative; Quarry cannot stop a handler that ignores its context. A forced worker shutdown leaves unfinished attempts for lease recovery, so duplicate execution remains possible under the at-least-once guarantee. Metrics and tracing remain deferred to Milestone 5.

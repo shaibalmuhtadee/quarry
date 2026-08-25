@@ -64,8 +64,18 @@ func TestMigrationsApplyRollbackAndReapply(t *testing.T) {
 	}
 	verifyVersion(t, ctx, db, 3)
 	seedPreLeaseRunningJob(t, ctx, db)
-	applyMigrations(t, ctx, db, migrationDirectory)
+	if err := goose.UpToContext(ctx, db, migrationDirectory, 4); err != nil {
+		t.Fatalf("apply migration 4: %v", err)
+	}
 	verifyLeaseMigrationBackfill(t, ctx, db)
+	seedPreFailureDetailsAbandonedAttempt(t, ctx, db)
+	if err := goose.UpToContext(ctx, db, migrationDirectory, 5); err != nil {
+		t.Fatalf("apply migration 5: %v", err)
+	}
+	verifyAttemptFailureBackfill(t, ctx, db)
+	applyMigrations(t, ctx, db, migrationDirectory)
+	verifyIdempotencyMigrationExistingJob(t, ctx, db)
+	verifyCancellationMigrationExistingJob(t, ctx, db)
 	verifySchema(t, ctx, db)
 
 	if err := goose.DownToContext(ctx, db, migrationDirectory, 0); err != nil {
@@ -95,7 +105,23 @@ func applyMigrations(t *testing.T, ctx context.Context, db *sql.DB, directory st
 	if err := goose.UpContext(ctx, db, directory); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
-	verifyVersion(t, ctx, db, 4)
+	verifyVersion(t, ctx, db, 7)
+}
+
+func verifyCancellationMigrationExistingJob(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+
+	var cancellationIsNull bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT cancel_requested_at IS NULL
+		FROM jobs
+		WHERE id = '00000000-0000-0000-0000-000000000021'
+	`).Scan(&cancellationIsNull); err != nil {
+		t.Fatalf("read existing job after cancellation migration: %v", err)
+	}
+	if !cancellationIsNull {
+		t.Fatal("existing job cancellation request is not null")
+	}
 }
 
 func seedPreLeaseRunningJob(t *testing.T, ctx context.Context, db *sql.DB) {
@@ -151,6 +177,47 @@ func verifyLeaseMigrationBackfill(t *testing.T, ctx context.Context, db *sql.DB)
 	}
 }
 
+func seedPreFailureDetailsAbandonedAttempt(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+	if _, err := db.ExecContext(ctx, `
+		UPDATE job_attempts
+		SET status = 'abandoned', finished_at = statement_timestamp()
+		WHERE job_id = '00000000-0000-0000-0000-000000000021'
+	`); err != nil {
+		t.Fatalf("seed pre-failure-details abandoned attempt: %v", err)
+	}
+}
+
+func verifyAttemptFailureBackfill(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+	var code, message string
+	if err := db.QueryRowContext(ctx, `
+		SELECT error_code, error_message
+		FROM job_attempts
+		WHERE job_id = '00000000-0000-0000-0000-000000000021'
+	`).Scan(&code, &message); err != nil {
+		t.Fatalf("read attempt failure backfill: %v", err)
+	}
+	if code != "lease_expired" || message != "worker lease expired before the attempt completed" {
+		t.Fatalf("attempt failure backfill = (%q, %q)", code, message)
+	}
+}
+
+func verifyIdempotencyMigrationExistingJob(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+	var keyIsNull, hashIsNull bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT idempotency_key IS NULL, request_hash IS NULL
+		FROM jobs
+		WHERE id = '00000000-0000-0000-0000-000000000021'
+	`).Scan(&keyIsNull, &hashIsNull); err != nil {
+		t.Fatalf("read existing job after idempotency migration: %v", err)
+	}
+	if !keyIsNull || !hashIsNull {
+		t.Fatalf("existing job idempotency fields null = key %t, hash %t", keyIsNull, hashIsNull)
+	}
+}
+
 func verifyVersion(t *testing.T, ctx context.Context, db *sql.DB, want int64) {
 	t.Helper()
 
@@ -175,6 +242,13 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 			t.Fatalf("table %q does not exist", table)
 		}
 	}
+	var idempotencyIndexExists bool
+	if err := db.QueryRowContext(ctx, `SELECT to_regclass('jobs_idempotency_idx') IS NOT NULL`).Scan(&idempotencyIndexExists); err != nil {
+		t.Fatalf("check idempotency index: %v", err)
+	}
+	if !idempotencyIndexExists {
+		t.Fatal("submission idempotency index does not exist")
+	}
 
 	const jobID = "00000000-0000-0000-0000-000000000001"
 	const workerID = "00000000-0000-0000-0000-000000000010"
@@ -191,10 +265,32 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 		t.Fatalf("insert valid job: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, `
+		INSERT INTO jobs (
+			id, job_type, payload, status, max_attempts, timeout_ms, idempotency_key, request_hash
+		)
+		VALUES (
+			'00000000-0000-0000-0000-000000000030', 'idempotency.test', '{}', 'queued', 3, 30000,
+			'request-1', decode(repeat('ab', 32), 'hex')
+		), (
+			'00000000-0000-0000-0000-000000000031', 'idempotency.other', '{}', 'queued', 3, 30000,
+			'request-1', decode(repeat('cd', 32), 'hex')
+		)
+	`); err != nil {
+		t.Fatalf("insert valid idempotent jobs: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
 		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)
 		VALUES ($1, 1, $2, 'running', now())
 	`, jobID, workerID); err != nil {
 		t.Fatalf("insert valid attempt: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO job_attempts (
+			job_id, attempt_no, worker_id, status, error_code, error_message, started_at, finished_at
+		)
+		VALUES ($1, 2, $2, 'retryable_failed', 'dependency_timeout', 'dependency timed out', now(), now())
+	`, jobID, workerID); err != nil {
+		t.Fatalf("insert valid failed attempt: %v", err)
 	}
 
 	expectConstraintError(t, ctx, db, "23514", `
@@ -235,6 +331,35 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 		VALUES ('00000000-0000-0000-0000-000000000005', 'test', '{}', 'queued', -1, 3, 30000)
 	`)
 	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms, idempotency_key)
+		VALUES ('00000000-0000-0000-0000-000000000032', 'idempotency.test', '{}', 'queued', 3, 30000, 'missing-hash')
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms, request_hash)
+		VALUES (
+			'00000000-0000-0000-0000-000000000033', 'idempotency.test', '{}', 'queued', 3, 30000,
+			decode(repeat('ab', 32), 'hex')
+		)
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO jobs (
+			id, job_type, payload, status, max_attempts, timeout_ms, idempotency_key, request_hash
+		)
+		VALUES (
+			'00000000-0000-0000-0000-000000000034', 'idempotency.test', '{}', 'queued', 3, 30000,
+			'wrong-hash-size', decode('ab', 'hex')
+		)
+	`)
+	expectConstraintError(t, ctx, db, "23505", `
+		INSERT INTO jobs (
+			id, job_type, payload, status, max_attempts, timeout_ms, idempotency_key, request_hash
+		)
+		VALUES (
+			'00000000-0000-0000-0000-000000000035', 'idempotency.test', '{}', 'queued', 3, 30000,
+			'request-1', decode(repeat('ef', 32), 'hex')
+		)
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
 		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
 		VALUES ('00000000-0000-0000-0000-000000000006', 'test', '{}', 'queued', 0, 30000)
 	`)
@@ -269,11 +394,19 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 	`)
 	expectConstraintError(t, ctx, db, "23514", `
 		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)
-		VALUES ('00000000-0000-0000-0000-000000000001', 2, '00000000-0000-0000-0000-000000000010', '', now())
+		VALUES ('00000000-0000-0000-0000-000000000001', 3, '00000000-0000-0000-0000-000000000010', '', now())
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at, finished_at)
+		VALUES ('00000000-0000-0000-0000-000000000001', 3, '00000000-0000-0000-0000-000000000010', 'permanent_failed', now(), now())
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, error_code, error_message, started_at)
+		VALUES ('00000000-0000-0000-0000-000000000001', 3, '00000000-0000-0000-0000-000000000010', 'running', 'unexpected', 'not allowed', now())
 	`)
 	expectConstraintError(t, ctx, db, "23502", `
 		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)
-		VALUES ('00000000-0000-0000-0000-000000000001', 2, '00000000-0000-0000-0000-000000000010', 'running', NULL)
+		VALUES ('00000000-0000-0000-0000-000000000001', 3, '00000000-0000-0000-0000-000000000010', 'running', NULL)
 	`)
 	expectConstraintError(t, ctx, db, "23505", `
 		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)
@@ -285,7 +418,7 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 	`)
 	expectConstraintError(t, ctx, db, "23503", `
 		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)
-		VALUES ('00000000-0000-0000-0000-000000000001', 2, '00000000-0000-0000-0000-000000000099', 'running', now())
+		VALUES ('00000000-0000-0000-0000-000000000001', 3, '00000000-0000-0000-0000-000000000099', 'running', now())
 	`)
 }
 

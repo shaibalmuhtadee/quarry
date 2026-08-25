@@ -21,7 +21,7 @@ func TestSuccessfulJobAndAttemptHistoryThroughHTTP(t *testing.T) {
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
 	jobStore := postgres.NewJobStore(pool)
-	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	dispatcherStore := newDispatcherTestStore(t, pool, testLeaseDuration)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	server := httptest.NewServer(api.NewHandler(jobStore, pool, logger))
 	t.Cleanup(server.Close)
@@ -52,7 +52,7 @@ func TestSuccessfulJobAndAttemptHistoryThroughHTTP(t *testing.T) {
 	workerID := registerTestWorker(t, ctx, dispatcherStore, 1)
 	acquired := acquireOneTestJob(t, ctx, dispatcherStore, workerID, "http.success")
 	result := mustResult(t, `{"message":"hello","handled":true}`)
-	if err := dispatcherStore.ReportSuccess(ctx, workerID, jobID, acquired.AttemptNumber, result); err != nil {
+	if err := reportSuccess(ctx, dispatcherStore, workerID, jobID, acquired.AttemptNumber, result); err != nil {
 		t.Fatalf("report successful attempt: %v", err)
 	}
 
@@ -92,5 +92,71 @@ func TestSuccessfulJobAndAttemptHistoryThroughHTTP(t *testing.T) {
 	if attempt.Number != 1 || attempt.WorkerID != workerID.String() ||
 		attempt.Status != "succeeded" || attempt.FinishedAt == nil {
 		t.Fatalf("successful HTTP attempt = %#v", attempt)
+	}
+}
+
+func TestFailedJobAndLatestFailureThroughHTTP(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := newDispatcherTestPool(t, ctx)
+	jobStore := postgres.NewJobStore(pool)
+	dispatcherStore := newDispatcherTestStore(t, pool, testLeaseDuration)
+	server := httptest.NewServer(api.NewHandler(
+		jobStore,
+		pool,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	))
+	t.Cleanup(server.Close)
+
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		server.URL+"/v1/jobs",
+		bytes.NewBufferString(`{"type":"http.failure","payload":{},"timeout_ms":30000}`),
+	)
+	if err != nil {
+		t.Fatalf("create job submission request: %v", err)
+	}
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatalf("submit job: %v", err)
+	}
+	var submitted struct {
+		ID string `json:"id"`
+	}
+	decodeAPIResponse(t, response, http.StatusCreated, &submitted)
+	jobID, err := domain.ParseJobID(submitted.ID)
+	if err != nil {
+		t.Fatalf("parse submitted job ID: %v", err)
+	}
+
+	workerID := registerTestWorker(t, ctx, dispatcherStore, 1)
+	acquired := acquireOneTestJob(t, ctx, dispatcherStore, workerID, "http.failure")
+	if err := dispatcherStore.ReportAttempt(
+		ctx,
+		workerID,
+		jobID,
+		acquired.AttemptNumber,
+		mustFailureOutcome(t, domain.NewPermanentFailureOutcome),
+	); err != nil {
+		t.Fatalf("report permanent failure: %v", err)
+	}
+
+	response, err = server.Client().Get(server.URL + "/v1/jobs/" + submitted.ID)
+	if err != nil {
+		t.Fatalf("get failed job: %v", err)
+	}
+	var job struct {
+		Status        domain.JobStatus `json:"status"`
+		LatestFailure *struct {
+			ErrorCode    string `json:"error_code"`
+			ErrorMessage string `json:"error_message"`
+		} `json:"latest_failure"`
+	}
+	decodeAPIResponse(t, response, http.StatusOK, &job)
+	if job.Status != domain.JobStatusDeadLettered || job.LatestFailure == nil ||
+		job.LatestFailure.ErrorCode != "dependency_timeout" ||
+		job.LatestFailure.ErrorMessage != "dependency timed out" {
+		t.Fatalf("failed HTTP job = %#v", job)
 	}
 }

@@ -12,84 +12,73 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const createJob = `-- name: CreateJob :one
-INSERT INTO jobs (
-    id,
-    job_type,
-    payload,
-    status,
-    max_attempts,
-    timeout_ms
-)
-VALUES ($1, $2, $3, 'queued', $4, $5)
-RETURNING id, job_type, payload, result, status, attempt_count, max_attempts, timeout_ms, created_at, updated_at, finished_at
+const cancelPendingJob = `-- name: CancelPendingJob :execrows
+UPDATE jobs
+SET status = 'cancelled',
+    cancel_requested_at = $1,
+    finished_at = $1,
+    updated_at = $1
+WHERE id = $2
+  AND status IN ('queued', 'retry_wait')
+  AND cancel_requested_at IS NULL
 `
 
-type CreateJobParams struct {
-	ID          uuid.UUID
-	JobType     string
-	Payload     []byte
-	MaxAttempts int32
-	TimeoutMs   int64
+type CancelPendingJobParams struct {
+	TransitionTime pgtype.Timestamptz
+	JobID          uuid.UUID
 }
 
-type CreateJobRow struct {
-	ID           uuid.UUID
-	JobType      string
-	Payload      []byte
-	Result       []byte
-	Status       string
-	AttemptCount int32
-	MaxAttempts  int32
-	TimeoutMs    int64
-	CreatedAt    pgtype.Timestamptz
-	UpdatedAt    pgtype.Timestamptz
-	FinishedAt   pgtype.Timestamptz
-}
-
-func (q *Queries) CreateJob(ctx context.Context, arg CreateJobParams) (CreateJobRow, error) {
-	row := q.db.QueryRow(ctx, createJob,
-		arg.ID,
-		arg.JobType,
-		arg.Payload,
-		arg.MaxAttempts,
-		arg.TimeoutMs,
-	)
-	var i CreateJobRow
-	err := row.Scan(
-		&i.ID,
-		&i.JobType,
-		&i.Payload,
-		&i.Result,
-		&i.Status,
-		&i.AttemptCount,
-		&i.MaxAttempts,
-		&i.TimeoutMs,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.FinishedAt,
-	)
-	return i, err
+func (q *Queries) CancelPendingJob(ctx context.Context, arg CancelPendingJobParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelPendingJob, arg.TransitionTime, arg.JobID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getJob = `-- name: GetJob :one
-SELECT id, job_type, payload, result, status, attempt_count, max_attempts, timeout_ms, created_at, updated_at, finished_at
+SELECT
+    jobs.id,
+    jobs.job_type,
+    jobs.payload,
+    jobs.result,
+    jobs.status,
+    jobs.attempt_count,
+    jobs.max_attempts,
+    jobs.timeout_ms,
+    jobs.created_at,
+    jobs.updated_at,
+    jobs.finished_at,
+    jobs.cancel_requested_at,
+    latest_failure.error_code AS latest_failure_error_code,
+    latest_failure.error_message AS latest_failure_error_message
 FROM jobs
-WHERE id = $1
+LEFT JOIN LATERAL (
+    SELECT error_code, error_message
+    FROM job_attempts
+    WHERE job_id = jobs.id
+      AND error_code IS NOT NULL
+    ORDER BY attempt_no DESC
+    LIMIT 1
+) AS latest_failure ON true
+WHERE jobs.id = $1
 `
 
 type GetJobRow struct {
-	ID           uuid.UUID
-	JobType      string
-	Payload      []byte
-	Result       []byte
-	Status       string
-	AttemptCount int32
-	MaxAttempts  int32
-	TimeoutMs    int64
-	CreatedAt    pgtype.Timestamptz
-	UpdatedAt    pgtype.Timestamptz
-	FinishedAt   pgtype.Timestamptz
+	ID                        uuid.UUID
+	JobType                   string
+	Payload                   []byte
+	Result                    []byte
+	Status                    string
+	AttemptCount              int32
+	MaxAttempts               int32
+	TimeoutMs                 int64
+	CreatedAt                 pgtype.Timestamptz
+	UpdatedAt                 pgtype.Timestamptz
+	FinishedAt                pgtype.Timestamptz
+	CancelRequestedAt         pgtype.Timestamptz
+	LatestFailureErrorCode    pgtype.Text
+	LatestFailureErrorMessage pgtype.Text
 }
 
 func (q *Queries) GetJob(ctx context.Context, id uuid.UUID) (GetJobRow, error) {
@@ -107,6 +96,9 @@ func (q *Queries) GetJob(ctx context.Context, id uuid.UUID) (GetJobRow, error) {
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.FinishedAt,
+		&i.CancelRequestedAt,
+		&i.LatestFailureErrorCode,
+		&i.LatestFailureErrorMessage,
 	)
 	return i, err
 }
@@ -117,6 +109,8 @@ SELECT
     job_attempts.attempt_no,
     job_attempts.worker_id,
     job_attempts.status,
+    job_attempts.error_code,
+    job_attempts.error_message,
     job_attempts.started_at,
     job_attempts.finished_at
 FROM jobs
@@ -126,12 +120,14 @@ ORDER BY job_attempts.attempt_no
 `
 
 type GetJobAttemptsRow struct {
-	JobID      uuid.UUID
-	AttemptNo  pgtype.Int4
-	WorkerID   pgtype.UUID
-	Status     pgtype.Text
-	StartedAt  pgtype.Timestamptz
-	FinishedAt pgtype.Timestamptz
+	JobID        uuid.UUID
+	AttemptNo    pgtype.Int4
+	WorkerID     pgtype.UUID
+	Status       pgtype.Text
+	ErrorCode    pgtype.Text
+	ErrorMessage pgtype.Text
+	StartedAt    pgtype.Timestamptz
+	FinishedAt   pgtype.Timestamptz
 }
 
 func (q *Queries) GetJobAttempts(ctx context.Context, id uuid.UUID) ([]GetJobAttemptsRow, error) {
@@ -148,6 +144,8 @@ func (q *Queries) GetJobAttempts(ctx context.Context, id uuid.UUID) ([]GetJobAtt
 			&i.AttemptNo,
 			&i.WorkerID,
 			&i.Status,
+			&i.ErrorCode,
+			&i.ErrorMessage,
 			&i.StartedAt,
 			&i.FinishedAt,
 		); err != nil {
@@ -159,4 +157,197 @@ func (q *Queries) GetJobAttempts(ctx context.Context, id uuid.UUID) ([]GetJobAtt
 		return nil, err
 	}
 	return items, nil
+}
+
+const getJobByIdempotencyKey = `-- name: GetJobByIdempotencyKey :one
+SELECT
+    id,
+    job_type,
+    payload,
+    result,
+    status,
+    attempt_count,
+    max_attempts,
+    timeout_ms,
+    created_at,
+    updated_at,
+    finished_at,
+    cancel_requested_at,
+    request_hash
+FROM jobs
+WHERE job_type = $1 AND idempotency_key = $2
+`
+
+type GetJobByIdempotencyKeyParams struct {
+	JobType        string
+	IdempotencyKey pgtype.Text
+}
+
+type GetJobByIdempotencyKeyRow struct {
+	ID                uuid.UUID
+	JobType           string
+	Payload           []byte
+	Result            []byte
+	Status            string
+	AttemptCount      int32
+	MaxAttempts       int32
+	TimeoutMs         int64
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
+	FinishedAt        pgtype.Timestamptz
+	CancelRequestedAt pgtype.Timestamptz
+	RequestHash       []byte
+}
+
+func (q *Queries) GetJobByIdempotencyKey(ctx context.Context, arg GetJobByIdempotencyKeyParams) (GetJobByIdempotencyKeyRow, error) {
+	row := q.db.QueryRow(ctx, getJobByIdempotencyKey, arg.JobType, arg.IdempotencyKey)
+	var i GetJobByIdempotencyKeyRow
+	err := row.Scan(
+		&i.ID,
+		&i.JobType,
+		&i.Payload,
+		&i.Result,
+		&i.Status,
+		&i.AttemptCount,
+		&i.MaxAttempts,
+		&i.TimeoutMs,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.FinishedAt,
+		&i.CancelRequestedAt,
+		&i.RequestHash,
+	)
+	return i, err
+}
+
+const lockJobForCancellation = `-- name: LockJobForCancellation :one
+SELECT status, cancel_requested_at
+FROM jobs
+WHERE id = $1
+FOR UPDATE
+`
+
+type LockJobForCancellationRow struct {
+	Status            string
+	CancelRequestedAt pgtype.Timestamptz
+}
+
+func (q *Queries) LockJobForCancellation(ctx context.Context, id uuid.UUID) (LockJobForCancellationRow, error) {
+	row := q.db.QueryRow(ctx, lockJobForCancellation, id)
+	var i LockJobForCancellationRow
+	err := row.Scan(&i.Status, &i.CancelRequestedAt)
+	return i, err
+}
+
+const requestRunningJobCancellation = `-- name: RequestRunningJobCancellation :execrows
+UPDATE jobs
+SET cancel_requested_at = $1,
+    updated_at = $1
+WHERE id = $2
+  AND status = 'running'
+  AND cancel_requested_at IS NULL
+`
+
+type RequestRunningJobCancellationParams struct {
+	TransitionTime pgtype.Timestamptz
+	JobID          uuid.UUID
+}
+
+func (q *Queries) RequestRunningJobCancellation(ctx context.Context, arg RequestRunningJobCancellationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, requestRunningJobCancellation, arg.TransitionTime, arg.JobID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const submitJob = `-- name: SubmitJob :one
+INSERT INTO jobs (
+    id,
+    job_type,
+    payload,
+    status,
+    max_attempts,
+    timeout_ms,
+    idempotency_key,
+    request_hash
+)
+VALUES (
+    $1,
+    $2,
+    $3,
+    'queued',
+    $4,
+    $5,
+    $6,
+    $7
+)
+ON CONFLICT (job_type, idempotency_key) WHERE idempotency_key IS NOT NULL
+DO NOTHING
+RETURNING
+    id,
+    job_type,
+    payload,
+    result,
+    status,
+    attempt_count,
+    max_attempts,
+    timeout_ms,
+    created_at,
+    updated_at,
+    finished_at,
+    cancel_requested_at
+`
+
+type SubmitJobParams struct {
+	ID             uuid.UUID
+	JobType        string
+	Payload        []byte
+	MaxAttempts    int32
+	TimeoutMs      int64
+	IdempotencyKey pgtype.Text
+	RequestHash    []byte
+}
+
+type SubmitJobRow struct {
+	ID                uuid.UUID
+	JobType           string
+	Payload           []byte
+	Result            []byte
+	Status            string
+	AttemptCount      int32
+	MaxAttempts       int32
+	TimeoutMs         int64
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
+	FinishedAt        pgtype.Timestamptz
+	CancelRequestedAt pgtype.Timestamptz
+}
+
+func (q *Queries) SubmitJob(ctx context.Context, arg SubmitJobParams) (SubmitJobRow, error) {
+	row := q.db.QueryRow(ctx, submitJob,
+		arg.ID,
+		arg.JobType,
+		arg.Payload,
+		arg.MaxAttempts,
+		arg.TimeoutMs,
+		arg.IdempotencyKey,
+		arg.RequestHash,
+	)
+	var i SubmitJobRow
+	err := row.Scan(
+		&i.ID,
+		&i.JobType,
+		&i.Payload,
+		&i.Result,
+		&i.Status,
+		&i.AttemptCount,
+		&i.MaxAttempts,
+		&i.TimeoutMs,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.FinishedAt,
+		&i.CancelRequestedAt,
+	)
+	return i, err
 }

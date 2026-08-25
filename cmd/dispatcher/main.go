@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"os"
 	"os/signal"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/shaibalmuhtadee/quarry/internal/dispatcher"
+	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	dispatcherv1 "github.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1"
 	"github.com/shaibalmuhtadee/quarry/internal/store/postgres"
 	"google.golang.org/grpc"
@@ -24,6 +26,8 @@ const (
 	defaultLeaseDuration     = 20 * time.Second
 	defaultReaperInterval    = time.Second
 	defaultReaperBatchSize   = int32(100)
+	defaultRetryBaseDelay    = domain.DefaultRetryBaseDelay
+	defaultRetryMaxDelay     = domain.DefaultRetryMaxDelay
 	shutdownTimeout          = 10 * time.Second
 )
 
@@ -34,6 +38,8 @@ type config struct {
 	reaperInterval    time.Duration
 	reaperBatchSize   int32
 	workerLiveness    time.Duration
+	retryBaseDelay    time.Duration
+	retryMaxDelay     time.Duration
 }
 
 func main() {
@@ -105,6 +111,25 @@ func loadConfig() (config, error) {
 	if workerLiveness <= 0 || workerLiveness%time.Millisecond != 0 {
 		return config{}, errors.New("QUARRY_WORKER_LIVENESS_TIMEOUT must be a positive whole number of milliseconds")
 	}
+	retryBaseDelay := defaultRetryBaseDelay
+	if value := os.Getenv("QUARRY_RETRY_BASE_DELAY"); value != "" {
+		parsed, err := time.ParseDuration(value)
+		if err != nil {
+			return config{}, fmt.Errorf("parse QUARRY_RETRY_BASE_DELAY: %w", err)
+		}
+		retryBaseDelay = parsed
+	}
+	retryMaxDelay := defaultRetryMaxDelay
+	if value := os.Getenv("QUARRY_RETRY_MAX_DELAY"); value != "" {
+		parsed, err := time.ParseDuration(value)
+		if err != nil {
+			return config{}, fmt.Errorf("parse QUARRY_RETRY_MAX_DELAY: %w", err)
+		}
+		retryMaxDelay = parsed
+	}
+	if _, err := domain.NewRetryPolicy(retryBaseDelay, retryMaxDelay, rand.Int64N); err != nil {
+		return config{}, fmt.Errorf("configure retry policy: %w", err)
+	}
 
 	return config{
 		databaseURL:       databaseURL,
@@ -113,6 +138,8 @@ func loadConfig() (config, error) {
 		reaperInterval:    reaperInterval,
 		reaperBatchSize:   reaperBatchSize,
 		workerLiveness:    workerLiveness,
+		retryBaseDelay:    retryBaseDelay,
+		retryMaxDelay:     retryMaxDelay,
 	}, nil
 }
 
@@ -127,7 +154,11 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("listen on %q: %w", cfg.dispatcherAddress, err)
 	}
-	store := postgres.NewDispatcherStore(pool, cfg.leaseDuration)
+	retryPolicy, err := domain.NewRetryPolicy(cfg.retryBaseDelay, cfg.retryMaxDelay, rand.Int64N)
+	if err != nil {
+		return fmt.Errorf("configure retry policy: %w", err)
+	}
+	store := postgres.NewDispatcherStore(pool, cfg.leaseDuration, retryPolicy)
 	reaper, err := dispatcher.NewReaper(store, dispatcher.ReaperConfig{
 		Interval:              cfg.reaperInterval,
 		BatchSize:             cfg.reaperBatchSize,

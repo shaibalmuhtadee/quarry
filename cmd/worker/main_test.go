@@ -23,6 +23,7 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("QUARRY_WORKER_VERSION", "")
 	t.Setenv("QUARRY_WORKER_CONCURRENCY", "")
 	t.Setenv("QUARRY_HEARTBEAT_INTERVAL", "")
+	t.Setenv("QUARRY_WORKER_SHUTDOWN_TIMEOUT", "")
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -30,7 +31,7 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 	}
 	if cfg.dispatcherAddress != defaultDispatcherAddress || cfg.hostname != "test-host" ||
 		cfg.version != defaultVersion || cfg.concurrency != defaultConcurrency ||
-		cfg.heartbeatInterval != defaultHeartbeatInterval {
+		cfg.heartbeatInterval != defaultHeartbeatInterval || cfg.shutdownTimeout != defaultShutdownTimeout {
 		t.Fatalf("default config = %#v", cfg)
 	}
 
@@ -39,12 +40,14 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("QUARRY_WORKER_VERSION", "v2")
 	t.Setenv("QUARRY_WORKER_CONCURRENCY", "7")
 	t.Setenv("QUARRY_HEARTBEAT_INTERVAL", "3s")
+	t.Setenv("QUARRY_WORKER_SHUTDOWN_TIMEOUT", "7s")
 	cfg, err = loadConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.dispatcherAddress != "127.0.0.1:19090" || cfg.hostname != "worker-a" ||
-		cfg.version != "v2" || cfg.concurrency != 7 || cfg.heartbeatInterval != 3*time.Second {
+		cfg.version != "v2" || cfg.concurrency != 7 || cfg.heartbeatInterval != 3*time.Second ||
+		cfg.shutdownTimeout != 7*time.Second {
 		t.Fatalf("overridden config = %#v", cfg)
 	}
 }
@@ -73,6 +76,18 @@ func TestLoadConfigRejectsInvalidConcurrency(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRejectsInvalidShutdownTimeout(t *testing.T) {
+	for _, value := range []string{"invalid", "0s", "-1s"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("QUARRY_WORKER_HOSTNAME", "test-host")
+			t.Setenv("QUARRY_WORKER_SHUTDOWN_TIMEOUT", value)
+			if _, err := loadConfig(); err == nil {
+				t.Fatalf("loadConfig accepted shutdown timeout %q", value)
+			}
+		})
+	}
+}
+
 func TestRunRegistersFreshIdentityAndStopsOnCancellation(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -96,6 +111,7 @@ func TestRunRegistersFreshIdentityAndStopsOnCancellation(t *testing.T) {
 		version:           "test-version",
 		concurrency:       2,
 		heartbeatInterval: 10 * time.Millisecond,
+		shutdownTimeout:   time.Second,
 	}
 	first := runUntilAcquisition(t, cfg, service.acquired)
 	second := runUntilAcquisition(t, cfg, service.acquired)

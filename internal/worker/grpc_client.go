@@ -110,24 +110,82 @@ func (client *GRPCClient) Heartbeat(
 	return results, nil
 }
 
-func (client *GRPCClient) ReportSuccess(
+func (client *GRPCClient) ReportAttempt(
 	ctx context.Context,
 	workerID domain.WorkerID,
 	jobID domain.JobID,
 	attemptNumber domain.AttemptNumber,
-	result domain.Result,
+	outcome domain.AttemptOutcome,
 ) error {
-	callCtx, cancel := context.WithTimeout(ctx, client.timeout)
-	defer cancel()
-	_, err := client.client.ReportAttempt(callCtx, &dispatcherv1.ReportAttemptRequest{
+	request := &dispatcherv1.ReportAttemptRequest{
 		WorkerId:  workerID.String(),
 		JobId:     jobID.String(),
 		AttemptNo: uint32(attemptNumber.Int32()),
-		Outcome: &dispatcherv1.ReportAttemptRequest_Succeeded{
+	}
+	switch outcome.Kind() {
+	case domain.AttemptOutcomeKindSucceeded:
+		result, ok := outcome.Result()
+		if !ok {
+			return domain.ErrInvalidAttemptOutcome
+		}
+		request.Outcome = &dispatcherv1.ReportAttemptRequest_Succeeded{
 			Succeeded: &dispatcherv1.AttemptSucceeded{ResultJson: result.JSON()},
-		},
-	})
+		}
+	case domain.AttemptOutcomeKindRetryableFailure:
+		failure, ok := outcome.Failure()
+		if !ok {
+			return domain.ErrInvalidAttemptOutcome
+		}
+		request.Outcome = &dispatcherv1.ReportAttemptRequest_RetryableFailure{
+			RetryableFailure: mapAttemptFailure(failure),
+		}
+	case domain.AttemptOutcomeKindPermanentFailure:
+		failure, ok := outcome.Failure()
+		if !ok {
+			return domain.ErrInvalidAttemptOutcome
+		}
+		request.Outcome = &dispatcherv1.ReportAttemptRequest_PermanentFailure{
+			PermanentFailure: mapAttemptFailure(failure),
+		}
+	case domain.AttemptOutcomeKindCancelled:
+		failure, ok := outcome.Failure()
+		if !ok {
+			return domain.ErrInvalidAttemptOutcome
+		}
+		request.Outcome = &dispatcherv1.ReportAttemptRequest_Cancelled{
+			Cancelled: mapAttemptFailure(failure),
+		}
+	case domain.AttemptOutcomeKindTimedOut:
+		failure, ok := outcome.Failure()
+		if !ok {
+			return domain.ErrInvalidAttemptOutcome
+		}
+		request.Outcome = &dispatcherv1.ReportAttemptRequest_TimedOut{
+			TimedOut: mapAttemptFailure(failure),
+		}
+	case domain.AttemptOutcomeKindPanicked:
+		failure, ok := outcome.Failure()
+		if !ok {
+			return domain.ErrInvalidAttemptOutcome
+		}
+		request.Outcome = &dispatcherv1.ReportAttemptRequest_Panicked{
+			Panicked: mapAttemptFailure(failure),
+		}
+	default:
+		return fmt.Errorf("%w: worker cannot report outcome %q", domain.ErrInvalidAttemptOutcome, outcome.Kind())
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, client.timeout)
+	defer cancel()
+	_, err := client.client.ReportAttempt(callCtx, request)
 	return err
+}
+
+func mapAttemptFailure(failure domain.AttemptFailure) *dispatcherv1.AttemptFailure {
+	return &dispatcherv1.AttemptFailure{
+		ErrorCode:    failure.Code(),
+		ErrorMessage: failure.Message(),
+	}
 }
 
 func parseAcquiredJob(acquired *dispatcherv1.AcquiredJob) (Job, error) {
@@ -190,12 +248,16 @@ func parseHeartbeatResult(value *dispatcherv1.HeartbeatAttemptResult) (Heartbeat
 	default:
 		return HeartbeatResult{}, errors.New("heartbeat result state must be valid or stale")
 	}
+	if !valid && value.GetCancelRequested() {
+		return HeartbeatResult{}, errors.New("stale heartbeat result cannot request cancellation")
+	}
 
 	return HeartbeatResult{
 		Attempt: HeartbeatAttempt{
 			JobID:         jobID,
 			AttemptNumber: attemptNumber,
 		},
-		Valid: valid,
+		Valid:           valid,
+		CancelRequested: value.GetCancelRequested(),
 	}, nil
 }

@@ -19,17 +19,31 @@ import (
 )
 
 type fakeJobStore struct {
-	createJob       func(context.Context, domain.JobSubmission) (domain.Job, error)
-	getJob          func(context.Context, domain.JobID) (domain.Job, error)
-	listJobAttempts func(context.Context, domain.JobID) ([]domain.Attempt, error)
+	submitJob           func(context.Context, domain.JobSubmission) (domain.JobSubmissionResult, error)
+	getJob              func(context.Context, domain.JobID) (domain.Job, error)
+	requestCancellation func(context.Context, domain.JobID) (domain.Job, error)
+	listJobAttempts     func(context.Context, domain.JobID) ([]domain.Attempt, error)
 }
 
-func (store *fakeJobStore) CreateJob(ctx context.Context, submission domain.JobSubmission) (domain.Job, error) {
-	return store.createJob(ctx, submission)
+type createJobBody struct {
+	ID           string    `json:"id"`
+	Deduplicated bool      `json:"deduplicated"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+func (store *fakeJobStore) SubmitJob(ctx context.Context, submission domain.JobSubmission) (domain.JobSubmissionResult, error) {
+	return store.submitJob(ctx, submission)
 }
 
 func (store *fakeJobStore) GetJob(ctx context.Context, id domain.JobID) (domain.Job, error) {
 	return store.getJob(ctx, id)
+}
+
+func (store *fakeJobStore) RequestCancellation(ctx context.Context, id domain.JobID) (domain.Job, error) {
+	if store.requestCancellation == nil {
+		return domain.Job{}, errors.New("unexpected cancellation request")
+	}
+	return store.requestCancellation(ctx, id)
 }
 
 func (store *fakeJobStore) ListJobAttempts(ctx context.Context, id domain.JobID) ([]domain.Attempt, error) {
@@ -51,9 +65,9 @@ func TestCreateJobUsesDefaultsAndReturnsCreatedJob(t *testing.T) {
 	createdAt := time.Date(2026, time.August, 22, 12, 30, 0, 123456000, time.UTC)
 	var captured domain.JobSubmission
 	store := &fakeJobStore{
-		createJob: func(_ context.Context, submission domain.JobSubmission) (domain.Job, error) {
+		submitJob: func(_ context.Context, submission domain.JobSubmission) (domain.JobSubmissionResult, error) {
 			captured = submission
-			return jobFromSubmission(submission, createdAt), nil
+			return domain.JobSubmissionResult{Job: jobFromSubmission(submission, createdAt)}, nil
 		},
 	}
 	handler := newTestHandler(store)
@@ -85,6 +99,12 @@ func TestCreateJobUsesDefaultsAndReturnsCreatedJob(t *testing.T) {
 	if got := captured.Timeout(); got != 30*time.Second {
 		t.Fatalf("stored timeout = %s, want 30s", got)
 	}
+	if _, ok := captured.IdempotencyKey(); ok {
+		t.Fatal("submission without Idempotency-Key became idempotent")
+	}
+	if _, ok := captured.RequestHash(); ok {
+		t.Fatal("submission without Idempotency-Key has a request hash")
+	}
 
 	var body struct {
 		ID           string           `json:"id"`
@@ -107,12 +127,124 @@ func TestCreateJobUsesDefaultsAndReturnsCreatedJob(t *testing.T) {
 	}
 }
 
+func TestCreateJobReturnsDeduplicatedReplay(t *testing.T) {
+	createdAt := time.Date(2026, time.August, 24, 12, 30, 0, 0, time.UTC)
+	existing := testJob(t)
+	existing.CreatedAt = createdAt
+	var captured domain.JobSubmission
+	store := &fakeJobStore{
+		submitJob: func(_ context.Context, submission domain.JobSubmission) (domain.JobSubmissionResult, error) {
+			captured = submission
+			return domain.JobSubmissionResult{Job: existing, Deduplicated: true}, nil
+		},
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(
+		`{"type":"email.send","payload":{"b":2,"a":1},"timeout_ms":30000}`,
+	))
+	request.Header.Set("Idempotency-Key", "customer-order-42")
+	response := httptest.NewRecorder()
+
+	newTestHandler(store).ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("response status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	key, ok := captured.IdempotencyKey()
+	if !ok || key.String() != "customer-order-42" {
+		t.Fatalf("captured idempotency key = %q, present %t", key.String(), ok)
+	}
+	if hash, ok := captured.RequestHash(); !ok || len(hash) != 32 {
+		t.Fatalf("captured request hash length = %d, present %t", len(hash), ok)
+	}
+	if got, want := response.Header().Get("Location"), "/v1/jobs/"+existing.ID.String(); got != want {
+		t.Fatalf("Location = %q, want %q", got, want)
+	}
+	var body createJobBody
+	decodeJSONResponse(t, response, &body)
+	if body.ID != existing.ID.String() || !body.Deduplicated || !body.CreatedAt.Equal(createdAt) {
+		t.Fatalf("deduplicated response = %#v", body)
+	}
+}
+
+func TestCreateJobReturnsIdempotencyConflict(t *testing.T) {
+	store := &fakeJobStore{
+		submitJob: func(context.Context, domain.JobSubmission) (domain.JobSubmissionResult, error) {
+			return domain.JobSubmissionResult{}, fmt.Errorf("submit: %w", domain.ErrIdempotencyConflict)
+		},
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(
+		`{"type":"email.send","payload":{},"timeout_ms":30000}`,
+	))
+	request.Header.Set("Idempotency-Key", "customer-order-42")
+	response := httptest.NewRecorder()
+
+	newTestHandler(store).ServeHTTP(response, request)
+
+	assertErrorResponse(t, response, http.StatusConflict, "idempotency_conflict")
+}
+
+func TestCreateJobHashesResolvedMaximumAttempts(t *testing.T) {
+	var hashes [][]byte
+	store := &fakeJobStore{
+		submitJob: func(_ context.Context, submission domain.JobSubmission) (domain.JobSubmissionResult, error) {
+			hash, ok := submission.RequestHash()
+			if !ok {
+				t.Fatal("idempotent submission has no request hash")
+			}
+			hashes = append(hashes, hash)
+			return domain.JobSubmissionResult{Job: jobFromSubmission(submission, time.Now().UTC())}, nil
+		},
+	}
+	handler := newTestHandler(store)
+	for _, body := range []string{
+		`{"type":"email.send","payload":{"value":1},"timeout_ms":30000}`,
+		`{"type":"email.send","payload":{"value":1},"max_attempts":3,"timeout_ms":30000}`,
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(body))
+		request.Header.Set("Idempotency-Key", "request-1")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("response status = %d, want %d: %s", response.Code, http.StatusCreated, response.Body.String())
+		}
+	}
+	if len(hashes) != 2 || !reflect.DeepEqual(hashes[0], hashes[1]) {
+		t.Fatalf("resolved-default hashes = %x", hashes)
+	}
+}
+
+func TestCreateJobRejectsInvalidIdempotencyKey(t *testing.T) {
+	for _, values := range [][]string{{""}, {strings.Repeat("a", domain.MaxIdempotencyKeyLength+1)}, {"first", "second"}} {
+		t.Run(fmt.Sprint(len(values), " values of length ", len(values[0])), func(t *testing.T) {
+			calls := 0
+			store := &fakeJobStore{
+				submitJob: func(context.Context, domain.JobSubmission) (domain.JobSubmissionResult, error) {
+					calls++
+					return domain.JobSubmissionResult{}, errors.New("unexpected store call")
+				},
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(
+				`{"type":"email.send","payload":{},"timeout_ms":30000}`,
+			))
+			request.Header["Idempotency-Key"] = values
+			response := httptest.NewRecorder()
+
+			newTestHandler(store).ServeHTTP(response, request)
+
+			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_idempotency_key")
+			if calls != 0 {
+				t.Fatalf("store calls = %d, want 0", calls)
+			}
+		})
+	}
+}
+
 func TestCreateJobAcceptsExplicitLimitsAndNullPayload(t *testing.T) {
 	var captured domain.JobSubmission
 	store := &fakeJobStore{
-		createJob: func(_ context.Context, submission domain.JobSubmission) (domain.Job, error) {
+		submitJob: func(_ context.Context, submission domain.JobSubmission) (domain.JobSubmissionResult, error) {
 			captured = submission
-			return jobFromSubmission(submission, time.Now().UTC()), nil
+			return domain.JobSubmissionResult{Job: jobFromSubmission(submission, time.Now().UTC())}, nil
 		},
 	}
 	handler := newTestHandler(store)
@@ -170,9 +302,9 @@ func TestCreateJobRejectsInvalidRequests(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			createCalls := 0
 			store := &fakeJobStore{
-				createJob: func(context.Context, domain.JobSubmission) (domain.Job, error) {
+				submitJob: func(context.Context, domain.JobSubmission) (domain.JobSubmissionResult, error) {
 					createCalls++
-					return domain.Job{}, errors.New("unexpected store call")
+					return domain.JobSubmissionResult{}, errors.New("unexpected store call")
 				},
 			}
 			handler := newTestHandler(store)
@@ -191,8 +323,8 @@ func TestCreateJobRejectsInvalidRequests(t *testing.T) {
 
 func TestCreateJobReturnsGenericInternalError(t *testing.T) {
 	store := &fakeJobStore{
-		createJob: func(context.Context, domain.JobSubmission) (domain.Job, error) {
-			return domain.Job{}, errors.New("database password secret")
+		submitJob: func(context.Context, domain.JobSubmission) (domain.JobSubmissionResult, error) {
+			return domain.JobSubmissionResult{}, errors.New("database password secret")
 		},
 	}
 	handler := newTestHandler(store)
@@ -236,6 +368,9 @@ func TestGetJobReturnsStoredStateWithoutPayload(t *testing.T) {
 	if _, exists := fields["payload"]; exists {
 		t.Fatal("job response included the stored payload")
 	}
+	if _, exists := fields["latest_failure"]; exists {
+		t.Fatal("job response included a latest failure when no attempt failed")
+	}
 	assertJSONField(t, fields, "id", job.ID.String())
 	assertJSONField(t, fields, "type", job.Type.String())
 	assertJSONField(t, fields, "status", string(job.Status))
@@ -249,6 +384,134 @@ func TestGetJobReturnsStoredStateWithoutPayload(t *testing.T) {
 	assertJSONField(t, fields, "updated_at", job.UpdatedAt.Format(time.RFC3339Nano))
 	if got := string(fields["finished_at"]); got != "null" {
 		t.Fatalf("response finish time = %s, want null", got)
+	}
+	if got := string(fields["cancel_requested_at"]); got != "null" {
+		t.Fatalf("response cancellation request time = %s, want null", got)
+	}
+}
+
+func TestGetJobReturnsLatestSafeFailure(t *testing.T) {
+	job := testJob(t)
+	failure, err := domain.NewAttemptFailure("dependency_timeout", "dependency timed out")
+	if err != nil {
+		t.Fatalf("create failure: %v", err)
+	}
+	job.LatestFailure = &failure
+	store := &fakeJobStore{
+		getJob: func(context.Context, domain.JobID) (domain.Job, error) { return job, nil },
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+job.ID.String(), nil)
+	response := httptest.NewRecorder()
+
+	newTestHandler(store).ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("response status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var fields map[string]json.RawMessage
+	decodeJSONResponse(t, response, &fields)
+	var latestFailure map[string]json.RawMessage
+	if err := json.Unmarshal(fields["latest_failure"], &latestFailure); err != nil {
+		t.Fatalf("decode latest failure: %v", err)
+	}
+	assertJSONField(t, latestFailure, "error_code", failure.Code())
+	assertJSONField(t, latestFailure, "error_message", failure.Message())
+}
+
+func TestGetJobReturnsCancellationRequestTime(t *testing.T) {
+	job := testJob(t)
+	requestedAt := job.UpdatedAt.Add(time.Second)
+	job.Status = domain.JobStatusRunning
+	job.CancelRequestedAt = &requestedAt
+	store := &fakeJobStore{
+		getJob: func(context.Context, domain.JobID) (domain.Job, error) { return job, nil },
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+job.ID.String(), nil)
+	response := httptest.NewRecorder()
+
+	newTestHandler(store).ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("response status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var fields map[string]json.RawMessage
+	decodeJSONResponse(t, response, &fields)
+	assertJSONField(t, fields, "cancel_requested_at", requestedAt.Format(time.RFC3339Nano))
+}
+
+func TestCancelJobReturnsStoredCancellationState(t *testing.T) {
+	for _, originalStatus := range []domain.JobStatus{domain.JobStatusQueued, domain.JobStatusRetryWait, domain.JobStatusRunning} {
+		t.Run(string(originalStatus), func(t *testing.T) {
+			job := testJob(t)
+			job.Status = originalStatus
+			requestedAt := job.UpdatedAt.Add(time.Second)
+			job.CancelRequestedAt = &requestedAt
+			if originalStatus != domain.JobStatusRunning {
+				job.Status = domain.JobStatusCancelled
+				job.FinishedAt = &requestedAt
+			}
+			store := &fakeJobStore{
+				requestCancellation: func(_ context.Context, id domain.JobID) (domain.Job, error) {
+					if id != job.ID {
+						t.Fatalf("cancellation job ID = %s, want %s", id, job.ID)
+					}
+					return job, nil
+				},
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID.String()+"/cancel", nil)
+			response := httptest.NewRecorder()
+
+			newTestHandler(store).ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("response status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+			}
+			var fields map[string]json.RawMessage
+			decodeJSONResponse(t, response, &fields)
+			assertJSONField(t, fields, "id", job.ID.String())
+			assertJSONField(t, fields, "status", string(job.Status))
+			assertJSONField(t, fields, "cancel_requested_at", requestedAt.Format(time.RFC3339Nano))
+		})
+	}
+}
+
+func TestCancelJobMapsBoundaryErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		id         string
+		storeError error
+		wantStatus int
+		wantCode   string
+		wantCalls  int
+	}{
+		{name: "invalid ID", id: "bad", wantStatus: http.StatusBadRequest, wantCode: "invalid_job_id"},
+		{name: "not found", id: domain.NewJobID().String(), storeError: domain.ErrJobNotFound, wantStatus: http.StatusNotFound, wantCode: "job_not_found", wantCalls: 1},
+		{name: "terminal conflict", id: domain.NewJobID().String(), storeError: domain.ErrJobCancellationConflict, wantStatus: http.StatusConflict, wantCode: "cancellation_conflict", wantCalls: 1},
+		{name: "internal", id: domain.NewJobID().String(), storeError: errors.New("database password secret"), wantStatus: http.StatusInternalServerError, wantCode: "internal_error", wantCalls: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			store := &fakeJobStore{
+				requestCancellation: func(context.Context, domain.JobID) (domain.Job, error) {
+					calls++
+					return domain.Job{}, test.storeError
+				},
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+test.id+"/cancel", nil)
+			response := httptest.NewRecorder()
+
+			newTestHandler(store).ServeHTTP(response, request)
+
+			assertErrorResponse(t, response, test.wantStatus, test.wantCode)
+			if calls != test.wantCalls {
+				t.Fatalf("cancellation calls = %d, want %d", calls, test.wantCalls)
+			}
+			if strings.Contains(response.Body.String(), "database password secret") {
+				t.Fatal("response exposed the internal store error")
+			}
+		})
 	}
 }
 
@@ -333,6 +596,10 @@ func TestGetJobAttemptsReturnsAttemptsInStoreOrder(t *testing.T) {
 	firstFinishedAt := firstStartedAt.Add(time.Second)
 	secondStartedAt := firstFinishedAt.Add(time.Second)
 	secondFinishedAt := secondStartedAt.Add(time.Second)
+	failure, err := domain.NewAttemptFailure("invalid_input", "handler rejected the input")
+	if err != nil {
+		t.Fatalf("create attempt failure: %v", err)
+	}
 	store := &fakeJobStore{
 		listJobAttempts: func(context.Context, domain.JobID) ([]domain.Attempt, error) {
 			return []domain.Attempt{
@@ -348,7 +615,8 @@ func TestGetJobAttemptsReturnsAttemptsInStoreOrder(t *testing.T) {
 					JobID:      id,
 					Number:     secondNumber,
 					WorkerID:   workerID,
-					Status:     domain.AttemptStatusSucceeded,
+					Status:     domain.AttemptStatusPermanentFailed,
+					Failure:    &failure,
 					StartedAt:  secondStartedAt,
 					FinishedAt: &secondFinishedAt,
 				},
@@ -366,11 +634,13 @@ func TestGetJobAttemptsReturnsAttemptsInStoreOrder(t *testing.T) {
 	}
 	var body struct {
 		Attempts []struct {
-			Number     int32                `json:"attempt_no"`
-			WorkerID   string               `json:"worker_id"`
-			Status     domain.AttemptStatus `json:"status"`
-			StartedAt  time.Time            `json:"started_at"`
-			FinishedAt *time.Time           `json:"finished_at"`
+			Number       int32                `json:"attempt_no"`
+			WorkerID     string               `json:"worker_id"`
+			Status       domain.AttemptStatus `json:"status"`
+			ErrorCode    *string              `json:"error_code"`
+			ErrorMessage *string              `json:"error_message"`
+			StartedAt    time.Time            `json:"started_at"`
+			FinishedAt   *time.Time           `json:"finished_at"`
 		} `json:"attempts"`
 	}
 	decodeJSONResponse(t, response, &body)
@@ -381,12 +651,20 @@ func TestGetJobAttemptsReturnsAttemptsInStoreOrder(t *testing.T) {
 		t.Fatalf("attempt order = [%d, %d], want [1, 2]", body.Attempts[0].Number, body.Attempts[1].Number)
 	}
 	for i, attempt := range body.Attempts {
-		if attempt.WorkerID != workerID.String() || attempt.Status != domain.AttemptStatusSucceeded {
-			t.Fatalf("attempt %d identity or status = (%q, %q)", i, attempt.WorkerID, attempt.Status)
+		if attempt.WorkerID != workerID.String() {
+			t.Fatalf("attempt %d worker = %q", i, attempt.WorkerID)
 		}
 		if attempt.FinishedAt == nil {
 			t.Fatalf("attempt %d has null finish time", i)
 		}
+	}
+	if body.Attempts[0].Status != domain.AttemptStatusSucceeded || body.Attempts[0].ErrorCode != nil || body.Attempts[0].ErrorMessage != nil {
+		t.Fatalf("successful attempt = %#v", body.Attempts[0])
+	}
+	if body.Attempts[1].Status != domain.AttemptStatusPermanentFailed || body.Attempts[1].ErrorCode == nil ||
+		*body.Attempts[1].ErrorCode != "invalid_input" || body.Attempts[1].ErrorMessage == nil ||
+		*body.Attempts[1].ErrorMessage != "handler rejected the input" {
+		t.Fatalf("failed attempt = %#v", body.Attempts[1])
 	}
 }
 

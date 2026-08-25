@@ -16,11 +16,35 @@ import (
 
 const testLeaseDuration = 20 * time.Second
 
+func newDispatcherTestStore(t *testing.T, pool *pgxpool.Pool, leaseDuration time.Duration) *postgres.DispatcherStore {
+	t.Helper()
+	retryPolicy, err := domain.NewRetryPolicy(time.Second, time.Minute, func(int64) int64 { return 0 })
+	if err != nil {
+		t.Fatalf("create test retry policy: %v", err)
+	}
+	return postgres.NewDispatcherStore(pool, leaseDuration, retryPolicy)
+}
+
+func reportSuccess(
+	ctx context.Context,
+	store *postgres.DispatcherStore,
+	workerID domain.WorkerID,
+	jobID domain.JobID,
+	attemptNumber domain.AttemptNumber,
+	result domain.Result,
+) error {
+	outcome, err := domain.NewSucceededOutcome(result)
+	if err != nil {
+		return err
+	}
+	return store.ReportAttempt(ctx, workerID, jobID, attemptNumber, outcome)
+}
+
 func TestDispatcherStoreRegistersWorkersIdempotently(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	store := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	store := newDispatcherTestStore(t, pool, testLeaseDuration)
 
 	registration := postgres.WorkerRegistration{
 		ID:          domain.NewWorkerID(),
@@ -94,7 +118,7 @@ func TestDispatcherStoreClaimsEligibleSupportedJobsInOrder(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	dispatcherStore := newDispatcherTestStore(t, pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 
 	worker := registerTestWorker(t, ctx, dispatcherStore, 5)
@@ -197,7 +221,7 @@ func TestDispatcherStoreEnforcesConcurrencyAcrossConcurrentAcquisitions(t *testi
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	dispatcherStore := newDispatcherTestStore(t, pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, dispatcherStore, 3)
 	jobType := mustJobType(t, "capacity.test")
@@ -253,7 +277,7 @@ func TestDispatcherStoreConcurrentClaimersCreateOneAttemptPerJob(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	dispatcherStore := newDispatcherTestStore(t, pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	jobType := mustJobType(t, "claim.test")
 
@@ -333,7 +357,7 @@ func TestDispatcherStoreHeartbeatRenewsOnlyCurrentUnexpiredAttempts(t *testing.T
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	dispatcherStore := newDispatcherTestStore(t, pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, dispatcherStore, 5)
 	otherWorker := registerTestWorker(t, ctx, dispatcherStore, 1)
@@ -342,9 +366,12 @@ func TestDispatcherStoreHeartbeatRenewsOnlyCurrentUnexpiredAttempts(t *testing.T
 	expiredAttempt := acquireOneTestJob(t, ctx, dispatcherStore, worker, "heartbeat.expired")
 	validJob := createTestJob(t, ctx, jobStore, "heartbeat.valid", `{}`)
 	validAttempt := acquireOneTestJob(t, ctx, dispatcherStore, worker, "heartbeat.valid")
+	if _, err := jobStore.RequestCancellation(ctx, validJob.ID); err != nil {
+		t.Fatalf("request heartbeat cancellation: %v", err)
+	}
 	completedJob := createTestJob(t, ctx, jobStore, "heartbeat.completed", `{}`)
 	completedAttempt := acquireOneTestJob(t, ctx, dispatcherStore, worker, "heartbeat.completed")
-	if err := dispatcherStore.ReportSuccess(ctx, worker, completedJob.ID, completedAttempt.AttemptNumber, mustResult(t, `{"ok":true}`)); err != nil {
+	if err := reportSuccess(ctx, dispatcherStore, worker, completedJob.ID, completedAttempt.AttemptNumber, mustResult(t, `{"ok":true}`)); err != nil {
 		t.Fatalf("complete heartbeat test job: %v", err)
 	}
 	otherJob := createTestJob(t, ctx, jobStore, "heartbeat.other", `{}`)
@@ -391,7 +418,8 @@ func TestDispatcherStoreHeartbeatRenewsOnlyCurrentUnexpiredAttempts(t *testing.T
 	}
 	for i, result := range results {
 		wantValid := i == 1
-		if result.Attempt != attempts[i] || result.Valid != wantValid {
+		wantCancellation := i == 1
+		if result.Attempt != attempts[i] || result.Valid != wantValid || result.CancelRequested != wantCancellation {
 			t.Fatalf("heartbeat result %d = %#v, want attempt %#v valid %t", i, result, attempts[i], wantValid)
 		}
 	}
@@ -421,7 +449,7 @@ func TestDispatcherStoreHeartbeatWithoutAttemptsRefreshesWorkerLiveness(t *testi
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	store := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	store := newDispatcherTestStore(t, pool, testLeaseDuration)
 	worker := registerTestWorker(t, ctx, store, 1)
 	staleLastSeen := time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC)
 	if _, err := pool.Exec(ctx, `UPDATE workers SET state = 'lost', last_seen_at = $2 WHERE id = $1`, worker.UUID(), staleLastSeen); err != nil {
@@ -451,7 +479,7 @@ func TestDispatcherStoreHeartbeatWithoutAttemptsRefreshesWorkerLiveness(t *testi
 func TestDispatcherStoreHeartbeatRejectsUnregisteredWorker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	store := postgres.NewDispatcherStore(newDispatcherTestPool(t, ctx), testLeaseDuration)
+	store := newDispatcherTestStore(t, newDispatcherTestPool(t, ctx), testLeaseDuration)
 	results, err := store.Heartbeat(ctx, domain.NewWorkerID(), nil)
 	if !errors.Is(err, postgres.ErrWorkerNotRegistered) {
 		t.Fatalf("unregistered heartbeat error = %v, want ErrWorkerNotRegistered", err)
@@ -465,22 +493,22 @@ func TestDispatcherStoreReportsSuccessAtomicallyAndIdempotently(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	dispatcherStore := newDispatcherTestStore(t, pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, dispatcherStore, 1)
 	job := createTestJob(t, ctx, jobStore, "success.test", `{"input":true}`)
 	attempt := acquireOneTestJob(t, ctx, dispatcherStore, worker, "success.test")
 	result := mustResult(t, `{"ok":true,"count":2}`)
 
-	if err := dispatcherStore.ReportSuccess(ctx, worker, job.ID, attempt.AttemptNumber, result); err != nil {
+	if err := reportSuccess(ctx, dispatcherStore, worker, job.ID, attempt.AttemptNumber, result); err != nil {
 		t.Fatalf("report success: %v", err)
 	}
 	semanticallyIdenticalResult := mustResult(t, `{ "count": 2, "ok": true }`)
-	if err := dispatcherStore.ReportSuccess(ctx, worker, job.ID, attempt.AttemptNumber, semanticallyIdenticalResult); err != nil {
+	if err := reportSuccess(ctx, dispatcherStore, worker, job.ID, attempt.AttemptNumber, semanticallyIdenticalResult); err != nil {
 		t.Fatalf("repeat identical success: %v", err)
 	}
 	conflictingResult := mustResult(t, `{"ok":false,"count":2}`)
-	if err := dispatcherStore.ReportSuccess(ctx, worker, job.ID, attempt.AttemptNumber, conflictingResult); !errors.Is(err, postgres.ErrAttemptReportConflict) {
+	if err := reportSuccess(ctx, dispatcherStore, worker, job.ID, attempt.AttemptNumber, conflictingResult); !errors.Is(err, postgres.ErrAttemptReportConflict) {
 		t.Fatalf("conflicting repeated success error = %v, want ErrAttemptReportConflict", err)
 	}
 
@@ -524,11 +552,131 @@ func TestDispatcherStoreReportsSuccessAtomicallyAndIdempotently(t *testing.T) {
 	}
 }
 
+func TestDispatcherStoreSchedulesRetryableFailureWithExactDelay(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := newDispatcherTestPool(t, ctx)
+	retryPolicy, err := domain.NewRetryPolicy(time.Second, time.Minute, func(upperExclusive int64) int64 {
+		if upperExclusive != 1001 {
+			t.Fatalf("retry jitter upper bound = %d, want 1001", upperExclusive)
+		}
+		return 750
+	})
+	if err != nil {
+		t.Fatalf("create retry policy: %v", err)
+	}
+	store := postgres.NewDispatcherStore(pool, testLeaseDuration, retryPolicy)
+	jobStore := postgres.NewJobStore(pool)
+	worker := registerTestWorker(t, ctx, store, 2)
+	job := createTestJob(t, ctx, jobStore, "failure.retryable", `{}`)
+	attempt := acquireOneTestJob(t, ctx, store, worker, "failure.retryable")
+	outcome := mustFailureOutcome(t, domain.NewRetryableFailureOutcome)
+
+	if err := store.ReportAttempt(ctx, worker, job.ID, attempt.AttemptNumber, outcome); err != nil {
+		t.Fatalf("report retryable failure: %v", err)
+	}
+	if err := store.ReportAttempt(ctx, worker, job.ID, attempt.AttemptNumber, outcome); err != nil {
+		t.Fatalf("repeat retryable failure: %v", err)
+	}
+	changed := mustFailureOutcome(t, domain.NewPermanentFailureOutcome)
+	if err := store.ReportAttempt(ctx, worker, job.ID, attempt.AttemptNumber, changed); !errors.Is(err, postgres.ErrAttemptReportConflict) {
+		t.Fatalf("changed repeated report error = %v, want ErrAttemptReportConflict", err)
+	}
+
+	var status string
+	var availableAt, updatedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT status, available_at, updated_at FROM jobs WHERE id = $1`, job.ID.UUID()).Scan(&status, &availableAt, &updatedAt); err != nil {
+		t.Fatalf("read retry schedule: %v", err)
+	}
+	if status != string(domain.JobStatusRetryWait) || availableAt.Sub(updatedAt) != 750*time.Millisecond {
+		t.Fatalf("retry schedule = status %q, delay %s; want retry_wait, 750ms", status, availableAt.Sub(updatedAt))
+	}
+	before, err := store.AcquireJobs(ctx, worker, 1, []domain.JobType{mustJobType(t, "failure.retryable")})
+	if err != nil || len(before) != 0 {
+		t.Fatalf("claim before available_at = (%d jobs, %v), want (0, nil)", len(before), err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at = statement_timestamp() WHERE id = $1`, job.ID.UUID()); err != nil {
+		t.Fatalf("make retry eligible: %v", err)
+	}
+	after, err := store.AcquireJobs(ctx, worker, 1, []domain.JobType{mustJobType(t, "failure.retryable")})
+	if err != nil || len(after) != 1 || after[0].AttemptNumber.Int32() != 2 {
+		t.Fatalf("claim at available_at = (%#v, %v), want attempt 2", after, err)
+	}
+
+	attempts, err := jobStore.ListJobAttempts(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("list retry attempts: %v", err)
+	}
+	if len(attempts) != 2 || attempts[0].Status != domain.AttemptStatusRetryableFailed || attempts[0].Failure == nil ||
+		attempts[0].Failure.Code() != "dependency_timeout" || attempts[0].Failure.Message() != "dependency timed out" {
+		t.Fatalf("stored retry attempts = %#v", attempts)
+	}
+}
+
+func TestDispatcherStoreDeadLettersPermanentAndExhaustedFailures(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := newDispatcherTestPool(t, ctx)
+	store := newDispatcherTestStore(t, pool, testLeaseDuration)
+	jobStore := postgres.NewJobStore(pool)
+	worker := registerTestWorker(t, ctx, store, 2)
+
+	tests := []struct {
+		name        string
+		jobType     string
+		maxAttempts int32
+		outcome     func(domain.AttemptFailure) (domain.AttemptOutcome, error)
+		wantStatus  domain.AttemptStatus
+	}{
+		{name: "permanent", jobType: "failure.permanent", maxAttempts: 3, outcome: domain.NewPermanentFailureOutcome, wantStatus: domain.AttemptStatusPermanentFailed},
+		{name: "exhausted retryable", jobType: "failure.exhausted", maxAttempts: 1, outcome: domain.NewRetryableFailureOutcome, wantStatus: domain.AttemptStatusRetryableFailed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			job := createTestJob(t, ctx, jobStore, test.jobType, `{}`)
+			if _, err := pool.Exec(ctx, `UPDATE jobs SET max_attempts = $2 WHERE id = $1`, job.ID.UUID(), test.maxAttempts); err != nil {
+				t.Fatalf("set maximum attempts: %v", err)
+			}
+			attempt := acquireOneTestJob(t, ctx, store, worker, test.jobType)
+			if err := store.ReportAttempt(ctx, worker, job.ID, attempt.AttemptNumber, mustFailureOutcome(t, test.outcome)); err != nil {
+				t.Fatalf("report failure: %v", err)
+			}
+			stored, err := jobStore.GetJob(ctx, job.ID)
+			if err != nil {
+				t.Fatalf("get failed job: %v", err)
+			}
+			attempts, err := jobStore.ListJobAttempts(ctx, job.ID)
+			if err != nil {
+				t.Fatalf("list failed attempts: %v", err)
+			}
+			if stored.Status != domain.JobStatusDeadLettered || stored.FinishedAt == nil || len(attempts) != 1 || attempts[0].Status != test.wantStatus {
+				t.Fatalf("dead-letter state = job %#v, attempts %#v", stored, attempts)
+			}
+		})
+	}
+}
+
+func mustFailureOutcome(
+	t *testing.T,
+	constructor func(domain.AttemptFailure) (domain.AttemptOutcome, error),
+) domain.AttemptOutcome {
+	t.Helper()
+	failure, err := domain.NewAttemptFailure("dependency_timeout", "dependency timed out")
+	if err != nil {
+		t.Fatalf("create attempt failure: %v", err)
+	}
+	outcome, err := constructor(failure)
+	if err != nil {
+		t.Fatalf("create attempt outcome: %v", err)
+	}
+	return outcome
+}
+
 func TestDispatcherStoreRejectsMismatchedSuccessWithoutChangingState(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	dispatcherStore := newDispatcherTestStore(t, pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, dispatcherStore, 1)
 	otherWorker := registerTestWorker(t, ctx, dispatcherStore, 1)
@@ -552,7 +700,7 @@ func TestDispatcherStoreRejectsMismatchedSuccessWithoutChangingState(t *testing.
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := dispatcherStore.ReportSuccess(ctx, test.workerID, test.jobID, test.attemptNumber, result)
+			err := reportSuccess(ctx, dispatcherStore, test.workerID, test.jobID, test.attemptNumber, result)
 			if !errors.Is(err, postgres.ErrAttemptReportConflict) {
 				t.Fatalf("mismatched success error = %v, want ErrAttemptReportConflict", err)
 			}
@@ -586,7 +734,7 @@ func TestDispatcherStoreRollsBackAttemptWhenJobCompletionFails(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	dispatcherStore := newDispatcherTestStore(t, pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, dispatcherStore, 1)
 	job := createTestJob(t, ctx, jobStore, "atomic.test", `{}`)
@@ -614,7 +762,7 @@ func TestDispatcherStoreRollsBackAttemptWhenJobCompletionFails(t *testing.T) {
 		t.Fatalf("install completion failure trigger: %v", err)
 	}
 
-	err = dispatcherStore.ReportSuccess(ctx, worker, job.ID, attempt.AttemptNumber, mustResult(t, `{"ok":true}`))
+	err = reportSuccess(ctx, dispatcherStore, worker, job.ID, attempt.AttemptNumber, mustResult(t, `{"ok":true}`))
 	if err == nil {
 		t.Fatal("successful report unexpectedly passed the forced job update failure")
 	}
@@ -686,11 +834,11 @@ func createTestJob(
 	if err != nil {
 		t.Fatalf("create test submission: %v", err)
 	}
-	job, err := store.CreateJob(ctx, submission)
+	created, err := store.SubmitJob(ctx, submission)
 	if err != nil {
 		t.Fatalf("create test job: %v", err)
 	}
-	return job
+	return created.Job
 }
 
 func acquireOneTestJob(
