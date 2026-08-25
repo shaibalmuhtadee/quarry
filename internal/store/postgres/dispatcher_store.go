@@ -17,6 +17,7 @@ var (
 	ErrWorkerNotRegistered        = errors.New("worker is not registered")
 	ErrWorkerRegistrationConflict = errors.New("worker registration conflicts with the stored registration")
 	ErrAttemptReportConflict      = errors.New("attempt report conflicts with the stored attempt")
+	ErrInvalidRecoveryConfig      = errors.New("recovery batch size and worker liveness timeout must be positive")
 )
 
 type WorkerRegistration struct {
@@ -35,12 +36,23 @@ type AcquiredJob struct {
 	Timeout       time.Duration
 }
 
-type DispatcherStore struct {
-	pool *pgxpool.Pool
+type HeartbeatAttempt struct {
+	JobID         domain.JobID
+	AttemptNumber domain.AttemptNumber
 }
 
-func NewDispatcherStore(pool *pgxpool.Pool) *DispatcherStore {
-	return &DispatcherStore{pool: pool}
+type HeartbeatResult struct {
+	Attempt HeartbeatAttempt
+	Valid   bool
+}
+
+type DispatcherStore struct {
+	pool          *pgxpool.Pool
+	leaseDuration time.Duration
+}
+
+func NewDispatcherStore(pool *pgxpool.Pool, leaseDuration time.Duration) *DispatcherStore {
+	return &DispatcherStore{pool: pool, leaseDuration: leaseDuration}
 }
 
 func (store *DispatcherStore) RegisterWorker(
@@ -114,6 +126,7 @@ func (store *DispatcherStore) AcquireJobs(
 		SupportedJobTypes: typeNames,
 		ClaimLimit:        claimLimit,
 		WorkerID:          databaseWorkerID,
+		LeaseDurationMs:   store.leaseDuration.Milliseconds(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("claim jobs: %w", err)
@@ -133,6 +146,90 @@ func (store *DispatcherStore) AcquireJobs(
 	}
 
 	return jobs, nil
+}
+
+func (store *DispatcherStore) Heartbeat(
+	ctx context.Context,
+	workerID domain.WorkerID,
+	attempts []HeartbeatAttempt,
+) ([]HeartbeatResult, error) {
+	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("begin worker heartbeat: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	queries := postgresdb.New(tx)
+	workerRows, err := queries.RefreshWorkerHeartbeat(ctx, workerID.UUID())
+	if err != nil {
+		return nil, fmt.Errorf("refresh worker heartbeat: %w", err)
+	}
+	if workerRows == 0 {
+		return nil, ErrWorkerNotRegistered
+	}
+	if workerRows != 1 {
+		return nil, errors.New("worker heartbeat updated an unexpected number of workers")
+	}
+
+	results := make([]HeartbeatResult, len(attempts))
+	for i, attempt := range attempts {
+		renewedRows, err := queries.RenewAttemptLease(ctx, postgresdb.RenewAttemptLeaseParams{
+			LeaseDurationMs: store.leaseDuration.Milliseconds(),
+			JobID:           attempt.JobID.UUID(),
+			AttemptNo:       attempt.AttemptNumber.Int32(),
+			WorkerID: pgtype.UUID{
+				Bytes: workerID.UUID(),
+				Valid: true,
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("renew attempt lease: %w", err)
+		}
+		if renewedRows > 1 {
+			return nil, errors.New("attempt heartbeat updated an unexpected number of jobs")
+		}
+		results[i] = HeartbeatResult{
+			Attempt: attempt,
+			Valid:   renewedRows == 1,
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit worker heartbeat: %w", err)
+	}
+
+	return results, nil
+}
+
+func (store *DispatcherStore) RecoverExpiredAttempts(
+	ctx context.Context,
+	batchSize int32,
+	workerLivenessTimeout time.Duration,
+) (int64, error) {
+	if batchSize <= 0 || workerLivenessTimeout <= 0 || workerLivenessTimeout.Milliseconds() <= 0 {
+		return 0, ErrInvalidRecoveryConfig
+	}
+
+	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("begin expired attempt recovery: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	queries := postgresdb.New(tx)
+	if _, err := queries.MarkLostWorkers(ctx, workerLivenessTimeout.Milliseconds()); err != nil {
+		return 0, fmt.Errorf("mark lost workers: %w", err)
+	}
+
+	recoveredJobs, err := queries.RecoverExpiredJobs(ctx, batchSize)
+	if err != nil {
+		return 0, fmt.Errorf("recover expired jobs: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit expired attempt recovery: %w", err)
+	}
+
+	return int64(len(recoveredJobs)), nil
 }
 
 func (store *DispatcherStore) ReportSuccess(
@@ -174,7 +271,8 @@ func (store *DispatcherStore) ReportSuccess(
 		return nil
 	}
 	if report.JobStatus != string(domain.JobStatusRunning) ||
-		report.AttemptStatus != string(domain.AttemptStatusRunning) {
+		report.AttemptStatus != string(domain.AttemptStatusRunning) ||
+		!report.LeaseValid {
 		return ErrAttemptReportConflict
 	}
 

@@ -22,13 +22,15 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("QUARRY_WORKER_HOSTNAME", "test-host")
 	t.Setenv("QUARRY_WORKER_VERSION", "")
 	t.Setenv("QUARRY_WORKER_CONCURRENCY", "")
+	t.Setenv("QUARRY_HEARTBEAT_INTERVAL", "")
 
 	cfg, err := loadConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.dispatcherAddress != defaultDispatcherAddress || cfg.hostname != "test-host" ||
-		cfg.version != defaultVersion || cfg.concurrency != defaultConcurrency {
+		cfg.version != defaultVersion || cfg.concurrency != defaultConcurrency ||
+		cfg.heartbeatInterval != defaultHeartbeatInterval {
 		t.Fatalf("default config = %#v", cfg)
 	}
 
@@ -36,13 +38,26 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("QUARRY_WORKER_HOSTNAME", "worker-a")
 	t.Setenv("QUARRY_WORKER_VERSION", "v2")
 	t.Setenv("QUARRY_WORKER_CONCURRENCY", "7")
+	t.Setenv("QUARRY_HEARTBEAT_INTERVAL", "3s")
 	cfg, err = loadConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.dispatcherAddress != "127.0.0.1:19090" || cfg.hostname != "worker-a" ||
-		cfg.version != "v2" || cfg.concurrency != 7 {
+		cfg.version != "v2" || cfg.concurrency != 7 || cfg.heartbeatInterval != 3*time.Second {
 		t.Fatalf("overridden config = %#v", cfg)
+	}
+}
+
+func TestLoadConfigRejectsInvalidHeartbeatInterval(t *testing.T) {
+	for _, value := range []string{"invalid", "0s", "-1s"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("QUARRY_WORKER_HOSTNAME", "test-host")
+			t.Setenv("QUARRY_HEARTBEAT_INTERVAL", value)
+			if _, err := loadConfig(); err == nil {
+				t.Fatalf("loadConfig accepted heartbeat interval %q", value)
+			}
+		})
 	}
 }
 
@@ -80,6 +95,7 @@ func TestRunRegistersFreshIdentityAndStopsOnCancellation(t *testing.T) {
 		hostname:          "test-host",
 		version:           "test-version",
 		concurrency:       2,
+		heartbeatInterval: 10 * time.Millisecond,
 	}
 	first := runUntilAcquisition(t, cfg, service.acquired)
 	second := runUntilAcquisition(t, cfg, service.acquired)
@@ -110,6 +126,21 @@ type workerLifecycleService struct {
 	acquired      chan string
 }
 
+func (service *workerLifecycleService) Heartbeat(
+	_ context.Context,
+	request *dispatcherv1.HeartbeatRequest,
+) (*dispatcherv1.HeartbeatResponse, error) {
+	results := make([]*dispatcherv1.HeartbeatAttemptResult, len(request.GetActiveAttempts()))
+	for i, attempt := range request.GetActiveAttempts() {
+		results[i] = &dispatcherv1.HeartbeatAttemptResult{
+			JobId:     attempt.GetJobId(),
+			AttemptNo: attempt.GetAttemptNo(),
+			State:     dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID,
+		}
+	}
+	return &dispatcherv1.HeartbeatResponse{Attempts: results}, nil
+}
+
 func (service *workerLifecycleService) RegisterWorker(
 	_ context.Context,
 	request *dispatcherv1.RegisterWorkerRequest,
@@ -127,7 +158,7 @@ func (service *workerLifecycleService) AcquireJobs(
 	if request.GetAvailableCapacity() != 2 {
 		return nil, status.Errorf(codes.Internal, "capacity = %d", request.GetAvailableCapacity())
 	}
-	wantTypes := []string{"demo.echo", "demo.payload_size"}
+	wantTypes := []string{"demo.echo", "demo.payload_size", "demo.sleep"}
 	if !slices.Equal(request.GetSupportedJobTypes(), wantTypes) {
 		return nil, status.Errorf(codes.Internal, "types = %v", request.GetSupportedJobTypes())
 	}

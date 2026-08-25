@@ -22,6 +22,55 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type HeartbeatAttemptState int32
+
+const (
+	HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_UNSPECIFIED HeartbeatAttemptState = 0
+	HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID       HeartbeatAttemptState = 1
+	HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_STALE       HeartbeatAttemptState = 2
+)
+
+// Enum value maps for HeartbeatAttemptState.
+var (
+	HeartbeatAttemptState_name = map[int32]string{
+		0: "HEARTBEAT_ATTEMPT_STATE_UNSPECIFIED",
+		1: "HEARTBEAT_ATTEMPT_STATE_VALID",
+		2: "HEARTBEAT_ATTEMPT_STATE_STALE",
+	}
+	HeartbeatAttemptState_value = map[string]int32{
+		"HEARTBEAT_ATTEMPT_STATE_UNSPECIFIED": 0,
+		"HEARTBEAT_ATTEMPT_STATE_VALID":       1,
+		"HEARTBEAT_ATTEMPT_STATE_STALE":       2,
+	}
+)
+
+func (x HeartbeatAttemptState) Enum() *HeartbeatAttemptState {
+	p := new(HeartbeatAttemptState)
+	*p = x
+	return p
+}
+
+func (x HeartbeatAttemptState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (HeartbeatAttemptState) Descriptor() protoreflect.EnumDescriptor {
+	return file_quarry_dispatcher_v1_dispatcher_proto_enumTypes[0].Descriptor()
+}
+
+func (HeartbeatAttemptState) Type() protoreflect.EnumType {
+	return &file_quarry_dispatcher_v1_dispatcher_proto_enumTypes[0]
+}
+
+func (x HeartbeatAttemptState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use HeartbeatAttemptState.Descriptor instead.
+func (HeartbeatAttemptState) EnumDescriptor() ([]byte, []int) {
+	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP(), []int{0}
+}
+
 type RegisterWorkerRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	WorkerId      string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
@@ -314,6 +363,214 @@ func (x *AcquiredJob) GetTimeoutMs() int64 {
 	return 0
 }
 
+type HeartbeatRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	WorkerId       string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	ActiveAttempts []*HeartbeatAttempt    `protobuf:"bytes,2,rep,name=active_attempts,json=activeAttempts,proto3" json:"active_attempts,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *HeartbeatRequest) Reset() {
+	*x = HeartbeatRequest{}
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatRequest) ProtoMessage() {}
+
+func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatRequest.ProtoReflect.Descriptor instead.
+func (*HeartbeatRequest) Descriptor() ([]byte, []int) {
+	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *HeartbeatRequest) GetWorkerId() string {
+	if x != nil {
+		return x.WorkerId
+	}
+	return ""
+}
+
+func (x *HeartbeatRequest) GetActiveAttempts() []*HeartbeatAttempt {
+	if x != nil {
+		return x.ActiveAttempts
+	}
+	return nil
+}
+
+type HeartbeatAttempt struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	AttemptNo     uint32                 `protobuf:"varint,2,opt,name=attempt_no,json=attemptNo,proto3" json:"attempt_no,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HeartbeatAttempt) Reset() {
+	*x = HeartbeatAttempt{}
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatAttempt) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatAttempt) ProtoMessage() {}
+
+func (x *HeartbeatAttempt) ProtoReflect() protoreflect.Message {
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatAttempt.ProtoReflect.Descriptor instead.
+func (*HeartbeatAttempt) Descriptor() ([]byte, []int) {
+	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *HeartbeatAttempt) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+func (x *HeartbeatAttempt) GetAttemptNo() uint32 {
+	if x != nil {
+		return x.AttemptNo
+	}
+	return 0
+}
+
+type HeartbeatResponse struct {
+	state         protoimpl.MessageState    `protogen:"open.v1"`
+	Attempts      []*HeartbeatAttemptResult `protobuf:"bytes,1,rep,name=attempts,proto3" json:"attempts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HeartbeatResponse) Reset() {
+	*x = HeartbeatResponse{}
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatResponse) ProtoMessage() {}
+
+func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatResponse.ProtoReflect.Descriptor instead.
+func (*HeartbeatResponse) Descriptor() ([]byte, []int) {
+	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *HeartbeatResponse) GetAttempts() []*HeartbeatAttemptResult {
+	if x != nil {
+		return x.Attempts
+	}
+	return nil
+}
+
+type HeartbeatAttemptResult struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	AttemptNo     uint32                 `protobuf:"varint,2,opt,name=attempt_no,json=attemptNo,proto3" json:"attempt_no,omitempty"`
+	State         HeartbeatAttemptState  `protobuf:"varint,3,opt,name=state,proto3,enum=quarry.dispatcher.v1.HeartbeatAttemptState" json:"state,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HeartbeatAttemptResult) Reset() {
+	*x = HeartbeatAttemptResult{}
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatAttemptResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatAttemptResult) ProtoMessage() {}
+
+func (x *HeartbeatAttemptResult) ProtoReflect() protoreflect.Message {
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatAttemptResult.ProtoReflect.Descriptor instead.
+func (*HeartbeatAttemptResult) Descriptor() ([]byte, []int) {
+	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *HeartbeatAttemptResult) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+func (x *HeartbeatAttemptResult) GetAttemptNo() uint32 {
+	if x != nil {
+		return x.AttemptNo
+	}
+	return 0
+}
+
+func (x *HeartbeatAttemptResult) GetState() HeartbeatAttemptState {
+	if x != nil {
+		return x.State
+	}
+	return HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_UNSPECIFIED
+}
+
 type ReportAttemptRequest struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	WorkerId  string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
@@ -329,7 +586,7 @@ type ReportAttemptRequest struct {
 
 func (x *ReportAttemptRequest) Reset() {
 	*x = ReportAttemptRequest{}
-	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[5]
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -341,7 +598,7 @@ func (x *ReportAttemptRequest) String() string {
 func (*ReportAttemptRequest) ProtoMessage() {}
 
 func (x *ReportAttemptRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[5]
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -354,7 +611,7 @@ func (x *ReportAttemptRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportAttemptRequest.ProtoReflect.Descriptor instead.
 func (*ReportAttemptRequest) Descriptor() ([]byte, []int) {
-	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP(), []int{5}
+	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ReportAttemptRequest) GetWorkerId() string {
@@ -413,7 +670,7 @@ type AttemptSucceeded struct {
 
 func (x *AttemptSucceeded) Reset() {
 	*x = AttemptSucceeded{}
-	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[6]
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -425,7 +682,7 @@ func (x *AttemptSucceeded) String() string {
 func (*AttemptSucceeded) ProtoMessage() {}
 
 func (x *AttemptSucceeded) ProtoReflect() protoreflect.Message {
-	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[6]
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -438,7 +695,7 @@ func (x *AttemptSucceeded) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttemptSucceeded.ProtoReflect.Descriptor instead.
 func (*AttemptSucceeded) Descriptor() ([]byte, []int) {
-	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP(), []int{6}
+	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *AttemptSucceeded) GetResultJson() []byte {
@@ -456,7 +713,7 @@ type ReportAttemptResponse struct {
 
 func (x *ReportAttemptResponse) Reset() {
 	*x = ReportAttemptResponse{}
-	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[7]
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -468,7 +725,7 @@ func (x *ReportAttemptResponse) String() string {
 func (*ReportAttemptResponse) ProtoMessage() {}
 
 func (x *ReportAttemptResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[7]
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -481,7 +738,7 @@ func (x *ReportAttemptResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportAttemptResponse.ProtoReflect.Descriptor instead.
 func (*ReportAttemptResponse) Descriptor() ([]byte, []int) {
-	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP(), []int{7}
+	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP(), []int{11}
 }
 
 var File_quarry_dispatcher_v1_dispatcher_proto protoreflect.FileDescriptor
@@ -510,7 +767,21 @@ const file_quarry_dispatcher_v1_dispatcher_proto_rawDesc = "" +
 	"\bjob_type\x18\x03 \x01(\tR\ajobType\x12!\n" +
 	"\fpayload_json\x18\x04 \x01(\fR\vpayloadJson\x12\x1d\n" +
 	"\n" +
-	"timeout_ms\x18\x05 \x01(\x03R\ttimeoutMs\"\xbc\x01\n" +
+	"timeout_ms\x18\x05 \x01(\x03R\ttimeoutMs\"\x80\x01\n" +
+	"\x10HeartbeatRequest\x12\x1b\n" +
+	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12O\n" +
+	"\x0factive_attempts\x18\x02 \x03(\v2&.quarry.dispatcher.v1.HeartbeatAttemptR\x0eactiveAttempts\"H\n" +
+	"\x10HeartbeatAttempt\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x1d\n" +
+	"\n" +
+	"attempt_no\x18\x02 \x01(\rR\tattemptNo\"]\n" +
+	"\x11HeartbeatResponse\x12H\n" +
+	"\battempts\x18\x01 \x03(\v2,.quarry.dispatcher.v1.HeartbeatAttemptResultR\battempts\"\x91\x01\n" +
+	"\x16HeartbeatAttemptResult\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x1d\n" +
+	"\n" +
+	"attempt_no\x18\x02 \x01(\rR\tattemptNo\x12A\n" +
+	"\x05state\x18\x03 \x01(\x0e2+.quarry.dispatcher.v1.HeartbeatAttemptStateR\x05state\"\xbc\x01\n" +
 	"\x14ReportAttemptRequest\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x15\n" +
 	"\x06job_id\x18\x02 \x01(\tR\x05jobId\x12\x1d\n" +
@@ -521,10 +792,15 @@ const file_quarry_dispatcher_v1_dispatcher_proto_rawDesc = "" +
 	"\x10AttemptSucceeded\x12\x1f\n" +
 	"\vresult_json\x18\x01 \x01(\fR\n" +
 	"resultJson\"\x17\n" +
-	"\x15ReportAttemptResponse2\xce\x02\n" +
+	"\x15ReportAttemptResponse*\x86\x01\n" +
+	"\x15HeartbeatAttemptState\x12'\n" +
+	"#HEARTBEAT_ATTEMPT_STATE_UNSPECIFIED\x10\x00\x12!\n" +
+	"\x1dHEARTBEAT_ATTEMPT_STATE_VALID\x10\x01\x12!\n" +
+	"\x1dHEARTBEAT_ATTEMPT_STATE_STALE\x10\x022\xac\x03\n" +
 	"\x11DispatcherService\x12k\n" +
 	"\x0eRegisterWorker\x12+.quarry.dispatcher.v1.RegisterWorkerRequest\x1a,.quarry.dispatcher.v1.RegisterWorkerResponse\x12b\n" +
-	"\vAcquireJobs\x12(.quarry.dispatcher.v1.AcquireJobsRequest\x1a).quarry.dispatcher.v1.AcquireJobsResponse\x12h\n" +
+	"\vAcquireJobs\x12(.quarry.dispatcher.v1.AcquireJobsRequest\x1a).quarry.dispatcher.v1.AcquireJobsResponse\x12\\\n" +
+	"\tHeartbeat\x12&.quarry.dispatcher.v1.HeartbeatRequest\x1a'.quarry.dispatcher.v1.HeartbeatResponse\x12h\n" +
 	"\rReportAttempt\x12*.quarry.dispatcher.v1.ReportAttemptRequest\x1a+.quarry.dispatcher.v1.ReportAttemptResponseBUZSgithub.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1;dispatcherv1b\x06proto3"
 
 var (
@@ -539,33 +815,44 @@ func file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP() []byte {
 	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescData
 }
 
-var file_quarry_dispatcher_v1_dispatcher_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_quarry_dispatcher_v1_dispatcher_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_quarry_dispatcher_v1_dispatcher_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_quarry_dispatcher_v1_dispatcher_proto_goTypes = []any{
-	(*RegisterWorkerRequest)(nil),  // 0: quarry.dispatcher.v1.RegisterWorkerRequest
-	(*RegisterWorkerResponse)(nil), // 1: quarry.dispatcher.v1.RegisterWorkerResponse
-	(*AcquireJobsRequest)(nil),     // 2: quarry.dispatcher.v1.AcquireJobsRequest
-	(*AcquireJobsResponse)(nil),    // 3: quarry.dispatcher.v1.AcquireJobsResponse
-	(*AcquiredJob)(nil),            // 4: quarry.dispatcher.v1.AcquiredJob
-	(*ReportAttemptRequest)(nil),   // 5: quarry.dispatcher.v1.ReportAttemptRequest
-	(*AttemptSucceeded)(nil),       // 6: quarry.dispatcher.v1.AttemptSucceeded
-	(*ReportAttemptResponse)(nil),  // 7: quarry.dispatcher.v1.ReportAttemptResponse
-	(*timestamppb.Timestamp)(nil),  // 8: google.protobuf.Timestamp
+	(HeartbeatAttemptState)(0),     // 0: quarry.dispatcher.v1.HeartbeatAttemptState
+	(*RegisterWorkerRequest)(nil),  // 1: quarry.dispatcher.v1.RegisterWorkerRequest
+	(*RegisterWorkerResponse)(nil), // 2: quarry.dispatcher.v1.RegisterWorkerResponse
+	(*AcquireJobsRequest)(nil),     // 3: quarry.dispatcher.v1.AcquireJobsRequest
+	(*AcquireJobsResponse)(nil),    // 4: quarry.dispatcher.v1.AcquireJobsResponse
+	(*AcquiredJob)(nil),            // 5: quarry.dispatcher.v1.AcquiredJob
+	(*HeartbeatRequest)(nil),       // 6: quarry.dispatcher.v1.HeartbeatRequest
+	(*HeartbeatAttempt)(nil),       // 7: quarry.dispatcher.v1.HeartbeatAttempt
+	(*HeartbeatResponse)(nil),      // 8: quarry.dispatcher.v1.HeartbeatResponse
+	(*HeartbeatAttemptResult)(nil), // 9: quarry.dispatcher.v1.HeartbeatAttemptResult
+	(*ReportAttemptRequest)(nil),   // 10: quarry.dispatcher.v1.ReportAttemptRequest
+	(*AttemptSucceeded)(nil),       // 11: quarry.dispatcher.v1.AttemptSucceeded
+	(*ReportAttemptResponse)(nil),  // 12: quarry.dispatcher.v1.ReportAttemptResponse
+	(*timestamppb.Timestamp)(nil),  // 13: google.protobuf.Timestamp
 }
 var file_quarry_dispatcher_v1_dispatcher_proto_depIdxs = []int32{
-	8, // 0: quarry.dispatcher.v1.RegisterWorkerRequest.started_at:type_name -> google.protobuf.Timestamp
-	4, // 1: quarry.dispatcher.v1.AcquireJobsResponse.jobs:type_name -> quarry.dispatcher.v1.AcquiredJob
-	6, // 2: quarry.dispatcher.v1.ReportAttemptRequest.succeeded:type_name -> quarry.dispatcher.v1.AttemptSucceeded
-	0, // 3: quarry.dispatcher.v1.DispatcherService.RegisterWorker:input_type -> quarry.dispatcher.v1.RegisterWorkerRequest
-	2, // 4: quarry.dispatcher.v1.DispatcherService.AcquireJobs:input_type -> quarry.dispatcher.v1.AcquireJobsRequest
-	5, // 5: quarry.dispatcher.v1.DispatcherService.ReportAttempt:input_type -> quarry.dispatcher.v1.ReportAttemptRequest
-	1, // 6: quarry.dispatcher.v1.DispatcherService.RegisterWorker:output_type -> quarry.dispatcher.v1.RegisterWorkerResponse
-	3, // 7: quarry.dispatcher.v1.DispatcherService.AcquireJobs:output_type -> quarry.dispatcher.v1.AcquireJobsResponse
-	7, // 8: quarry.dispatcher.v1.DispatcherService.ReportAttempt:output_type -> quarry.dispatcher.v1.ReportAttemptResponse
-	6, // [6:9] is the sub-list for method output_type
-	3, // [3:6] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	13, // 0: quarry.dispatcher.v1.RegisterWorkerRequest.started_at:type_name -> google.protobuf.Timestamp
+	5,  // 1: quarry.dispatcher.v1.AcquireJobsResponse.jobs:type_name -> quarry.dispatcher.v1.AcquiredJob
+	7,  // 2: quarry.dispatcher.v1.HeartbeatRequest.active_attempts:type_name -> quarry.dispatcher.v1.HeartbeatAttempt
+	9,  // 3: quarry.dispatcher.v1.HeartbeatResponse.attempts:type_name -> quarry.dispatcher.v1.HeartbeatAttemptResult
+	0,  // 4: quarry.dispatcher.v1.HeartbeatAttemptResult.state:type_name -> quarry.dispatcher.v1.HeartbeatAttemptState
+	11, // 5: quarry.dispatcher.v1.ReportAttemptRequest.succeeded:type_name -> quarry.dispatcher.v1.AttemptSucceeded
+	1,  // 6: quarry.dispatcher.v1.DispatcherService.RegisterWorker:input_type -> quarry.dispatcher.v1.RegisterWorkerRequest
+	3,  // 7: quarry.dispatcher.v1.DispatcherService.AcquireJobs:input_type -> quarry.dispatcher.v1.AcquireJobsRequest
+	6,  // 8: quarry.dispatcher.v1.DispatcherService.Heartbeat:input_type -> quarry.dispatcher.v1.HeartbeatRequest
+	10, // 9: quarry.dispatcher.v1.DispatcherService.ReportAttempt:input_type -> quarry.dispatcher.v1.ReportAttemptRequest
+	2,  // 10: quarry.dispatcher.v1.DispatcherService.RegisterWorker:output_type -> quarry.dispatcher.v1.RegisterWorkerResponse
+	4,  // 11: quarry.dispatcher.v1.DispatcherService.AcquireJobs:output_type -> quarry.dispatcher.v1.AcquireJobsResponse
+	8,  // 12: quarry.dispatcher.v1.DispatcherService.Heartbeat:output_type -> quarry.dispatcher.v1.HeartbeatResponse
+	12, // 13: quarry.dispatcher.v1.DispatcherService.ReportAttempt:output_type -> quarry.dispatcher.v1.ReportAttemptResponse
+	10, // [10:14] is the sub-list for method output_type
+	6,  // [6:10] is the sub-list for method input_type
+	6,  // [6:6] is the sub-list for extension type_name
+	6,  // [6:6] is the sub-list for extension extendee
+	0,  // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_quarry_dispatcher_v1_dispatcher_proto_init() }
@@ -573,7 +860,7 @@ func file_quarry_dispatcher_v1_dispatcher_proto_init() {
 	if File_quarry_dispatcher_v1_dispatcher_proto != nil {
 		return
 	}
-	file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[5].OneofWrappers = []any{
+	file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[9].OneofWrappers = []any{
 		(*ReportAttemptRequest_Succeeded)(nil),
 	}
 	type x struct{}
@@ -581,13 +868,14 @@ func file_quarry_dispatcher_v1_dispatcher_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_quarry_dispatcher_v1_dispatcher_proto_rawDesc), len(file_quarry_dispatcher_v1_dispatcher_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   8,
+			NumEnums:      1,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_quarry_dispatcher_v1_dispatcher_proto_goTypes,
 		DependencyIndexes: file_quarry_dispatcher_v1_dispatcher_proto_depIdxs,
+		EnumInfos:         file_quarry_dispatcher_v1_dispatcher_proto_enumTypes,
 		MessageInfos:      file_quarry_dispatcher_v1_dispatcher_proto_msgTypes,
 	}.Build()
 	File_quarry_dispatcher_v1_dispatcher_proto = out.File

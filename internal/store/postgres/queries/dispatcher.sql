@@ -4,11 +4,14 @@ INSERT INTO workers (
     hostname,
     version,
     concurrency,
-    started_at
+    started_at,
+    state,
+    last_seen_at
 )
-VALUES ($1, $2, $3, $4, $5)
+VALUES ($1, $2, $3, $4, $5, 'active', statement_timestamp())
 ON CONFLICT (id) DO UPDATE
-SET id = EXCLUDED.id
+SET state = 'active',
+    last_seen_at = statement_timestamp()
 WHERE workers.hostname = EXCLUDED.hostname
   AND workers.version = EXCLUDED.version
   AND workers.concurrency = EXCLUDED.concurrency
@@ -27,11 +30,35 @@ FROM jobs
 WHERE current_worker_id = $1
   AND status = 'running';
 
+-- name: RefreshWorkerHeartbeat :execrows
+UPDATE workers
+SET state = 'active',
+    last_seen_at = statement_timestamp()
+WHERE id = sqlc.arg(worker_id);
+
+-- name: MarkLostWorkers :execrows
+UPDATE workers
+SET state = 'lost'
+WHERE state = 'active'
+  AND last_seen_at <= statement_timestamp()
+        - sqlc.arg(liveness_timeout_ms)::bigint * interval '1 millisecond';
+
+-- name: RenewAttemptLease :execrows
+UPDATE jobs
+SET lease_expires_at = statement_timestamp()
+        + sqlc.arg(lease_duration_ms)::bigint * interval '1 millisecond',
+    updated_at = statement_timestamp()
+WHERE id = sqlc.arg(job_id)
+  AND attempt_count = sqlc.arg(attempt_no)
+  AND current_worker_id = sqlc.arg(worker_id)
+  AND status = 'running'
+  AND lease_expires_at > statement_timestamp();
+
 -- name: ClaimJobs :many
 WITH eligible AS (
     SELECT id
     FROM jobs
-    WHERE status = 'queued'
+    WHERE status IN ('queued', 'retry_wait')
       AND available_at <= now()
       AND job_type = ANY(sqlc.arg(supported_job_types)::text[])
     ORDER BY available_at, created_at
@@ -42,7 +69,9 @@ WITH eligible AS (
     SET status = 'running',
         attempt_count = attempt_count + 1,
         current_worker_id = sqlc.arg(worker_id),
-        updated_at = now()
+        lease_expires_at = statement_timestamp()
+            + sqlc.arg(lease_duration_ms)::bigint * interval '1 millisecond',
+        updated_at = statement_timestamp()
     FROM eligible
     WHERE jobs.id = eligible.id
     RETURNING
@@ -66,7 +95,7 @@ WITH eligible AS (
         attempt_count,
         sqlc.arg(worker_id),
         'running',
-        now()
+        statement_timestamp()
     FROM claimed
     RETURNING job_id, attempt_no
 )
@@ -85,6 +114,7 @@ SELECT
     jobs.status AS job_status,
     jobs.attempt_count,
     CAST(COALESCE(jobs.result = sqlc.arg(result_json)::jsonb, false) AS boolean) AS result_matches,
+    CAST(COALESCE(jobs.lease_expires_at > statement_timestamp(), false) AS boolean) AS lease_valid,
     job_attempts.worker_id,
     job_attempts.status AS attempt_status
 FROM jobs
@@ -108,9 +138,56 @@ UPDATE jobs
 SET status = 'succeeded',
     result = sqlc.arg(result_json)::jsonb,
     current_worker_id = NULL,
+    lease_expires_at = NULL,
     finished_at = sqlc.arg(finished_at),
     updated_at = sqlc.arg(finished_at)
 WHERE id = sqlc.arg(job_id)
   AND attempt_count = sqlc.arg(attempt_no)
   AND current_worker_id = sqlc.arg(worker_id)
-  AND status = 'running';
+  AND status = 'running'
+  AND lease_expires_at > statement_timestamp();
+
+-- name: RecoverExpiredJobs :many
+WITH expired AS MATERIALIZED (
+    SELECT
+        id,
+        attempt_count,
+        attempt_count >= max_attempts AS attempts_exhausted
+    FROM jobs
+    WHERE status = 'running'
+      AND lease_expires_at <= statement_timestamp()
+    ORDER BY lease_expires_at, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT sqlc.arg(batch_size)
+), abandoned AS (
+    UPDATE job_attempts
+    SET status = 'abandoned',
+        finished_at = statement_timestamp()
+    FROM expired
+    WHERE job_attempts.job_id = expired.id
+      AND job_attempts.attempt_no = expired.attempt_count
+      AND job_attempts.status = 'running'
+    RETURNING job_attempts.job_id, job_attempts.attempt_no
+), recovered AS (
+    UPDATE jobs
+    SET status = CASE
+            WHEN expired.attempts_exhausted THEN 'dead_lettered'
+            ELSE 'retry_wait'
+        END,
+        current_worker_id = NULL,
+        lease_expires_at = NULL,
+        available_at = statement_timestamp(),
+        finished_at = CASE
+            WHEN expired.attempts_exhausted THEN statement_timestamp()
+            ELSE NULL
+        END,
+        updated_at = statement_timestamp()
+    FROM expired
+    JOIN abandoned
+      ON abandoned.job_id = expired.id
+     AND abandoned.attempt_no = expired.attempt_count
+    WHERE jobs.id = expired.id
+    RETURNING jobs.id
+)
+SELECT id
+FROM recovered;

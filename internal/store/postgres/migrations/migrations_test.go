@@ -59,7 +59,13 @@ func TestMigrationsApplyRollbackAndReapply(t *testing.T) {
 		t.Fatalf("set Goose dialect: %v", err)
 	}
 
+	if err := goose.UpToContext(ctx, db, migrationDirectory, 3); err != nil {
+		t.Fatalf("apply migrations through version 3: %v", err)
+	}
+	verifyVersion(t, ctx, db, 3)
+	seedPreLeaseRunningJob(t, ctx, db)
 	applyMigrations(t, ctx, db, migrationDirectory)
+	verifyLeaseMigrationBackfill(t, ctx, db)
 	verifySchema(t, ctx, db)
 
 	if err := goose.DownToContext(ctx, db, migrationDirectory, 0); err != nil {
@@ -89,7 +95,60 @@ func applyMigrations(t *testing.T, ctx context.Context, db *sql.DB, directory st
 	if err := goose.UpContext(ctx, db, directory); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
-	verifyVersion(t, ctx, db, 3)
+	verifyVersion(t, ctx, db, 4)
+}
+
+func seedPreLeaseRunningJob(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO workers (id, hostname, version, concurrency, started_at)
+		VALUES ('00000000-0000-0000-0000-000000000020', 'pre-lease-worker', 'test', 1, now());
+
+		INSERT INTO jobs (
+			id, job_type, payload, status, attempt_count, max_attempts, timeout_ms, current_worker_id
+		)
+		VALUES (
+			'00000000-0000-0000-0000-000000000021', 'pre-lease-job', '{}', 'running', 1, 3, 30000,
+			'00000000-0000-0000-0000-000000000020'
+		);
+
+		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)
+		VALUES (
+			'00000000-0000-0000-0000-000000000021', 1,
+			'00000000-0000-0000-0000-000000000020', 'running', now()
+		);
+	`); err != nil {
+		t.Fatalf("seed pre-lease running job: %v", err)
+	}
+}
+
+func verifyLeaseMigrationBackfill(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+
+	var workerState string
+	var hasLastSeen, leaseExpired bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT workers.state,
+		       workers.last_seen_at IS NOT NULL,
+		       jobs.lease_expires_at <= statement_timestamp()
+		FROM workers
+		JOIN jobs ON jobs.current_worker_id = workers.id
+		WHERE jobs.id = '00000000-0000-0000-0000-000000000021'
+	`).Scan(&workerState, &hasLastSeen, &leaseExpired); err != nil {
+		t.Fatalf("read lease migration backfill: %v", err)
+	}
+	if workerState != "active" || !hasLastSeen || !leaseExpired {
+		t.Fatalf("lease migration backfill = state %q, last_seen %t, expired %t", workerState, hasLastSeen, leaseExpired)
+	}
+
+	var indexExists bool
+	if err := db.QueryRowContext(ctx, `SELECT to_regclass('jobs_expired_lease_idx') IS NOT NULL`).Scan(&indexExists); err != nil {
+		t.Fatalf("check expired lease index: %v", err)
+	}
+	if !indexExists {
+		t.Fatal("expired lease index does not exist")
+	}
 }
 
 func verifyVersion(t *testing.T, ctx context.Context, db *sql.DB, want int64) {
@@ -150,6 +209,10 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 		INSERT INTO workers (id, hostname, version, concurrency, started_at)
 		VALUES ('00000000-0000-0000-0000-000000000013', 'worker-c', 'test', 0, now())
 	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO workers (id, hostname, version, concurrency, started_at, state)
+		VALUES ('00000000-0000-0000-0000-000000000014', 'worker-d', 'test', 1, now(), 'unknown')
+	`)
 
 	expectConstraintError(t, ctx, db, "23514", `
 		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
@@ -186,6 +249,19 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 	expectConstraintError(t, ctx, db, "23514", `
 		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
 		VALUES ('00000000-0000-0000-0000-000000000009', 'test', '{}', 'queued', 3, 9223372036855)
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO jobs (id, job_type, payload, status, attempt_count, max_attempts, timeout_ms)
+		VALUES ('00000000-0000-0000-0000-000000000015', 'test', '{}', 'running', 1, 3, 30000)
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO jobs (
+			id, job_type, payload, status, max_attempts, timeout_ms, current_worker_id, lease_expires_at
+		)
+		VALUES (
+			'00000000-0000-0000-0000-000000000016', 'test', '{}', 'queued', 3, 30000,
+			'00000000-0000-0000-0000-000000000010', now()
+		)
 	`)
 	expectConstraintError(t, ctx, db, "23514", `
 		INSERT INTO job_attempts (job_id, attempt_no, worker_id, status, started_at)

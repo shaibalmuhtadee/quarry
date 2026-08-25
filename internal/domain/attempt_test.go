@@ -45,6 +45,7 @@ func TestAttemptStatus(t *testing.T) {
 	for _, value := range []domain.AttemptStatus{
 		domain.AttemptStatusRunning,
 		domain.AttemptStatusSucceeded,
+		domain.AttemptStatusAbandoned,
 	} {
 		value := value
 		t.Run(string(value), func(t *testing.T) {

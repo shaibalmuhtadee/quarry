@@ -14,7 +14,11 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-var ErrInvalidConfiguration = errors.New("invalid worker configuration")
+var (
+	ErrInvalidConfiguration = errors.New("invalid worker configuration")
+	errLeaseStale           = errors.New("attempt lease is stale")
+	errAttemptLost          = errors.New("attempt report lost its lease race")
+)
 
 type Handler func(context.Context, domain.Payload) (domain.Result, error)
 
@@ -34,9 +38,20 @@ type Job struct {
 	Timeout       time.Duration
 }
 
+type HeartbeatAttempt struct {
+	JobID         domain.JobID
+	AttemptNumber domain.AttemptNumber
+}
+
+type HeartbeatResult struct {
+	Attempt HeartbeatAttempt
+	Valid   bool
+}
+
 type Dispatcher interface {
 	Register(context.Context, Registration) error
 	Acquire(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error)
+	Heartbeat(context.Context, domain.WorkerID, []HeartbeatAttempt) ([]HeartbeatResult, error)
 	ReportSuccess(
 		context.Context,
 		domain.WorkerID,
@@ -47,22 +62,24 @@ type Dispatcher interface {
 }
 
 type Config struct {
-	Registration     Registration
-	IdleBackoffMin   time.Duration
-	IdleBackoffMax   time.Duration
-	ReportBackoffMin time.Duration
-	ReportBackoffMax time.Duration
+	Registration      Registration
+	IdleBackoffMin    time.Duration
+	IdleBackoffMax    time.Duration
+	ReportBackoffMin  time.Duration
+	ReportBackoffMax  time.Duration
+	HeartbeatInterval time.Duration
 }
 
 type Worker struct {
-	dispatcher       Dispatcher
-	registration     Registration
-	handlers         map[string]Handler
-	supportedTypes   []domain.JobType
-	idleBackoffMin   time.Duration
-	idleBackoffMax   time.Duration
-	reportBackoffMin time.Duration
-	reportBackoffMax time.Duration
+	dispatcher        Dispatcher
+	registration      Registration
+	handlers          map[string]Handler
+	supportedTypes    []domain.JobType
+	idleBackoffMin    time.Duration
+	idleBackoffMax    time.Duration
+	reportBackoffMin  time.Duration
+	reportBackoffMax  time.Duration
+	heartbeatInterval time.Duration
 }
 
 func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worker, error) {
@@ -90,6 +107,9 @@ func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worke
 	if err := validateBackoff(cfg.ReportBackoffMin, cfg.ReportBackoffMax); err != nil {
 		return nil, fmt.Errorf("%w: report backoff: %v", ErrInvalidConfiguration, err)
 	}
+	if cfg.HeartbeatInterval <= 0 {
+		return nil, fmt.Errorf("%w: heartbeat interval must be positive", ErrInvalidConfiguration)
+	}
 
 	handlerCopy := make(map[string]Handler, len(handlers))
 	supportedTypes := make([]domain.JobType, 0, len(handlers))
@@ -109,15 +129,91 @@ func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worke
 	})
 
 	return &Worker{
-		dispatcher:       dispatcher,
-		registration:     cfg.Registration,
-		handlers:         handlerCopy,
-		supportedTypes:   supportedTypes,
-		idleBackoffMin:   cfg.IdleBackoffMin,
-		idleBackoffMax:   cfg.IdleBackoffMax,
-		reportBackoffMin: cfg.ReportBackoffMin,
-		reportBackoffMax: cfg.ReportBackoffMax,
+		dispatcher:        dispatcher,
+		registration:      cfg.Registration,
+		handlers:          handlerCopy,
+		supportedTypes:    supportedTypes,
+		idleBackoffMin:    cfg.IdleBackoffMin,
+		idleBackoffMax:    cfg.IdleBackoffMax,
+		reportBackoffMin:  cfg.ReportBackoffMin,
+		reportBackoffMax:  cfg.ReportBackoffMax,
+		heartbeatInterval: cfg.HeartbeatInterval,
 	}, nil
+}
+
+type activeAttempt struct {
+	identity HeartbeatAttempt
+	job      Job
+	ctx      context.Context
+	cancel   context.CancelCauseFunc
+}
+
+type activeAttempts struct {
+	mu       sync.Mutex
+	attempts map[HeartbeatAttempt]*activeAttempt
+}
+
+func newActiveAttempts() *activeAttempts {
+	return &activeAttempts{attempts: make(map[HeartbeatAttempt]*activeAttempt)}
+}
+
+func (active *activeAttempts) add(parent context.Context, job Job) (*activeAttempt, error) {
+	identity := HeartbeatAttempt{JobID: job.ID, AttemptNumber: job.AttemptNumber}
+	ctx, cancel := context.WithCancelCause(parent)
+	attempt := &activeAttempt{identity: identity, job: job, ctx: ctx, cancel: cancel}
+
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	if _, exists := active.attempts[identity]; exists {
+		cancel(errors.New("duplicate active attempt"))
+		return nil, errors.New("dispatcher returned a duplicate active attempt")
+	}
+	active.attempts[identity] = attempt
+	return attempt, nil
+}
+
+func (active *activeAttempts) len() int {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	return len(active.attempts)
+}
+
+func (active *activeAttempts) snapshot() []HeartbeatAttempt {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	attempts := make([]HeartbeatAttempt, 0, len(active.attempts))
+	for identity := range active.attempts {
+		attempts = append(attempts, identity)
+	}
+	return attempts
+}
+
+func (active *activeAttempts) remove(attempt *activeAttempt, cause error) bool {
+	active.mu.Lock()
+	current, exists := active.attempts[attempt.identity]
+	if exists && current == attempt {
+		delete(active.attempts, attempt.identity)
+	}
+	active.mu.Unlock()
+	if !exists || current != attempt {
+		return false
+	}
+	attempt.cancel(cause)
+	return true
+}
+
+func (active *activeAttempts) cancel(identity HeartbeatAttempt, cause error) bool {
+	active.mu.Lock()
+	attempt, exists := active.attempts[identity]
+	if exists {
+		delete(active.attempts, identity)
+	}
+	active.mu.Unlock()
+	if !exists {
+		return false
+	}
+	attempt.cancel(cause)
+	return true
 }
 
 func (worker *Worker) Run(ctx context.Context) error {
@@ -130,58 +226,61 @@ func (worker *Worker) Run(ctx context.Context) error {
 
 	runCtx, cancel := context.WithCancel(ctx)
 
-	jobs := make(chan Job, worker.registration.Concurrency)
-	completed := make(chan struct{}, worker.registration.Concurrency)
-	executorErrors := make(chan error, 1)
+	jobs := make(chan *activeAttempt, worker.registration.Concurrency)
+	capacityChanged := make(chan struct{}, 1)
+	runtimeErrors := make(chan error, 1)
+	active := newActiveAttempts()
 	var failOnce sync.Once
 	fail := func(err error) {
 		failOnce.Do(func() {
-			executorErrors <- err
+			runtimeErrors <- err
 			cancel()
 		})
 	}
+	notifyCapacityChanged := func() {
+		select {
+		case capacityChanged <- struct{}{}:
+		default:
+		}
+	}
 
-	var executors sync.WaitGroup
+	var goroutines sync.WaitGroup
 	for range worker.registration.Concurrency {
-		executors.Add(1)
+		goroutines.Add(1)
 		go func() {
-			defer executors.Done()
-			worker.execute(runCtx, jobs, completed, fail)
+			defer goroutines.Done()
+			worker.execute(runCtx, jobs, active, notifyCapacityChanged, fail)
 		}()
 	}
+	goroutines.Add(1)
+	go func() {
+		defer goroutines.Done()
+		if err := worker.heartbeatLoop(runCtx, active, notifyCapacityChanged); err != nil {
+			fail(err)
+		}
+	}()
 	defer func() {
 		cancel()
-		executors.Wait()
+		goroutines.Wait()
 	}()
 
-	outstanding := uint32(0)
 	idleBackoff := worker.idleBackoffMin
 	for {
-		if err := receiveExecutorError(executorErrors); err != nil {
+		if err := receiveRuntimeError(runtimeErrors); err != nil {
 			return err
 		}
 		if ctx.Err() != nil {
 			return nil
 		}
 
-		for {
-			select {
-			case <-completed:
-				outstanding--
-			default:
-				goto completionsDrained
-			}
-		}
-
-	completionsDrained:
-		if outstanding == worker.registration.Concurrency {
+		outstanding := uint32(active.len())
+		if outstanding >= worker.registration.Concurrency {
 			select {
 			case <-ctx.Done():
 				return nil
-			case err := <-executorErrors:
+			case err := <-runtimeErrors:
 				return err
-			case <-completed:
-				outstanding--
+			case <-capacityChanged:
 			}
 			continue
 		}
@@ -195,8 +294,8 @@ func (worker *Worker) Run(ctx context.Context) error {
 		)
 		if err != nil {
 			if runCtx.Err() != nil {
-				if executorErr := receiveExecutorError(executorErrors); executorErr != nil {
-					return executorErr
+				if runtimeErr := receiveRuntimeError(runtimeErrors); runtimeErr != nil {
+					return runtimeErr
 				}
 				return nil
 			}
@@ -225,12 +324,16 @@ func (worker *Worker) Run(ctx context.Context) error {
 			if _, ok := worker.handlers[job.Type.String()]; !ok {
 				return fmt.Errorf("dispatcher returned unsupported job type %q", job.Type.String())
 			}
-			outstanding++
+			attempt, err := active.add(runCtx, job)
+			if err != nil {
+				return err
+			}
 			select {
-			case jobs <- job:
+			case jobs <- attempt:
 			case <-runCtx.Done():
-				if executorErr := receiveExecutorError(executorErrors); executorErr != nil {
-					return executorErr
+				active.remove(attempt, context.Cause(runCtx))
+				if runtimeErr := receiveRuntimeError(runtimeErrors); runtimeErr != nil {
+					return runtimeErr
 				}
 				return nil
 			}
@@ -240,34 +343,85 @@ func (worker *Worker) Run(ctx context.Context) error {
 
 func (worker *Worker) execute(
 	ctx context.Context,
-	jobs <-chan Job,
-	completed chan<- struct{},
+	jobs <-chan *activeAttempt,
+	active *activeAttempts,
+	notifyCapacityChanged func(),
 	fail func(error),
 ) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case job := <-jobs:
+		case attempt := <-jobs:
 			if ctx.Err() != nil {
 				return
 			}
+			if errors.Is(context.Cause(attempt.ctx), errLeaseStale) {
+				continue
+			}
+			job := attempt.job
 			handler := worker.handlers[job.Type.String()]
-			result, err := handler(ctx, job.Payload)
+			result, err := handler(attempt.ctx, job.Payload)
+			if errors.Is(context.Cause(attempt.ctx), errLeaseStale) {
+				continue
+			}
+			if ctx.Err() != nil {
+				return
+			}
 			if err != nil {
 				fail(fmt.Errorf("execute %s attempt %d: %w", job.ID, job.AttemptNumber.Int32(), err))
 				return
 			}
-			if err := worker.reportUntilAcknowledged(ctx, job, result); err != nil {
+			if err := worker.reportUntilAcknowledged(attempt.ctx, job, result); err != nil {
+				if errors.Is(err, errAttemptLost) || errors.Is(context.Cause(attempt.ctx), errLeaseStale) {
+					if active.remove(attempt, err) {
+						notifyCapacityChanged()
+					}
+					continue
+				}
 				if ctx.Err() == nil {
 					fail(err)
 				}
 				return
 			}
-			select {
-			case completed <- struct{}{}:
-			case <-ctx.Done():
-				return
+			if active.remove(attempt, nil) {
+				notifyCapacityChanged()
+			}
+		}
+	}
+}
+
+func (worker *Worker) heartbeatLoop(
+	ctx context.Context,
+	active *activeAttempts,
+	notifyCapacityChanged func(),
+) error {
+	ticker := time.NewTicker(worker.heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+
+		results, err := worker.dispatcher.Heartbeat(
+			ctx,
+			worker.registration.WorkerID,
+			active.snapshot(),
+		)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if isTransientRPCError(err) {
+				continue
+			}
+			return fmt.Errorf("heartbeat worker: %w", err)
+		}
+		for _, result := range results {
+			if !result.Valid && active.cancel(result.Attempt, errLeaseStale) {
+				notifyCapacityChanged()
 			}
 		}
 	}
@@ -292,6 +446,9 @@ func (worker *Worker) reportUntilAcknowledged(
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if status.Code(err) == codes.FailedPrecondition {
+			return errAttemptLost
+		}
 		if !isTransientRPCError(err) {
 			return fmt.Errorf("report %s attempt %d: %w", job.ID, job.AttemptNumber.Int32(), err)
 		}
@@ -308,7 +465,7 @@ func validateBackoff(minimum, maximum time.Duration) error {
 	return nil
 }
 
-func receiveExecutorError(errors <-chan error) error {
+func receiveRuntimeError(errors <-chan error) error {
 	select {
 	case err := <-errors:
 		return err
