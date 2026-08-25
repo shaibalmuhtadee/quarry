@@ -30,13 +30,14 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // DispatcherService coordinates worker registration, job acquisition, lease
-// heartbeats, and successful attempt reporting.
+// heartbeats, and attempt outcome reporting.
 type DispatcherServiceClient interface {
 	// RegisterWorker records one worker process identity.
 	RegisterWorker(ctx context.Context, in *RegisterWorkerRequest, opts ...grpc.CallOption) (*RegisterWorkerResponse, error)
 	// AcquireJobs claims jobs that the worker can execute.
 	AcquireJobs(ctx context.Context, in *AcquireJobsRequest, opts ...grpc.CallOption) (*AcquireJobsResponse, error)
-	// Heartbeat renews active attempt leases and reports stale attempts.
+	// Heartbeat renews active attempt leases and reports stale attempts and
+	// cancellation requests.
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
 	// ReportAttempt records the outcome of one acquired attempt.
 	ReportAttempt(ctx context.Context, in *ReportAttemptRequest, opts ...grpc.CallOption) (*ReportAttemptResponse, error)
@@ -95,13 +96,14 @@ func (c *dispatcherServiceClient) ReportAttempt(ctx context.Context, in *ReportA
 // for forward compatibility.
 //
 // DispatcherService coordinates worker registration, job acquisition, lease
-// heartbeats, and successful attempt reporting.
+// heartbeats, and attempt outcome reporting.
 type DispatcherServiceServer interface {
 	// RegisterWorker records one worker process identity.
 	RegisterWorker(context.Context, *RegisterWorkerRequest) (*RegisterWorkerResponse, error)
 	// AcquireJobs claims jobs that the worker can execute.
 	AcquireJobs(context.Context, *AcquireJobsRequest) (*AcquireJobsResponse, error)
-	// Heartbeat renews active attempt leases and reports stale attempts.
+	// Heartbeat renews active attempt leases and reports stale attempts and
+	// cancellation requests.
 	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
 	// ReportAttempt records the outcome of one acquired attempt.
 	ReportAttempt(context.Context, *ReportAttemptRequest) (*ReportAttemptResponse, error)

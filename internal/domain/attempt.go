@@ -34,15 +34,27 @@ func (number AttemptNumber) IsZero() bool {
 type AttemptStatus string
 
 const (
-	AttemptStatusRunning   AttemptStatus = "running"
-	AttemptStatusSucceeded AttemptStatus = "succeeded"
-	AttemptStatusAbandoned AttemptStatus = "abandoned"
+	AttemptStatusRunning         AttemptStatus = "running"
+	AttemptStatusSucceeded       AttemptStatus = "succeeded"
+	AttemptStatusRetryableFailed AttemptStatus = "retryable_failed"
+	AttemptStatusPermanentFailed AttemptStatus = "permanent_failed"
+	AttemptStatusCancelled       AttemptStatus = "cancelled"
+	AttemptStatusTimedOut        AttemptStatus = "timed_out"
+	AttemptStatusPanicked        AttemptStatus = "panicked"
+	AttemptStatusAbandoned       AttemptStatus = "abandoned"
 )
 
 func ParseAttemptStatus(value string) (AttemptStatus, error) {
 	status := AttemptStatus(value)
 	switch status {
-	case AttemptStatusRunning, AttemptStatusSucceeded, AttemptStatusAbandoned:
+	case AttemptStatusRunning,
+		AttemptStatusSucceeded,
+		AttemptStatusRetryableFailed,
+		AttemptStatusPermanentFailed,
+		AttemptStatusCancelled,
+		AttemptStatusTimedOut,
+		AttemptStatusPanicked,
+		AttemptStatusAbandoned:
 		return status, nil
 	default:
 		return "", fmt.Errorf("%w: %q", ErrInvalidAttemptStatus, value)

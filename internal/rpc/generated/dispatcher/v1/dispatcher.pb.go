@@ -512,12 +512,13 @@ func (x *HeartbeatResponse) GetAttempts() []*HeartbeatAttemptResult {
 }
 
 type HeartbeatAttemptResult struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	AttemptNo     uint32                 `protobuf:"varint,2,opt,name=attempt_no,json=attemptNo,proto3" json:"attempt_no,omitempty"`
-	State         HeartbeatAttemptState  `protobuf:"varint,3,opt,name=state,proto3,enum=quarry.dispatcher.v1.HeartbeatAttemptState" json:"state,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	JobId           string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	AttemptNo       uint32                 `protobuf:"varint,2,opt,name=attempt_no,json=attemptNo,proto3" json:"attempt_no,omitempty"`
+	State           HeartbeatAttemptState  `protobuf:"varint,3,opt,name=state,proto3,enum=quarry.dispatcher.v1.HeartbeatAttemptState" json:"state,omitempty"`
+	CancelRequested bool                   `protobuf:"varint,4,opt,name=cancel_requested,json=cancelRequested,proto3" json:"cancel_requested,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *HeartbeatAttemptResult) Reset() {
@@ -571,6 +572,13 @@ func (x *HeartbeatAttemptResult) GetState() HeartbeatAttemptState {
 	return HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_UNSPECIFIED
 }
 
+func (x *HeartbeatAttemptResult) GetCancelRequested() bool {
+	if x != nil {
+		return x.CancelRequested
+	}
+	return false
+}
+
 type ReportAttemptRequest struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	WorkerId  string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
@@ -579,6 +587,11 @@ type ReportAttemptRequest struct {
 	// Types that are valid to be assigned to Outcome:
 	//
 	//	*ReportAttemptRequest_Succeeded
+	//	*ReportAttemptRequest_RetryableFailure
+	//	*ReportAttemptRequest_PermanentFailure
+	//	*ReportAttemptRequest_Cancelled
+	//	*ReportAttemptRequest_TimedOut
+	//	*ReportAttemptRequest_Panicked
 	Outcome       isReportAttemptRequest_Outcome `protobuf_oneof:"outcome"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -651,6 +664,51 @@ func (x *ReportAttemptRequest) GetSucceeded() *AttemptSucceeded {
 	return nil
 }
 
+func (x *ReportAttemptRequest) GetRetryableFailure() *AttemptFailure {
+	if x != nil {
+		if x, ok := x.Outcome.(*ReportAttemptRequest_RetryableFailure); ok {
+			return x.RetryableFailure
+		}
+	}
+	return nil
+}
+
+func (x *ReportAttemptRequest) GetPermanentFailure() *AttemptFailure {
+	if x != nil {
+		if x, ok := x.Outcome.(*ReportAttemptRequest_PermanentFailure); ok {
+			return x.PermanentFailure
+		}
+	}
+	return nil
+}
+
+func (x *ReportAttemptRequest) GetCancelled() *AttemptFailure {
+	if x != nil {
+		if x, ok := x.Outcome.(*ReportAttemptRequest_Cancelled); ok {
+			return x.Cancelled
+		}
+	}
+	return nil
+}
+
+func (x *ReportAttemptRequest) GetTimedOut() *AttemptFailure {
+	if x != nil {
+		if x, ok := x.Outcome.(*ReportAttemptRequest_TimedOut); ok {
+			return x.TimedOut
+		}
+	}
+	return nil
+}
+
+func (x *ReportAttemptRequest) GetPanicked() *AttemptFailure {
+	if x != nil {
+		if x, ok := x.Outcome.(*ReportAttemptRequest_Panicked); ok {
+			return x.Panicked
+		}
+	}
+	return nil
+}
+
 type isReportAttemptRequest_Outcome interface {
 	isReportAttemptRequest_Outcome()
 }
@@ -659,7 +717,37 @@ type ReportAttemptRequest_Succeeded struct {
 	Succeeded *AttemptSucceeded `protobuf:"bytes,4,opt,name=succeeded,proto3,oneof"`
 }
 
+type ReportAttemptRequest_RetryableFailure struct {
+	RetryableFailure *AttemptFailure `protobuf:"bytes,5,opt,name=retryable_failure,json=retryableFailure,proto3,oneof"`
+}
+
+type ReportAttemptRequest_PermanentFailure struct {
+	PermanentFailure *AttemptFailure `protobuf:"bytes,6,opt,name=permanent_failure,json=permanentFailure,proto3,oneof"`
+}
+
+type ReportAttemptRequest_Cancelled struct {
+	Cancelled *AttemptFailure `protobuf:"bytes,7,opt,name=cancelled,proto3,oneof"`
+}
+
+type ReportAttemptRequest_TimedOut struct {
+	TimedOut *AttemptFailure `protobuf:"bytes,8,opt,name=timed_out,json=timedOut,proto3,oneof"`
+}
+
+type ReportAttemptRequest_Panicked struct {
+	Panicked *AttemptFailure `protobuf:"bytes,9,opt,name=panicked,proto3,oneof"`
+}
+
 func (*ReportAttemptRequest_Succeeded) isReportAttemptRequest_Outcome() {}
+
+func (*ReportAttemptRequest_RetryableFailure) isReportAttemptRequest_Outcome() {}
+
+func (*ReportAttemptRequest_PermanentFailure) isReportAttemptRequest_Outcome() {}
+
+func (*ReportAttemptRequest_Cancelled) isReportAttemptRequest_Outcome() {}
+
+func (*ReportAttemptRequest_TimedOut) isReportAttemptRequest_Outcome() {}
+
+func (*ReportAttemptRequest_Panicked) isReportAttemptRequest_Outcome() {}
 
 type AttemptSucceeded struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -705,6 +793,58 @@ func (x *AttemptSucceeded) GetResultJson() []byte {
 	return nil
 }
 
+type AttemptFailure struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ErrorCode     string                 `protobuf:"bytes,1,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
+	ErrorMessage  string                 `protobuf:"bytes,2,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AttemptFailure) Reset() {
+	*x = AttemptFailure{}
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AttemptFailure) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AttemptFailure) ProtoMessage() {}
+
+func (x *AttemptFailure) ProtoReflect() protoreflect.Message {
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AttemptFailure.ProtoReflect.Descriptor instead.
+func (*AttemptFailure) Descriptor() ([]byte, []int) {
+	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *AttemptFailure) GetErrorCode() string {
+	if x != nil {
+		return x.ErrorCode
+	}
+	return ""
+}
+
+func (x *AttemptFailure) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
 type ReportAttemptResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -713,7 +853,7 @@ type ReportAttemptResponse struct {
 
 func (x *ReportAttemptResponse) Reset() {
 	*x = ReportAttemptResponse{}
-	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[11]
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -725,7 +865,7 @@ func (x *ReportAttemptResponse) String() string {
 func (*ReportAttemptResponse) ProtoMessage() {}
 
 func (x *ReportAttemptResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[11]
+	mi := &file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -738,7 +878,7 @@ func (x *ReportAttemptResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportAttemptResponse.ProtoReflect.Descriptor instead.
 func (*ReportAttemptResponse) Descriptor() ([]byte, []int) {
-	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP(), []int{11}
+	return file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP(), []int{12}
 }
 
 var File_quarry_dispatcher_v1_dispatcher_proto protoreflect.FileDescriptor
@@ -776,22 +916,32 @@ const file_quarry_dispatcher_v1_dispatcher_proto_rawDesc = "" +
 	"\n" +
 	"attempt_no\x18\x02 \x01(\rR\tattemptNo\"]\n" +
 	"\x11HeartbeatResponse\x12H\n" +
-	"\battempts\x18\x01 \x03(\v2,.quarry.dispatcher.v1.HeartbeatAttemptResultR\battempts\"\x91\x01\n" +
+	"\battempts\x18\x01 \x03(\v2,.quarry.dispatcher.v1.HeartbeatAttemptResultR\battempts\"\xbc\x01\n" +
 	"\x16HeartbeatAttemptResult\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x1d\n" +
 	"\n" +
 	"attempt_no\x18\x02 \x01(\rR\tattemptNo\x12A\n" +
-	"\x05state\x18\x03 \x01(\x0e2+.quarry.dispatcher.v1.HeartbeatAttemptStateR\x05state\"\xbc\x01\n" +
+	"\x05state\x18\x03 \x01(\x0e2+.quarry.dispatcher.v1.HeartbeatAttemptStateR\x05state\x12)\n" +
+	"\x10cancel_requested\x18\x04 \x01(\bR\x0fcancelRequested\"\xb5\x04\n" +
 	"\x14ReportAttemptRequest\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x15\n" +
 	"\x06job_id\x18\x02 \x01(\tR\x05jobId\x12\x1d\n" +
 	"\n" +
 	"attempt_no\x18\x03 \x01(\rR\tattemptNo\x12F\n" +
-	"\tsucceeded\x18\x04 \x01(\v2&.quarry.dispatcher.v1.AttemptSucceededH\x00R\tsucceededB\t\n" +
+	"\tsucceeded\x18\x04 \x01(\v2&.quarry.dispatcher.v1.AttemptSucceededH\x00R\tsucceeded\x12S\n" +
+	"\x11retryable_failure\x18\x05 \x01(\v2$.quarry.dispatcher.v1.AttemptFailureH\x00R\x10retryableFailure\x12S\n" +
+	"\x11permanent_failure\x18\x06 \x01(\v2$.quarry.dispatcher.v1.AttemptFailureH\x00R\x10permanentFailure\x12D\n" +
+	"\tcancelled\x18\a \x01(\v2$.quarry.dispatcher.v1.AttemptFailureH\x00R\tcancelled\x12C\n" +
+	"\ttimed_out\x18\b \x01(\v2$.quarry.dispatcher.v1.AttemptFailureH\x00R\btimedOut\x12B\n" +
+	"\bpanicked\x18\t \x01(\v2$.quarry.dispatcher.v1.AttemptFailureH\x00R\bpanickedB\t\n" +
 	"\aoutcome\"3\n" +
 	"\x10AttemptSucceeded\x12\x1f\n" +
 	"\vresult_json\x18\x01 \x01(\fR\n" +
-	"resultJson\"\x17\n" +
+	"resultJson\"T\n" +
+	"\x0eAttemptFailure\x12\x1d\n" +
+	"\n" +
+	"error_code\x18\x01 \x01(\tR\terrorCode\x12#\n" +
+	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"\x17\n" +
 	"\x15ReportAttemptResponse*\x86\x01\n" +
 	"\x15HeartbeatAttemptState\x12'\n" +
 	"#HEARTBEAT_ATTEMPT_STATE_UNSPECIFIED\x10\x00\x12!\n" +
@@ -816,7 +966,7 @@ func file_quarry_dispatcher_v1_dispatcher_proto_rawDescGZIP() []byte {
 }
 
 var file_quarry_dispatcher_v1_dispatcher_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_quarry_dispatcher_v1_dispatcher_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_quarry_dispatcher_v1_dispatcher_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_quarry_dispatcher_v1_dispatcher_proto_goTypes = []any{
 	(HeartbeatAttemptState)(0),     // 0: quarry.dispatcher.v1.HeartbeatAttemptState
 	(*RegisterWorkerRequest)(nil),  // 1: quarry.dispatcher.v1.RegisterWorkerRequest
@@ -830,29 +980,35 @@ var file_quarry_dispatcher_v1_dispatcher_proto_goTypes = []any{
 	(*HeartbeatAttemptResult)(nil), // 9: quarry.dispatcher.v1.HeartbeatAttemptResult
 	(*ReportAttemptRequest)(nil),   // 10: quarry.dispatcher.v1.ReportAttemptRequest
 	(*AttemptSucceeded)(nil),       // 11: quarry.dispatcher.v1.AttemptSucceeded
-	(*ReportAttemptResponse)(nil),  // 12: quarry.dispatcher.v1.ReportAttemptResponse
-	(*timestamppb.Timestamp)(nil),  // 13: google.protobuf.Timestamp
+	(*AttemptFailure)(nil),         // 12: quarry.dispatcher.v1.AttemptFailure
+	(*ReportAttemptResponse)(nil),  // 13: quarry.dispatcher.v1.ReportAttemptResponse
+	(*timestamppb.Timestamp)(nil),  // 14: google.protobuf.Timestamp
 }
 var file_quarry_dispatcher_v1_dispatcher_proto_depIdxs = []int32{
-	13, // 0: quarry.dispatcher.v1.RegisterWorkerRequest.started_at:type_name -> google.protobuf.Timestamp
+	14, // 0: quarry.dispatcher.v1.RegisterWorkerRequest.started_at:type_name -> google.protobuf.Timestamp
 	5,  // 1: quarry.dispatcher.v1.AcquireJobsResponse.jobs:type_name -> quarry.dispatcher.v1.AcquiredJob
 	7,  // 2: quarry.dispatcher.v1.HeartbeatRequest.active_attempts:type_name -> quarry.dispatcher.v1.HeartbeatAttempt
 	9,  // 3: quarry.dispatcher.v1.HeartbeatResponse.attempts:type_name -> quarry.dispatcher.v1.HeartbeatAttemptResult
 	0,  // 4: quarry.dispatcher.v1.HeartbeatAttemptResult.state:type_name -> quarry.dispatcher.v1.HeartbeatAttemptState
 	11, // 5: quarry.dispatcher.v1.ReportAttemptRequest.succeeded:type_name -> quarry.dispatcher.v1.AttemptSucceeded
-	1,  // 6: quarry.dispatcher.v1.DispatcherService.RegisterWorker:input_type -> quarry.dispatcher.v1.RegisterWorkerRequest
-	3,  // 7: quarry.dispatcher.v1.DispatcherService.AcquireJobs:input_type -> quarry.dispatcher.v1.AcquireJobsRequest
-	6,  // 8: quarry.dispatcher.v1.DispatcherService.Heartbeat:input_type -> quarry.dispatcher.v1.HeartbeatRequest
-	10, // 9: quarry.dispatcher.v1.DispatcherService.ReportAttempt:input_type -> quarry.dispatcher.v1.ReportAttemptRequest
-	2,  // 10: quarry.dispatcher.v1.DispatcherService.RegisterWorker:output_type -> quarry.dispatcher.v1.RegisterWorkerResponse
-	4,  // 11: quarry.dispatcher.v1.DispatcherService.AcquireJobs:output_type -> quarry.dispatcher.v1.AcquireJobsResponse
-	8,  // 12: quarry.dispatcher.v1.DispatcherService.Heartbeat:output_type -> quarry.dispatcher.v1.HeartbeatResponse
-	12, // 13: quarry.dispatcher.v1.DispatcherService.ReportAttempt:output_type -> quarry.dispatcher.v1.ReportAttemptResponse
-	10, // [10:14] is the sub-list for method output_type
-	6,  // [6:10] is the sub-list for method input_type
-	6,  // [6:6] is the sub-list for extension type_name
-	6,  // [6:6] is the sub-list for extension extendee
-	0,  // [0:6] is the sub-list for field type_name
+	12, // 6: quarry.dispatcher.v1.ReportAttemptRequest.retryable_failure:type_name -> quarry.dispatcher.v1.AttemptFailure
+	12, // 7: quarry.dispatcher.v1.ReportAttemptRequest.permanent_failure:type_name -> quarry.dispatcher.v1.AttemptFailure
+	12, // 8: quarry.dispatcher.v1.ReportAttemptRequest.cancelled:type_name -> quarry.dispatcher.v1.AttemptFailure
+	12, // 9: quarry.dispatcher.v1.ReportAttemptRequest.timed_out:type_name -> quarry.dispatcher.v1.AttemptFailure
+	12, // 10: quarry.dispatcher.v1.ReportAttemptRequest.panicked:type_name -> quarry.dispatcher.v1.AttemptFailure
+	1,  // 11: quarry.dispatcher.v1.DispatcherService.RegisterWorker:input_type -> quarry.dispatcher.v1.RegisterWorkerRequest
+	3,  // 12: quarry.dispatcher.v1.DispatcherService.AcquireJobs:input_type -> quarry.dispatcher.v1.AcquireJobsRequest
+	6,  // 13: quarry.dispatcher.v1.DispatcherService.Heartbeat:input_type -> quarry.dispatcher.v1.HeartbeatRequest
+	10, // 14: quarry.dispatcher.v1.DispatcherService.ReportAttempt:input_type -> quarry.dispatcher.v1.ReportAttemptRequest
+	2,  // 15: quarry.dispatcher.v1.DispatcherService.RegisterWorker:output_type -> quarry.dispatcher.v1.RegisterWorkerResponse
+	4,  // 16: quarry.dispatcher.v1.DispatcherService.AcquireJobs:output_type -> quarry.dispatcher.v1.AcquireJobsResponse
+	8,  // 17: quarry.dispatcher.v1.DispatcherService.Heartbeat:output_type -> quarry.dispatcher.v1.HeartbeatResponse
+	13, // 18: quarry.dispatcher.v1.DispatcherService.ReportAttempt:output_type -> quarry.dispatcher.v1.ReportAttemptResponse
+	15, // [15:19] is the sub-list for method output_type
+	11, // [11:15] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_quarry_dispatcher_v1_dispatcher_proto_init() }
@@ -862,6 +1018,11 @@ func file_quarry_dispatcher_v1_dispatcher_proto_init() {
 	}
 	file_quarry_dispatcher_v1_dispatcher_proto_msgTypes[9].OneofWrappers = []any{
 		(*ReportAttemptRequest_Succeeded)(nil),
+		(*ReportAttemptRequest_RetryableFailure)(nil),
+		(*ReportAttemptRequest_PermanentFailure)(nil),
+		(*ReportAttemptRequest_Cancelled)(nil),
+		(*ReportAttemptRequest_TimedOut)(nil),
+		(*ReportAttemptRequest_Panicked)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -869,7 +1030,7 @@ func file_quarry_dispatcher_v1_dispatcher_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_quarry_dispatcher_v1_dispatcher_proto_rawDesc), len(file_quarry_dispatcher_v1_dispatcher_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   12,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
