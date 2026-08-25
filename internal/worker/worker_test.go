@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -767,6 +768,29 @@ func newTestWorkerWithID(
 	handlers map[string]Handler,
 ) *Worker {
 	t.Helper()
+	return newTestWorkerWithIDAndLogger(t, dispatcher, concurrency, workerID, nil, handlers)
+}
+
+func newTestWorkerWithLogger(
+	t *testing.T,
+	dispatcher Dispatcher,
+	concurrency uint32,
+	logger *slog.Logger,
+	handlers map[string]Handler,
+) *Worker {
+	t.Helper()
+	return newTestWorkerWithIDAndLogger(t, dispatcher, concurrency, domain.NewWorkerID(), logger, handlers)
+}
+
+func newTestWorkerWithIDAndLogger(
+	t *testing.T,
+	dispatcher Dispatcher,
+	concurrency uint32,
+	workerID domain.WorkerID,
+	logger *slog.Logger,
+	handlers map[string]Handler,
+) *Worker {
+	t.Helper()
 	runtime, err := New(dispatcher, handlers, Config{
 		Registration: Registration{
 			WorkerID:    workerID,
@@ -780,6 +804,7 @@ func newTestWorkerWithID(
 		ReportBackoffMin:  time.Millisecond,
 		ReportBackoffMax:  2 * time.Millisecond,
 		HeartbeatInterval: 5 * time.Millisecond,
+		Logger:            logger,
 	})
 	if err != nil {
 		t.Fatal(err)

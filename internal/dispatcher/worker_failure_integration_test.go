@@ -3,6 +3,8 @@ package dispatcher_test
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"testing"
 	"time"
@@ -12,6 +14,7 @@ import (
 	dispatcherv1 "github.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1"
 	"github.com/shaibalmuhtadee/quarry/internal/store/postgres"
 	workerruntime "github.com/shaibalmuhtadee/quarry/internal/worker"
+	"github.com/shaibalmuhtadee/quarry/internal/worker/handlers"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
@@ -30,9 +33,13 @@ func TestWorkerRetryableFailureRetriesUntilMaximumAttempts(t *testing.T) {
 		t,
 		2,
 		domain.AttemptStatusRetryableFailed,
+		30*time.Second,
+		`{"test":true}`,
 		func(context.Context, domain.Payload) (domain.Result, error) {
 			return domain.Result{}, handlerErr
 		},
+		"dependency_timeout",
+		"dependency timed out",
 	)
 }
 
@@ -49,9 +56,41 @@ func TestWorkerPermanentFailureDoesNotRetry(t *testing.T) {
 		t,
 		1,
 		domain.AttemptStatusPermanentFailed,
+		30*time.Second,
+		`{"test":true}`,
 		func(context.Context, domain.Payload) (domain.Result, error) {
 			return domain.Result{}, handlerErr
 		},
+		"invalid_input",
+		"input is invalid",
+	)
+}
+
+func TestWorkerTimeoutRetriesUntilMaximumAttempts(t *testing.T) {
+	testWorkerFailureThroughGRPCAndPostgres(
+		t,
+		2,
+		domain.AttemptStatusTimedOut,
+		20*time.Millisecond,
+		`{"duration_ms":60000}`,
+		handlers.Sleep,
+		"execution_timeout",
+		"handler execution timed out",
+	)
+}
+
+func TestWorkerPanicRetriesUntilMaximumAttempts(t *testing.T) {
+	testWorkerFailureThroughGRPCAndPostgres(
+		t,
+		2,
+		domain.AttemptStatusPanicked,
+		30*time.Second,
+		`{"test":true}`,
+		func(context.Context, domain.Payload) (domain.Result, error) {
+			panic("unsafe panic detail")
+		},
+		"handler_panicked",
+		"handler panicked",
 	)
 }
 
@@ -59,7 +98,11 @@ func testWorkerFailureThroughGRPCAndPostgres(
 	t *testing.T,
 	wantAttempts int,
 	wantAttemptStatus domain.AttemptStatus,
+	executionTimeout time.Duration,
+	payloadJSON string,
 	handler workerruntime.Handler,
+	wantCode string,
+	wantMessage string,
 ) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -95,11 +138,11 @@ func testWorkerFailureThroughGRPCAndPostgres(
 	}
 
 	jobType := mustJobType(t, "integration.handler_failure")
-	payload, err := domain.ParsePayload([]byte(`{"test":true}`))
+	payload, err := domain.ParsePayload([]byte(payloadJSON))
 	if err != nil {
 		t.Fatalf("parse payload: %v", err)
 	}
-	submission, err := domain.NewJobSubmission(jobType, payload, 2, 30*time.Second)
+	submission, err := domain.NewJobSubmission(jobType, payload, 2, executionTimeout)
 	if err != nil {
 		t.Fatalf("create job submission: %v", err)
 	}
@@ -117,6 +160,7 @@ func testWorkerFailureThroughGRPCAndPostgres(
 		IdleBackoffMin: time.Millisecond, IdleBackoffMax: 2 * time.Millisecond,
 		ReportBackoffMin: time.Millisecond, ReportBackoffMax: 2 * time.Millisecond,
 		HeartbeatInterval: 5 * time.Millisecond,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatalf("create worker: %v", err)
@@ -164,10 +208,6 @@ func testWorkerFailureThroughGRPCAndPostgres(
 	for i, attempt := range attempts {
 		if attempt.Number.Int32() != int32(i+1) || attempt.Status != wantAttemptStatus || attempt.Failure == nil {
 			t.Fatalf("attempt %d = %#v", i, attempt)
-		}
-		wantCode, wantMessage := "dependency_timeout", "dependency timed out"
-		if wantAttemptStatus == domain.AttemptStatusPermanentFailed {
-			wantCode, wantMessage = "invalid_input", "input is invalid"
 		}
 		if attempt.Failure.Code() != wantCode || attempt.Failure.Message() != wantMessage {
 			t.Fatalf("attempt %d failure = (%q, %q), want (%q, %q)", i, attempt.Failure.Code(), attempt.Failure.Message(), wantCode, wantMessage)

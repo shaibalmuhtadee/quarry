@@ -147,8 +147,24 @@ func (client *GRPCClient) ReportAttempt(
 		request.Outcome = &dispatcherv1.ReportAttemptRequest_PermanentFailure{
 			PermanentFailure: mapAttemptFailure(failure),
 		}
+	case domain.AttemptOutcomeKindTimedOut:
+		failure, ok := outcome.Failure()
+		if !ok {
+			return domain.ErrInvalidAttemptOutcome
+		}
+		request.Outcome = &dispatcherv1.ReportAttemptRequest_TimedOut{
+			TimedOut: mapAttemptFailure(failure),
+		}
+	case domain.AttemptOutcomeKindPanicked:
+		failure, ok := outcome.Failure()
+		if !ok {
+			return domain.ErrInvalidAttemptOutcome
+		}
+		request.Outcome = &dispatcherv1.ReportAttemptRequest_Panicked{
+			Panicked: mapAttemptFailure(failure),
+		}
 	default:
-		return fmt.Errorf("%w: worker cannot report outcome %q in this milestone slice", domain.ErrInvalidAttemptOutcome, outcome.Kind())
+		return fmt.Errorf("%w: worker cannot report outcome %q", domain.ErrInvalidAttemptOutcome, outcome.Kind())
 	}
 
 	callCtx, cancel := context.WithTimeout(ctx, client.timeout)

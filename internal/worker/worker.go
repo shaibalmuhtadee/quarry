@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"sort"
 	"sync"
@@ -18,6 +19,7 @@ var (
 	ErrInvalidConfiguration = errors.New("invalid worker configuration")
 	errLeaseStale           = errors.New("attempt lease is stale")
 	errAttemptLost          = errors.New("attempt report lost its lease race")
+	errExecutionTimedOut    = errors.New("attempt execution timed out")
 )
 
 type Handler func(context.Context, domain.Payload) (domain.Result, error)
@@ -68,6 +70,7 @@ type Config struct {
 	ReportBackoffMin  time.Duration
 	ReportBackoffMax  time.Duration
 	HeartbeatInterval time.Duration
+	Logger            *slog.Logger
 }
 
 type Worker struct {
@@ -80,6 +83,7 @@ type Worker struct {
 	reportBackoffMin  time.Duration
 	reportBackoffMax  time.Duration
 	heartbeatInterval time.Duration
+	logger            *slog.Logger
 }
 
 func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worker, error) {
@@ -110,6 +114,10 @@ func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worke
 	if cfg.HeartbeatInterval <= 0 {
 		return nil, fmt.Errorf("%w: heartbeat interval must be positive", ErrInvalidConfiguration)
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 
 	handlerCopy := make(map[string]Handler, len(handlers))
 	supportedTypes := make([]domain.JobType, 0, len(handlers))
@@ -138,6 +146,7 @@ func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worke
 		reportBackoffMin:  cfg.ReportBackoffMin,
 		reportBackoffMax:  cfg.ReportBackoffMax,
 		heartbeatInterval: cfg.HeartbeatInterval,
+		logger:            logger,
 	}, nil
 }
 
@@ -361,14 +370,37 @@ func (worker *Worker) execute(
 			}
 			job := attempt.job
 			handler := worker.handlers[job.Type.String()]
-			result, err := handler(attempt.ctx, job.Payload)
+			handlerCtx, cancelHandler := context.WithTimeoutCause(attempt.ctx, job.Timeout, errExecutionTimedOut)
+			execution := invokeHandler(handlerCtx, handler, job.Payload)
+			cancelHandler()
+			handlerCause := context.Cause(handlerCtx)
+			if execution.panicked {
+				worker.logger.Error(
+					"handler panicked",
+					slog.String("job_id", job.ID.String()),
+					slog.Int("attempt_no", int(job.AttemptNumber.Int32())),
+					slog.String("job_type", job.Type.String()),
+					slog.Any("panic", execution.panicValue),
+					slog.String("stack", string(execution.stack)),
+				)
+			}
 			if errors.Is(context.Cause(attempt.ctx), errLeaseStale) {
 				continue
 			}
 			if ctx.Err() != nil {
 				return
 			}
-			outcome, err := classifyHandlerResult(result, err)
+
+			var outcome domain.AttemptOutcome
+			var err error
+			switch {
+			case errors.Is(handlerCause, errExecutionTimedOut):
+				outcome, err = timedOutOutcome()
+			case execution.panicked:
+				outcome, err = panickedOutcome()
+			default:
+				outcome, err = classifyHandlerResult(execution.result, execution.err)
+			}
 			if err != nil {
 				fail(fmt.Errorf("classify %s attempt %d: %w", job.ID, job.AttemptNumber.Int32(), err))
 				return

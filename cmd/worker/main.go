@@ -132,6 +132,7 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 		ReportBackoffMin:  reportBackoffMin,
 		ReportBackoffMax:  reportBackoffMax,
 		HeartbeatInterval: cfg.heartbeatInterval,
+		Logger:            logger,
 	})
 	if err != nil {
 		return err

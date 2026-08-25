@@ -155,7 +155,7 @@ func TestGRPCClientPreservesRegistrationAcquisitionAndReportIdentity(t *testing.
 	}
 }
 
-func TestGRPCClientMapsHandlerFailureOutcomes(t *testing.T) {
+func TestGRPCClientMapsWorkerFailureOutcomes(t *testing.T) {
 	t.Parallel()
 
 	workerID := domain.NewWorkerID()
@@ -178,6 +178,12 @@ func TestGRPCClientMapsHandlerFailureOutcomes(t *testing.T) {
 		}},
 		{name: "permanent", outcome: domain.NewPermanentFailureOutcome, read: func(request *dispatcherv1.ReportAttemptRequest) *dispatcherv1.AttemptFailure {
 			return request.GetPermanentFailure()
+		}},
+		{name: "timed out", outcome: domain.NewTimedOutOutcome, read: func(request *dispatcherv1.ReportAttemptRequest) *dispatcherv1.AttemptFailure {
+			return request.GetTimedOut()
+		}},
+		{name: "panicked", outcome: domain.NewPanickedOutcome, read: func(request *dispatcherv1.ReportAttemptRequest) *dispatcherv1.AttemptFailure {
+			return request.GetPanicked()
 		}},
 	}
 	for _, test := range tests {

@@ -427,7 +427,7 @@ Deduplicate identical job submissions durably and reject changed submissions tha
 
 ## Slice 5: execution timeouts and panic recovery
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -484,7 +484,27 @@ Apply submitted execution deadlines cooperatively and keep the worker alive afte
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- Each handler invocation receives a `context.WithTimeoutCause` child of its active-attempt context. The submitted job timeout sets the deadline, and the private `errExecutionTimedOut` cause remains distinct from lease-stale and worker-lifecycle cancellation.
+- When the handler returns, the worker cancels the handler context and then reads its first cancellation cause. A handler completion that cancels first follows its normal result or error path. A deadline that cancels first produces `timed_out`, even if the handler later returns success, returns another error, or panics.
+- Timeout cancels only the handler context. The worker keeps the active-attempt context alive for heartbeats and outcome-report retries until the dispatcher acknowledges the report or rejects the stale attempt.
+- The handler call boundary records whether control returned normally. A panic is recovered there with its value and `runtime/debug.Stack`; the worker logs the panic, stack, job ID, attempt number, and job type, then continues using the same bounded executor.
+- Persisted timeout and panic details are fixed safe values: `execution_timeout` with `handler execution timed out`, and `handler_panicked` with `handler panicked`. Panic values and stacks stay in internal logs and never enter gRPC or PostgreSQL failure fields.
+- Worker configuration accepts a logger and defaults to `slog.Default()` when callers omit it. `cmd/worker` passes its process JSON logger into the runtime.
+- The worker gRPC client now maps `timed_out` and `panicked` outcomes. Cancelled outcome reporting remains deferred to Slice 7.
+- A handler that ignores context cancellation retains its executor slot and delays reporting until it returns. The worker does not claim that Go can forcibly terminate that handler.
+- Real gRPC and PostgreSQL tests use the context-aware `demo.sleep` handler for timeouts and a panicking handler for panics. Both outcomes retry through the durable policy and dead-letter exactly at the submitted maximum attempt count.
+- No architecture or project-plan deviation was required.
+
+### Validation result
+
+- `go test -run 'TestWorkerAppliesSubmittedTimeoutAndOverridesHandlerError|TestWorkerTimeoutBoundaryUsesFirstCancellationCause|TestWorkerRecoversPanicLogsStackAndContinues|TestWorkerCannotReleaseSlotUntilContextIgnoringHandlerReturns' -count=1 ./internal/worker` passed focused timeout propagation, outcome precedence, panic logging, worker survival, and context-ignoring handler tests in 1.037 seconds.
+- `go test -run 'TestWorkerTimeoutRetriesUntilMaximumAttempts|TestWorkerPanicRetriesUntilMaximumAttempts' -count=1 ./internal/dispatcher` passed the real gRPC and PostgreSQL timeout and panic retry paths in 5.963 seconds.
+- `go test -count=1 ./internal/worker/... ./cmd/worker ./internal/dispatcher` passed the complete focused suites in 1.033 seconds for the worker, 0.997 seconds for handlers, 1.008 seconds for the worker command, and 14.258 seconds for the dispatcher integration package.
+- The timeout-boundary, context-ignoring handler, and panic-survival tests passed 20 consecutive runs in 1.612 seconds.
+- `docker run --rm --volume "C:\Users\shai\Documents\Code\quarry:/src" --workdir /src golang:1.27.0-bookworm go test -race -count=1 ./internal/worker/... ./cmd/worker` passed under the race detector in 1.057 seconds for the worker, 1.033 seconds for handlers, and 1.037 seconds for the worker command.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned tool checks, generated-code checks, vet, all uncached tests, builds, Compose rendering, migrations through version 6, the HTTP smoke test, the 40-job distributed process test, the worker-crash recovery process test, stale-report coverage, and cleanup verification.
+- `git diff --check` passed after the completion documentation update.
+- GitHub-hosted CI was not run.
 
 ## Slice 6: durable cancellation state
 
