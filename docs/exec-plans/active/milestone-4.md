@@ -267,7 +267,7 @@ Finish reported failures atomically, schedule eligible retries, dead-letter perm
 
 ## Slice 3: worker handler-failure reporting
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -322,7 +322,23 @@ Let handlers report retryable and permanent failures without stopping the worker
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- Handlers classify failures with validated `HandlerError` constructors for retryable and permanent outcomes. The typed error keeps the safe persisted code and message separate from an optional wrapped internal cause, and classification works through ordinary error wrapping.
+- An unclassified handler error becomes a permanent failure with the stable safe code `handler_error` and message `handler failed`; the original error is not sent over gRPC or persisted.
+- The worker constructs one immutable outcome after the handler returns and uses the existing acknowledgement loop to retry transient report failures with the same worker, job, attempt, and outcome. The attempt remains active and heartbeating until acknowledgement.
+- A handler failure does not enter the worker-fatal path. `FailedPrecondition` still removes only the stale attempt, so subsequent work and unrelated concurrent attempts continue.
+- The worker gRPC client now maps success, retryable failure, and permanent failure outcomes. Timeout, panic, and cancellation outcomes remain deliberately rejected until their later slices add the corresponding worker behavior.
+- Real gRPC and PostgreSQL integration tests prove that retryable handler failures consume attempts through the submitted maximum and that permanent handler failures dead-letter after one attempt without retrying.
+- No architecture or project-plan deviation was required.
+
+### Validation result
+
+- `go test -count=1 ./internal/worker/... ./cmd/worker` passed handler classification, generic safe-error handling, worker continuation, concurrent-attempt isolation, stable report retry, gRPC mapping, and existing worker behavior.
+- `go test -run 'TestWorkerRetryableFailureRetriesUntilMaximumAttempts|TestWorkerPermanentFailureDoesNotRetry' -count=1 ./internal/dispatcher` passed against real gRPC and PostgreSQL in 5.716 seconds after Docker access was enabled. The restricted Windows run first reported the known Testcontainers environment error `rootless Docker is not supported on Windows`; no code change was needed.
+- `go test -count=1 ./internal/worker/... ./cmd/worker ./internal/dispatcher` passed the complete focused worker and dispatcher suites before the final assertion tightening; the two affected PostgreSQL tests then passed again with their exact stored failure-detail assertions.
+- `docker run --rm --volume "C:\Users\shai\Documents\Code\quarry:/src" --workdir /src golang:1.27.0-bookworm go test -race -count=1 ./internal/worker/... ./cmd/worker` passed the worker packages under the race detector.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned tool checks, generated-code checks, vet, all uncached tests, builds, Compose rendering, migrations through version 5, the HTTP smoke test, the 40-job distributed process test, the worker-crash recovery process test, stale-report coverage, and cleanup verification.
+- `git diff --check` passed after the completion documentation update.
+- GitHub-hosted CI was not run.
 
 ## Slice 4: concurrent submission idempotency
 

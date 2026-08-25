@@ -3,8 +3,8 @@
 - Current milestone: Milestone 4, retries and execution controls
 - Milestone status: in progress
 - Completed milestones: Milestones 0, 1, 2, and 3
-- Current area of work: Milestone 4 Slice 2 complete; Slice 3 not started
+- Current area of work: Milestone 4 Slice 3 complete; Slice 4 not started
 - Known blockers: none
 - Known architecture deviations: none
 - Known implementation deviations: PowerShell provides the common command interface instead of GNU Make. The project plan permits an equivalent command interface, and this choice does not change the system architecture.
-- Known limitations: Workers still report only successful handler results; handler failure reporting begins in Slice 3. Submission idempotency, timeout enforcement, panic recovery, cancellation propagation and its public command, and graceful worker draining remain unimplemented. A handler must observe context cancellation to stop promptly. Metrics and tracing remain deferred to Milestone 5. GitHub-hosted CI has not run for the current state.
+- Known limitations: Submission idempotency, timeout enforcement, panic recovery, cancellation propagation and its public command, and graceful worker draining remain unimplemented. A handler must observe context cancellation to stop promptly. Metrics and tracing remain deferred to Milestone 5. GitHub-hosted CI has not run for the current state.

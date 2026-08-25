@@ -52,12 +52,12 @@ type Dispatcher interface {
 	Register(context.Context, Registration) error
 	Acquire(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error)
 	Heartbeat(context.Context, domain.WorkerID, []HeartbeatAttempt) ([]HeartbeatResult, error)
-	ReportSuccess(
+	ReportAttempt(
 		context.Context,
 		domain.WorkerID,
 		domain.JobID,
 		domain.AttemptNumber,
-		domain.Result,
+		domain.AttemptOutcome,
 	) error
 }
 
@@ -368,11 +368,12 @@ func (worker *Worker) execute(
 			if ctx.Err() != nil {
 				return
 			}
+			outcome, err := classifyHandlerResult(result, err)
 			if err != nil {
-				fail(fmt.Errorf("execute %s attempt %d: %w", job.ID, job.AttemptNumber.Int32(), err))
+				fail(fmt.Errorf("classify %s attempt %d: %w", job.ID, job.AttemptNumber.Int32(), err))
 				return
 			}
-			if err := worker.reportUntilAcknowledged(attempt.ctx, job, result); err != nil {
+			if err := worker.reportUntilAcknowledged(attempt.ctx, job, outcome); err != nil {
 				if errors.Is(err, errAttemptLost) || errors.Is(context.Cause(attempt.ctx), errLeaseStale) {
 					if active.remove(attempt, err) {
 						notifyCapacityChanged()
@@ -430,15 +431,15 @@ func (worker *Worker) heartbeatLoop(
 func (worker *Worker) reportUntilAcknowledged(
 	ctx context.Context,
 	job Job,
-	result domain.Result,
+	outcome domain.AttemptOutcome,
 ) error {
 	for {
-		err := worker.dispatcher.ReportSuccess(
+		err := worker.dispatcher.ReportAttempt(
 			ctx,
 			worker.registration.WorkerID,
 			job.ID,
 			job.AttemptNumber,
-			result,
+			outcome,
 		)
 		if err == nil {
 			return nil

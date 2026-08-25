@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -18,7 +19,7 @@ type fakeDispatcher struct {
 	register  func(context.Context, Registration) error
 	acquire   func(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error)
 	heartbeat func(context.Context, domain.WorkerID, []HeartbeatAttempt) ([]HeartbeatResult, error)
-	report    func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.Result) error
+	report    func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error
 }
 
 func (dispatcher *fakeDispatcher) Heartbeat(
@@ -52,14 +53,14 @@ func (dispatcher *fakeDispatcher) Acquire(
 	return dispatcher.acquire(ctx, workerID, capacity, supportedTypes)
 }
 
-func (dispatcher *fakeDispatcher) ReportSuccess(
+func (dispatcher *fakeDispatcher) ReportAttempt(
 	ctx context.Context,
 	workerID domain.WorkerID,
 	jobID domain.JobID,
 	attemptNumber domain.AttemptNumber,
-	result domain.Result,
+	outcome domain.AttemptOutcome,
 ) error {
-	return dispatcher.report(ctx, workerID, jobID, attemptNumber, result)
+	return dispatcher.report(ctx, workerID, jobID, attemptNumber, outcome)
 }
 
 func TestWorkerBoundsExecutionAndAdvertisesFreeCapacity(t *testing.T) {
@@ -91,7 +92,7 @@ func TestWorkerBoundsExecutionAndAdvertisesFreeCapacity(t *testing.T) {
 		domain.WorkerID,
 		domain.JobID,
 		domain.AttemptNumber,
-		domain.Result,
+		domain.AttemptOutcome,
 	) error {
 		reported <- struct{}{}
 		return nil
@@ -180,7 +181,7 @@ func TestWorkerHoldsSlotUntilSuccessReportIsAcknowledged(t *testing.T) {
 		_ domain.WorkerID,
 		_ domain.JobID,
 		_ domain.AttemptNumber,
-		_ domain.Result,
+		_ domain.AttemptOutcome,
 	) error {
 		if reports.Add(1) == 1 {
 			close(firstReport)
@@ -243,8 +244,12 @@ func TestWorkerRetriesTransientReportWithSameIdentity(t *testing.T) {
 		gotWorkerID domain.WorkerID,
 		gotJobID domain.JobID,
 		gotAttempt domain.AttemptNumber,
-		result domain.Result,
+		outcome domain.AttemptOutcome,
 	) error {
+		result, ok := outcome.Result()
+		if !ok {
+			t.Fatalf("reported outcome = %q, want succeeded", outcome.Kind())
+		}
 		mu.Lock()
 		calls = append(calls, reportCall{gotWorkerID, gotJobID, gotAttempt, string(result.JSON())})
 		callCount := len(calls)
@@ -279,6 +284,188 @@ func TestWorkerRetriesTransientReportWithSameIdentity(t *testing.T) {
 			call.attempt != job.AttemptNumber || call.result != `{"done":true}` {
 			t.Fatalf("report call %d = %#v", i, call)
 		}
+	}
+}
+
+func TestWorkerReportsHandlerFailuresAndContinues(t *testing.T) {
+	t.Parallel()
+
+	retryableJob := makeJobs(t, 1, "demo.retryable")[0]
+	permanentJob := makeJobs(t, 1, "demo.permanent")[0]
+	unknownJob := makeJobs(t, 1, "demo.unknown")[0]
+	successJob := makeJobs(t, 1, "demo.success")[0]
+	jobs := []Job{retryableJob, permanentJob, unknownJob, successJob}
+
+	retryableErr, err := NewRetryableHandlerError("dependency_timeout", "dependency timed out", errors.New("dial tcp secret-host"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	permanentErr, err := NewPermanentHandlerError("invalid_input", "input is invalid", errors.New("unsafe parser detail"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var next atomic.Int32
+	dispatcher := &fakeDispatcher{}
+	dispatcher.acquire = func(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error) {
+		index := int(next.Add(1)) - 1
+		if index < len(jobs) {
+			return []Job{jobs[index]}, nil
+		}
+		return nil, nil
+	}
+	type reportCall struct {
+		jobID   domain.JobID
+		attempt domain.AttemptNumber
+		outcome domain.AttemptOutcome
+	}
+	var reportMu sync.Mutex
+	var reports []reportCall
+	acknowledged := make(chan struct{}, len(jobs))
+	dispatcher.report = func(
+		_ context.Context,
+		_ domain.WorkerID,
+		jobID domain.JobID,
+		attempt domain.AttemptNumber,
+		outcome domain.AttemptOutcome,
+	) error {
+		reportMu.Lock()
+		reports = append(reports, reportCall{jobID: jobID, attempt: attempt, outcome: outcome})
+		jobReports := 0
+		for _, call := range reports {
+			if call.jobID == jobID {
+				jobReports++
+			}
+		}
+		reportMu.Unlock()
+		if jobID == retryableJob.ID && jobReports == 1 {
+			return status.Error(codes.Unavailable, "temporary")
+		}
+		acknowledged <- struct{}{}
+		return nil
+	}
+	runtime := newTestWorker(t, dispatcher, 1, map[string]Handler{
+		"demo.retryable": func(context.Context, domain.Payload) (domain.Result, error) {
+			return domain.Result{}, fmt.Errorf("retryable wrapper: %w", retryableErr)
+		},
+		"demo.permanent": func(context.Context, domain.Payload) (domain.Result, error) {
+			return domain.Result{}, permanentErr
+		},
+		"demo.unknown": func(context.Context, domain.Payload) (domain.Result, error) {
+			return domain.Result{}, errors.New("database password secret")
+		},
+		"demo.success": func(context.Context, domain.Payload) (domain.Result, error) {
+			return mustResult(t, `{"ok":true}`), nil
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runWorker(runtime, ctx)
+	for range jobs {
+		awaitSignal(t, acknowledged)
+	}
+	cancel()
+	if err := awaitRun(t, done); err != nil {
+		t.Fatalf("worker stopped after handler failure: %v", err)
+	}
+
+	reportMu.Lock()
+	defer reportMu.Unlock()
+	if len(reports) != 5 {
+		t.Fatalf("report calls = %d, want 5", len(reports))
+	}
+	wantKinds := []domain.AttemptOutcomeKind{
+		domain.AttemptOutcomeKindRetryableFailure,
+		domain.AttemptOutcomeKindRetryableFailure,
+		domain.AttemptOutcomeKindPermanentFailure,
+		domain.AttemptOutcomeKindPermanentFailure,
+		domain.AttemptOutcomeKindSucceeded,
+	}
+	for i, report := range reports {
+		if report.outcome.Kind() != wantKinds[i] {
+			t.Fatalf("report %d kind = %q, want %q", i, report.outcome.Kind(), wantKinds[i])
+		}
+	}
+	firstFailure, firstOK := reports[0].outcome.Failure()
+	secondFailure, secondOK := reports[1].outcome.Failure()
+	if reports[0].jobID != retryableJob.ID || reports[1].jobID != retryableJob.ID ||
+		reports[0].attempt != reports[1].attempt || reports[0].outcome.Kind() != reports[1].outcome.Kind() ||
+		!firstOK || !secondOK || firstFailure.Code() != secondFailure.Code() || firstFailure.Message() != secondFailure.Message() {
+		t.Fatalf("retried failure reports changed identity or outcome: %#v", reports[:2])
+	}
+	unknownFailure, ok := reports[3].outcome.Failure()
+	if !ok || unknownFailure.Code() != unclassifiedHandlerErrorCode || unknownFailure.Message() != unclassifiedHandlerErrorMessage {
+		t.Fatalf("unclassified report = %#v", reports[3].outcome)
+	}
+}
+
+func TestWorkerHandlerFailureDoesNotCancelConcurrentAttempt(t *testing.T) {
+	t.Parallel()
+
+	failedJob := makeJobs(t, 1, "demo.failed")[0]
+	successJob := makeJobs(t, 1, "demo.concurrent-success")[0]
+	var acquired atomic.Bool
+	dispatcher := &fakeDispatcher{}
+	dispatcher.acquire = func(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error) {
+		if acquired.CompareAndSwap(false, true) {
+			return []Job{failedJob, successJob}, nil
+		}
+		return nil, nil
+	}
+	failureReported := make(chan struct{})
+	successReported := make(chan struct{})
+	dispatcher.report = func(
+		_ context.Context,
+		_ domain.WorkerID,
+		jobID domain.JobID,
+		_ domain.AttemptNumber,
+		outcome domain.AttemptOutcome,
+	) error {
+		switch jobID {
+		case failedJob.ID:
+			if outcome.Kind() != domain.AttemptOutcomeKindPermanentFailure {
+				t.Errorf("failed job outcome = %q", outcome.Kind())
+			}
+			close(failureReported)
+		case successJob.ID:
+			if outcome.Kind() != domain.AttemptOutcomeKindSucceeded {
+				t.Errorf("successful job outcome = %q", outcome.Kind())
+			}
+			close(successReported)
+		}
+		return nil
+	}
+	concurrentStarted := make(chan struct{})
+	releaseConcurrent := make(chan struct{})
+	permanentErr, err := NewPermanentHandlerError("invalid_input", "input is invalid", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newTestWorker(t, dispatcher, 2, map[string]Handler{
+		"demo.failed": func(context.Context, domain.Payload) (domain.Result, error) {
+			<-concurrentStarted
+			return domain.Result{}, permanentErr
+		},
+		"demo.concurrent-success": func(context.Context, domain.Payload) (domain.Result, error) {
+			close(concurrentStarted)
+			<-releaseConcurrent
+			return mustResult(t, `{"ok":true}`), nil
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runWorker(runtime, ctx)
+	awaitSignal(t, failureReported)
+	select {
+	case err := <-done:
+		t.Fatalf("worker stopped while unrelated attempt was active: %v", err)
+	default:
+	}
+	close(releaseConcurrent)
+	awaitSignal(t, successReported)
+	cancel()
+	if err := awaitRun(t, done); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -360,7 +547,7 @@ func TestWorkerHeartbeatsExecutingAndReportingAttemptUntilAcknowledged(t *testin
 	reportStarted := make(chan struct{})
 	releaseReport := make(chan struct{})
 	reported := make(chan struct{})
-	dispatcher.report = func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.Result) error {
+	dispatcher.report = func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error {
 		reporting.Store(true)
 		close(reportStarted)
 		<-releaseReport
@@ -432,7 +619,7 @@ func TestWorkerHeartbeatsAttemptBufferedAfterStaleExecutionCancellation(t *testi
 	handlerStarted := make(chan struct{})
 	unexpectedSecondHandler := make(chan struct{})
 	var handlerCalls atomic.Int32
-	dispatcher.report = func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.Result) error {
+	dispatcher.report = func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error {
 		return nil
 	}
 	runtime := newTestWorker(t, dispatcher, 1, map[string]Handler{
@@ -495,7 +682,7 @@ func TestWorkerRetriesTransientHeartbeatOnNextInterval(t *testing.T) {
 		secondOnce.Do(func() { close(secondHeartbeat) })
 		return []HeartbeatResult{{Attempt: attempts[0], Valid: true}}, nil
 	}
-	dispatcher.report = func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.Result) error {
+	dispatcher.report = func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error {
 		return nil
 	}
 	handlerStarted := make(chan struct{})
@@ -539,7 +726,7 @@ func TestWorkerTreatsFailedPreconditionReportAsLostAttempt(t *testing.T) {
 		_ domain.WorkerID,
 		jobID domain.JobID,
 		_ domain.AttemptNumber,
-		_ domain.Result,
+		_ domain.AttemptOutcome,
 	) error {
 		if jobID == jobs[0].ID {
 			return status.Error(codes.FailedPrecondition, "stale")

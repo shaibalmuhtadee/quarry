@@ -110,24 +110,58 @@ func (client *GRPCClient) Heartbeat(
 	return results, nil
 }
 
-func (client *GRPCClient) ReportSuccess(
+func (client *GRPCClient) ReportAttempt(
 	ctx context.Context,
 	workerID domain.WorkerID,
 	jobID domain.JobID,
 	attemptNumber domain.AttemptNumber,
-	result domain.Result,
+	outcome domain.AttemptOutcome,
 ) error {
-	callCtx, cancel := context.WithTimeout(ctx, client.timeout)
-	defer cancel()
-	_, err := client.client.ReportAttempt(callCtx, &dispatcherv1.ReportAttemptRequest{
+	request := &dispatcherv1.ReportAttemptRequest{
 		WorkerId:  workerID.String(),
 		JobId:     jobID.String(),
 		AttemptNo: uint32(attemptNumber.Int32()),
-		Outcome: &dispatcherv1.ReportAttemptRequest_Succeeded{
+	}
+	switch outcome.Kind() {
+	case domain.AttemptOutcomeKindSucceeded:
+		result, ok := outcome.Result()
+		if !ok {
+			return domain.ErrInvalidAttemptOutcome
+		}
+		request.Outcome = &dispatcherv1.ReportAttemptRequest_Succeeded{
 			Succeeded: &dispatcherv1.AttemptSucceeded{ResultJson: result.JSON()},
-		},
-	})
+		}
+	case domain.AttemptOutcomeKindRetryableFailure:
+		failure, ok := outcome.Failure()
+		if !ok {
+			return domain.ErrInvalidAttemptOutcome
+		}
+		request.Outcome = &dispatcherv1.ReportAttemptRequest_RetryableFailure{
+			RetryableFailure: mapAttemptFailure(failure),
+		}
+	case domain.AttemptOutcomeKindPermanentFailure:
+		failure, ok := outcome.Failure()
+		if !ok {
+			return domain.ErrInvalidAttemptOutcome
+		}
+		request.Outcome = &dispatcherv1.ReportAttemptRequest_PermanentFailure{
+			PermanentFailure: mapAttemptFailure(failure),
+		}
+	default:
+		return fmt.Errorf("%w: worker cannot report outcome %q in this milestone slice", domain.ErrInvalidAttemptOutcome, outcome.Kind())
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, client.timeout)
+	defer cancel()
+	_, err := client.client.ReportAttempt(callCtx, request)
 	return err
+}
+
+func mapAttemptFailure(failure domain.AttemptFailure) *dispatcherv1.AttemptFailure {
+	return &dispatcherv1.AttemptFailure{
+		ErrorCode:    failure.Code(),
+		ErrorMessage: failure.Message(),
+	}
 }
 
 func parseAcquiredJob(acquired *dispatcherv1.AcquiredJob) (Job, error) {

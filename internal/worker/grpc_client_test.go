@@ -123,7 +123,11 @@ func TestGRPCClientPreservesRegistrationAcquisitionAndReportIdentity(t *testing.
 		heartbeats[0].Attempt.AttemptNumber != attempt || !heartbeats[0].Valid {
 		t.Fatalf("heartbeat results = %#v", heartbeats)
 	}
-	if err := client.ReportSuccess(context.Background(), workerID, jobID, attempt, result); err != nil {
+	succeeded, err := domain.NewSucceededOutcome(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ReportAttempt(context.Background(), workerID, jobID, attempt, succeeded); err != nil {
 		t.Fatal(err)
 	}
 
@@ -148,6 +152,55 @@ func TestGRPCClientPreservesRegistrationAcquisitionAndReportIdentity(t *testing.
 		rpc.report.GetAttemptNo() != uint32(attempt.Int32()) ||
 		string(rpc.report.GetSucceeded().GetResultJson()) != `{"ok":true}` {
 		t.Fatalf("report request = %#v", rpc.report)
+	}
+}
+
+func TestGRPCClientMapsHandlerFailureOutcomes(t *testing.T) {
+	t.Parallel()
+
+	workerID := domain.NewWorkerID()
+	jobID := domain.NewJobID()
+	attempt, err := domain.NewAttemptNumber(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure, err := domain.NewAttemptFailure("dependency_timeout", "dependency timed out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name    string
+		outcome func(domain.AttemptFailure) (domain.AttemptOutcome, error)
+		read    func(*dispatcherv1.ReportAttemptRequest) *dispatcherv1.AttemptFailure
+	}{
+		{name: "retryable", outcome: domain.NewRetryableFailureOutcome, read: func(request *dispatcherv1.ReportAttemptRequest) *dispatcherv1.AttemptFailure {
+			return request.GetRetryableFailure()
+		}},
+		{name: "permanent", outcome: domain.NewPermanentFailureOutcome, read: func(request *dispatcherv1.ReportAttemptRequest) *dispatcherv1.AttemptFailure {
+			return request.GetPermanentFailure()
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rpc := &recordingRPCClient{}
+			client, err := NewGRPCClient(rpc, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			outcome, err := test.outcome(failure)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := client.ReportAttempt(context.Background(), workerID, jobID, attempt, outcome); err != nil {
+				t.Fatal(err)
+			}
+			stored := test.read(rpc.report)
+			if rpc.report.GetWorkerId() != workerID.String() || rpc.report.GetJobId() != jobID.String() ||
+				rpc.report.GetAttemptNo() != 3 || stored.GetErrorCode() != failure.Code() ||
+				stored.GetErrorMessage() != failure.Message() {
+				t.Fatalf("report request = %#v", rpc.report)
+			}
+		})
 	}
 }
 
