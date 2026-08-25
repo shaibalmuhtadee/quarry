@@ -17,6 +17,7 @@ var (
 	ErrWorkerNotRegistered        = errors.New("worker is not registered")
 	ErrWorkerRegistrationConflict = errors.New("worker registration conflicts with the stored registration")
 	ErrAttemptReportConflict      = errors.New("attempt report conflicts with the stored attempt")
+	ErrInvalidRecoveryConfig      = errors.New("recovery batch size and worker liveness timeout must be positive")
 )
 
 type WorkerRegistration struct {
@@ -200,6 +201,37 @@ func (store *DispatcherStore) Heartbeat(
 	return results, nil
 }
 
+func (store *DispatcherStore) RecoverExpiredAttempts(
+	ctx context.Context,
+	batchSize int32,
+	workerLivenessTimeout time.Duration,
+) (int64, error) {
+	if batchSize <= 0 || workerLivenessTimeout <= 0 || workerLivenessTimeout.Milliseconds() <= 0 {
+		return 0, ErrInvalidRecoveryConfig
+	}
+
+	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("begin expired attempt recovery: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	queries := postgresdb.New(tx)
+	if _, err := queries.MarkLostWorkers(ctx, workerLivenessTimeout.Milliseconds()); err != nil {
+		return 0, fmt.Errorf("mark lost workers: %w", err)
+	}
+
+	recoveredJobs, err := queries.RecoverExpiredJobs(ctx, batchSize)
+	if err != nil {
+		return 0, fmt.Errorf("recover expired jobs: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit expired attempt recovery: %w", err)
+	}
+
+	return int64(len(recoveredJobs)), nil
+}
+
 func (store *DispatcherStore) ReportSuccess(
 	ctx context.Context,
 	workerID domain.WorkerID,
@@ -239,7 +271,8 @@ func (store *DispatcherStore) ReportSuccess(
 		return nil
 	}
 	if report.JobStatus != string(domain.JobStatusRunning) ||
-		report.AttemptStatus != string(domain.AttemptStatusRunning) {
+		report.AttemptStatus != string(domain.AttemptStatusRunning) ||
+		!report.LeaseValid {
 		return ErrAttemptReportConflict
 	}
 

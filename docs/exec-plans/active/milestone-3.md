@@ -314,7 +314,7 @@ Make the worker heartbeat every acquired but unfinished attempt while preserving
 
 ## Slice 5: bounded lease reaper and expired-attempt recovery
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -371,11 +371,49 @@ Recover expired work safely when one or several dispatcher processes run reapers
 
 ### Decisions and deviations discovered during implementation
 
-- Pending implementation.
+- The worker-liveness threshold defaults to the configured lease duration and
+  remains independently configurable. The project plan requires a threshold
+  but does not prescribe its value.
+- Expired-attempt recovery is one PostgreSQL transaction. SQL owns the bounded
+  row selection, attempt abandonment, job transition, lease cleanup, and
+  attempt-exhaustion decision; the dispatcher reaper only schedules and logs
+  recovery runs.
+- The transaction marks stale active workers `lost` before recovering its job
+  batch. A heartbeat uses the existing database update to restore `active`, so
+  concurrent heartbeat and liveness updates converge without application-side
+  coordination.
+- Recovery moves non-exhausted jobs to immediately eligible `retry_wait`, and
+  claims now include that state. This is only replacement-attempt eligibility;
+  failure retries and backoff remain deferred to Milestone 4.
+- A job transition is conditional on abandoning its matching running attempt.
+  Missing or inconsistent attempt state therefore leaves the job unchanged
+  instead of creating a partial recovery transition.
+- Running success reports check lease validity while locking the current job
+  and again in the final job update. A report that crosses the expiry boundary
+  rolls back its attempt update and is rejected.
+- The reaper logs every non-cancellation database error and retries on its next
+  interval. No PostgreSQL error-classification dependency was added.
 
 ### Validation result
 
-- Pending implementation.
+- Real-PostgreSQL tests passed for retryable and exhausted recovery, abandoned
+  attempt history, immediate replacement claims, stale success after attempt 2,
+  completion after expiry, bounded concurrent reapers, locked-row skipping,
+  worker lost/active transitions, and the renewal-versus-reaper race.
+- Dispatcher reaper tests passed for immediate execution, retry after a store
+  error, configuration propagation, invalid configuration, and cancellation.
+- `go test -count=1 ./internal/store/postgres/... ./internal/dispatcher ./cmd/dispatcher`
+  passed.
+- `pwsh ./scripts/dev.ps1 generate-check` passed.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned
+  tool checks, generated-code checks, vet, all uncached tests, builds, Compose
+  rendering, migrations through version 4, the HTTP smoke test, and the
+  distributed process test. The distributed test processed 40 jobs with two
+  heartbeating workers and verified PostgreSQL state.
+- `git diff --check` passed.
+- Race-detector validation was unavailable because this Windows Go environment
+  has CGO disabled. The required Slice 5 validations passed.
+- GitHub-hosted CI was not run.
 
 ## Slice 6: worker-crash acceptance test and developer flow
 

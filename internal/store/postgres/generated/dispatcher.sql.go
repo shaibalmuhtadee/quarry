@@ -16,7 +16,7 @@ const claimJobs = `-- name: ClaimJobs :many
 WITH eligible AS (
     SELECT id
     FROM jobs
-    WHERE status = 'queued'
+    WHERE status IN ('queued', 'retry_wait')
       AND available_at <= now()
       AND job_type = ANY($1::text[])
     ORDER BY available_at, created_at
@@ -170,6 +170,7 @@ WHERE id = $3
   AND attempt_count = $4
   AND current_worker_id = $5
   AND status = 'running'
+  AND lease_expires_at > statement_timestamp()
 `
 
 type FinishJobSuccessParams struct {
@@ -199,6 +200,7 @@ SELECT
     jobs.status AS job_status,
     jobs.attempt_count,
     CAST(COALESCE(jobs.result = $1::jsonb, false) AS boolean) AS result_matches,
+    CAST(COALESCE(jobs.lease_expires_at > statement_timestamp(), false) AS boolean) AS lease_valid,
     job_attempts.worker_id,
     job_attempts.status AS attempt_status
 FROM jobs
@@ -219,6 +221,7 @@ type LockAttemptReportRow struct {
 	JobStatus     string
 	AttemptCount  int32
 	ResultMatches bool
+	LeaseValid    bool
 	WorkerID      uuid.UUID
 	AttemptStatus string
 }
@@ -230,6 +233,7 @@ func (q *Queries) LockAttemptReport(ctx context.Context, arg LockAttemptReportPa
 		&i.JobStatus,
 		&i.AttemptCount,
 		&i.ResultMatches,
+		&i.LeaseValid,
 		&i.WorkerID,
 		&i.AttemptStatus,
 	)
@@ -248,6 +252,88 @@ func (q *Queries) LockWorker(ctx context.Context, id uuid.UUID) (int32, error) {
 	var concurrency int32
 	err := row.Scan(&concurrency)
 	return concurrency, err
+}
+
+const markLostWorkers = `-- name: MarkLostWorkers :execrows
+UPDATE workers
+SET state = 'lost'
+WHERE state = 'active'
+  AND last_seen_at <= statement_timestamp()
+        - $1::bigint * interval '1 millisecond'
+`
+
+func (q *Queries) MarkLostWorkers(ctx context.Context, livenessTimeoutMs int64) (int64, error) {
+	result, err := q.db.Exec(ctx, markLostWorkers, livenessTimeoutMs)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recoverExpiredJobs = `-- name: RecoverExpiredJobs :many
+WITH expired AS MATERIALIZED (
+    SELECT
+        id,
+        attempt_count,
+        attempt_count >= max_attempts AS attempts_exhausted
+    FROM jobs
+    WHERE status = 'running'
+      AND lease_expires_at <= statement_timestamp()
+    ORDER BY lease_expires_at, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT $1
+), abandoned AS (
+    UPDATE job_attempts
+    SET status = 'abandoned',
+        finished_at = statement_timestamp()
+    FROM expired
+    WHERE job_attempts.job_id = expired.id
+      AND job_attempts.attempt_no = expired.attempt_count
+      AND job_attempts.status = 'running'
+    RETURNING job_attempts.job_id, job_attempts.attempt_no
+), recovered AS (
+    UPDATE jobs
+    SET status = CASE
+            WHEN expired.attempts_exhausted THEN 'dead_lettered'
+            ELSE 'retry_wait'
+        END,
+        current_worker_id = NULL,
+        lease_expires_at = NULL,
+        available_at = statement_timestamp(),
+        finished_at = CASE
+            WHEN expired.attempts_exhausted THEN statement_timestamp()
+            ELSE NULL
+        END,
+        updated_at = statement_timestamp()
+    FROM expired
+    JOIN abandoned
+      ON abandoned.job_id = expired.id
+     AND abandoned.attempt_no = expired.attempt_count
+    WHERE jobs.id = expired.id
+    RETURNING jobs.id
+)
+SELECT id
+FROM recovered
+`
+
+func (q *Queries) RecoverExpiredJobs(ctx context.Context, batchSize int32) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, recoverExpiredJobs, batchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const refreshWorkerHeartbeat = `-- name: RefreshWorkerHeartbeat :execrows

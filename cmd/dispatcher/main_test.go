@@ -21,6 +21,9 @@ func TestLoadConfig(t *testing.T) {
 		t.Setenv("QUARRY_DATABASE_URL", "")
 		t.Setenv("QUARRY_DISPATCHER_ADDR", "")
 		t.Setenv("QUARRY_LEASE_DURATION", "")
+		t.Setenv("QUARRY_REAPER_INTERVAL", "")
+		t.Setenv("QUARRY_REAPER_BATCH_SIZE", "")
+		t.Setenv("QUARRY_WORKER_LIVENESS_TIMEOUT", "")
 
 		got, err := loadConfig()
 		if err != nil {
@@ -35,12 +38,21 @@ func TestLoadConfig(t *testing.T) {
 		if got.leaseDuration != defaultLeaseDuration {
 			t.Fatalf("lease duration = %s, want %s", got.leaseDuration, defaultLeaseDuration)
 		}
+		if got.reaperInterval != defaultReaperInterval || got.reaperBatchSize != defaultReaperBatchSize {
+			t.Fatalf("reaper config = (%s, %d), want (%s, %d)", got.reaperInterval, got.reaperBatchSize, defaultReaperInterval, defaultReaperBatchSize)
+		}
+		if got.workerLiveness != defaultLeaseDuration {
+			t.Fatalf("worker liveness timeout = %s, want default lease duration %s", got.workerLiveness, defaultLeaseDuration)
+		}
 	})
 
 	t.Run("environment overrides", func(t *testing.T) {
 		t.Setenv("QUARRY_DATABASE_URL", "postgres://example/test")
 		t.Setenv("QUARRY_DISPATCHER_ADDR", "127.0.0.1:19090")
 		t.Setenv("QUARRY_LEASE_DURATION", "45s")
+		t.Setenv("QUARRY_REAPER_INTERVAL", "250ms")
+		t.Setenv("QUARRY_REAPER_BATCH_SIZE", "25")
+		t.Setenv("QUARRY_WORKER_LIVENESS_TIMEOUT", "1m")
 
 		got, err := loadConfig()
 		if err != nil {
@@ -55,6 +67,12 @@ func TestLoadConfig(t *testing.T) {
 		if got.leaseDuration != 45*time.Second {
 			t.Fatalf("lease duration = %s, want 45s", got.leaseDuration)
 		}
+		if got.reaperInterval != 250*time.Millisecond || got.reaperBatchSize != 25 {
+			t.Fatalf("reaper config = (%s, %d), want (250ms, 25)", got.reaperInterval, got.reaperBatchSize)
+		}
+		if got.workerLiveness != time.Minute {
+			t.Fatalf("worker liveness timeout = %s, want 1m", got.workerLiveness)
+		}
 	})
 
 	for _, value := range []string{"invalid", "0s", "-1s", "500us"} {
@@ -62,6 +80,29 @@ func TestLoadConfig(t *testing.T) {
 			t.Setenv("QUARRY_LEASE_DURATION", value)
 			if _, err := loadConfig(); err == nil {
 				t.Fatalf("loadConfig accepted lease duration %q", value)
+			}
+		})
+	}
+
+	for name, test := range map[string]struct {
+		variable string
+		value    string
+	}{
+		"reaper interval syntax": {variable: "QUARRY_REAPER_INTERVAL", value: "invalid"},
+		"reaper interval zero":   {variable: "QUARRY_REAPER_INTERVAL", value: "0s"},
+		"reaper batch syntax":    {variable: "QUARRY_REAPER_BATCH_SIZE", value: "invalid"},
+		"reaper batch zero":      {variable: "QUARRY_REAPER_BATCH_SIZE", value: "0"},
+		"worker liveness syntax": {variable: "QUARRY_WORKER_LIVENESS_TIMEOUT", value: "invalid"},
+		"worker liveness zero":   {variable: "QUARRY_WORKER_LIVENESS_TIMEOUT", value: "0s"},
+		"worker liveness sub-ms": {variable: "QUARRY_WORKER_LIVENESS_TIMEOUT", value: "500us"},
+	} {
+		t.Run("invalid "+name, func(t *testing.T) {
+			t.Setenv("QUARRY_REAPER_INTERVAL", "")
+			t.Setenv("QUARRY_REAPER_BATCH_SIZE", "")
+			t.Setenv("QUARRY_WORKER_LIVENESS_TIMEOUT", "")
+			t.Setenv(test.variable, test.value)
+			if _, err := loadConfig(); err == nil {
+				t.Fatalf("loadConfig accepted %s=%q", test.variable, test.value)
 			}
 		})
 	}
