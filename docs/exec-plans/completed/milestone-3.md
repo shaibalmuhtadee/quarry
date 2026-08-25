@@ -528,7 +528,7 @@ Prove the Milestone 3 definition of done with real API, dispatcher, worker, and 
 
 ## Milestone audit
 
-Status: not started
+Status: complete
 
 After all slices pass, audit the implementation against the original Milestone 3 requirements and definition of done in `docs/project-plan.md`.
 
@@ -544,3 +544,57 @@ The audit must:
 - update `docs/current-status.md`,
 - move this plan to `docs/exec-plans/completed/milestone-3.md` only if the definition of done passes,
 - report GitHub-hosted CI as unverified unless it runs against the completed state.
+
+### Audit findings
+
+- The implementation satisfies every Milestone 3 build item in
+  `docs/project-plan.md`: complete worker registration, heartbeats, durable
+  leases, lease renewal, a bounded multi-dispatcher-safe reaper,
+  expired-attempt abandonment, attempt-number fencing, and stale completion
+  rejection.
+- Lease assignment, renewal, expiry, recovery, and completion fencing use
+  PostgreSQL transactions and database time. Claims and reaper batches use
+  `FOR UPDATE SKIP LOCKED` against real PostgreSQL.
+- The worker keeps every acquired but unfinished attempt in a mutex-protected
+  registry, heartbeats buffered, executing, and reporting attempts, and
+  cancels only the matching attempt after the dispatcher reports a stale
+  lease.
+- The required process test force-killed worker 1 during a long-running job.
+  The lease and `last_seen_at` stopped advancing, the reaper abandoned attempt
+  1, worker 2 received and completed attempt 2, and HTTP and direct PostgreSQL
+  reads agreed on the final state.
+- A real gRPC and PostgreSQL integration test sent attempt 1's stale success
+  after attempt 2 started. The dispatcher returned `FailedPrecondition` and
+  left attempt 2 unchanged.
+- No Milestone 3 defect or omission required a code change during the audit.
+- No general handler-failure classification, retry backoff, timeout
+  enforcement, panic recovery, cancellation, graceful worker drain, or
+  idempotency behavior was introduced. Lease-expiry replacement and
+  final-attempt exhaustion remain the narrow crash-recovery rules approved for
+  Milestone 3.
+- No architecture or project-plan deviation was found.
+
+### Audit validation result
+
+- `go test -count=1 ./internal/store/postgres/... ./internal/dispatcher
+  ./cmd/dispatcher` passed against PostgreSQL 18.6. It covered migrations,
+  heartbeat renewal, bounded concurrent reapers, locked-row skipping,
+  renewal-versus-recovery races, expiry-before-recovery completion rejection,
+  and stale-report fencing.
+- `pwsh ./scripts/dev.ps1 recovery-test` passed as a standalone command. It
+  verified the real worker-crash path, direct PostgreSQL state, stale-report
+  rejection, and cleanup.
+- `docker run --rm --volume
+  "C:\Users\shai\Documents\Code\quarry:/src" --workdir /src
+  golang:1.27.0-bookworm go test -race -count=1 ./internal/worker/...
+  ./cmd/worker` passed.
+- `pwsh ./scripts/dev.ps1 check` passed. It repeated all uncached tests,
+  generated-code checks, vet, builds, Compose validation, migrations, the HTTP
+  smoke test, the 40-job distributed process test, the crash-recovery process
+  test, cleanup verification, and the stale-report gRPC integration test.
+- The first restricted PostgreSQL test run failed because Testcontainers
+  reported `rootless Docker is not supported on Windows`. The same tests passed
+  with normal Docker Desktop and Go-cache access; no code change was required.
+- `git diff --check` passed after the completion documentation update and plan
+  move.
+- GitHub-hosted CI was not run and remains unverified.
