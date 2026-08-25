@@ -292,6 +292,15 @@ func TestJobStoreListsAttemptsInAttemptNumberOrder(t *testing.T) {
 		attempts[2].Failure.Code() != "invalid_input" || attempts[2].Failure.Message() != "handler rejected the input" {
 		t.Fatalf("stored attempt failures = [%#v, %#v, %#v]", attempts[0].Failure, attempts[1].Failure, attempts[2].Failure)
 	}
+
+	storedJob, err := jobStore.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("get job with failed attempt: %v", err)
+	}
+	if storedJob.LatestFailure == nil || storedJob.LatestFailure.Code() != "invalid_input" ||
+		storedJob.LatestFailure.Message() != "handler rejected the input" {
+		t.Fatalf("latest job failure = %#v", storedJob.LatestFailure)
+	}
 }
 
 func startMigratedPostgres(t *testing.T) string {

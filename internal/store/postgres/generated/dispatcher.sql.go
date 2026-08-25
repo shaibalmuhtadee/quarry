@@ -37,12 +37,38 @@ func (q *Queries) AbandonExpiredAttempt(ctx context.Context, arg AbandonExpiredA
 	return result.RowsAffected(), nil
 }
 
+const cancelExpiredAttempt = `-- name: CancelExpiredAttempt :execrows
+UPDATE job_attempts
+SET status = 'cancelled',
+    error_code = 'cancellation_requested',
+    error_message = 'job cancellation was requested',
+    finished_at = $1
+WHERE job_id = $2
+  AND attempt_no = $3
+  AND status = 'running'
+`
+
+type CancelExpiredAttemptParams struct {
+	TransitionTime pgtype.Timestamptz
+	JobID          uuid.UUID
+	AttemptNo      int32
+}
+
+func (q *Queries) CancelExpiredAttempt(ctx context.Context, arg CancelExpiredAttemptParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelExpiredAttempt, arg.TransitionTime, arg.JobID, arg.AttemptNo)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const claimJobs = `-- name: ClaimJobs :many
 WITH eligible AS (
     SELECT id
     FROM jobs
     WHERE status IN ('queued', 'retry_wait')
       AND available_at <= now()
+      AND cancel_requested_at IS NULL
       AND job_type = ANY($1::text[])
     ORDER BY available_at, created_at
     FOR UPDATE SKIP LOCKED
@@ -259,6 +285,7 @@ SELECT
     jobs.max_attempts,
     CAST(jobs.result IS NOT DISTINCT FROM $1::jsonb AS boolean) AS result_matches,
     jobs.lease_expires_at,
+    jobs.cancel_requested_at,
     job_attempts.worker_id,
     job_attempts.status AS attempt_status,
     job_attempts.error_code,
@@ -278,15 +305,16 @@ type LockAttemptReportParams struct {
 }
 
 type LockAttemptReportRow struct {
-	JobStatus      string
-	AttemptCount   int32
-	MaxAttempts    int32
-	ResultMatches  bool
-	LeaseExpiresAt pgtype.Timestamptz
-	WorkerID       uuid.UUID
-	AttemptStatus  string
-	ErrorCode      pgtype.Text
-	ErrorMessage   pgtype.Text
+	JobStatus         string
+	AttemptCount      int32
+	MaxAttempts       int32
+	ResultMatches     bool
+	LeaseExpiresAt    pgtype.Timestamptz
+	CancelRequestedAt pgtype.Timestamptz
+	WorkerID          uuid.UUID
+	AttemptStatus     string
+	ErrorCode         pgtype.Text
+	ErrorMessage      pgtype.Text
 }
 
 func (q *Queries) LockAttemptReport(ctx context.Context, arg LockAttemptReportParams) (LockAttemptReportRow, error) {
@@ -298,6 +326,7 @@ func (q *Queries) LockAttemptReport(ctx context.Context, arg LockAttemptReportPa
 		&i.MaxAttempts,
 		&i.ResultMatches,
 		&i.LeaseExpiresAt,
+		&i.CancelRequestedAt,
 		&i.WorkerID,
 		&i.AttemptStatus,
 		&i.ErrorCode,
@@ -307,7 +336,7 @@ func (q *Queries) LockAttemptReport(ctx context.Context, arg LockAttemptReportPa
 }
 
 const lockExpiredJobs = `-- name: LockExpiredJobs :many
-SELECT id, attempt_count, max_attempts
+SELECT id, attempt_count, max_attempts, cancel_requested_at
 FROM jobs
 WHERE status = 'running'
   AND lease_expires_at <= statement_timestamp()
@@ -317,9 +346,10 @@ LIMIT $1
 `
 
 type LockExpiredJobsRow struct {
-	ID           uuid.UUID
-	AttemptCount int32
-	MaxAttempts  int32
+	ID                uuid.UUID
+	AttemptCount      int32
+	MaxAttempts       int32
+	CancelRequestedAt pgtype.Timestamptz
 }
 
 func (q *Queries) LockExpiredJobs(ctx context.Context, batchSize int32) ([]LockExpiredJobsRow, error) {
@@ -331,7 +361,12 @@ func (q *Queries) LockExpiredJobs(ctx context.Context, batchSize int32) ([]LockE
 	var items []LockExpiredJobsRow
 	for rows.Next() {
 		var i LockExpiredJobsRow
-		if err := rows.Scan(&i.ID, &i.AttemptCount, &i.MaxAttempts); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.AttemptCount,
+			&i.MaxAttempts,
+			&i.CancelRequestedAt,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -383,7 +418,8 @@ SET status = $1,
         ELSE available_at
     END,
     finished_at = CASE
-        WHEN $1 = 'dead_lettered' THEN $2::timestamptz
+        WHEN $1 IN ('dead_lettered', 'cancelled')
+            THEN $2::timestamptz
         ELSE NULL
     END,
     updated_at = $2::timestamptz
@@ -472,7 +508,7 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 	return id, err
 }
 
-const renewAttemptLease = `-- name: RenewAttemptLease :execrows
+const renewAttemptLease = `-- name: RenewAttemptLease :one
 UPDATE jobs
 SET lease_expires_at = statement_timestamp()
         + $1::bigint * interval '1 millisecond',
@@ -482,6 +518,7 @@ WHERE id = $2
   AND current_worker_id = $4
   AND status = 'running'
   AND lease_expires_at > statement_timestamp()
+RETURNING CAST(cancel_requested_at IS NOT NULL AS boolean) AS cancel_requested
 `
 
 type RenewAttemptLeaseParams struct {
@@ -491,15 +528,14 @@ type RenewAttemptLeaseParams struct {
 	WorkerID        pgtype.UUID
 }
 
-func (q *Queries) RenewAttemptLease(ctx context.Context, arg RenewAttemptLeaseParams) (int64, error) {
-	result, err := q.db.Exec(ctx, renewAttemptLease,
+func (q *Queries) RenewAttemptLease(ctx context.Context, arg RenewAttemptLeaseParams) (bool, error) {
+	row := q.db.QueryRow(ctx, renewAttemptLease,
 		arg.LeaseDurationMs,
 		arg.JobID,
 		arg.AttemptNo,
 		arg.WorkerID,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+	var cancel_requested bool
+	err := row.Scan(&cancel_requested)
+	return cancel_requested, err
 }

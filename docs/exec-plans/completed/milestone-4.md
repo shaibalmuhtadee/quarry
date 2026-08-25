@@ -508,7 +508,7 @@ Apply submitted execution deadlines cooperatively and keep the worker alive afte
 
 ## Slice 6: durable cancellation state
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -572,11 +572,26 @@ Add the cancellation state machine and storage operations without exposing the p
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- Migration 7 adds nullable `jobs.cancel_requested_at`. Existing jobs remain valid with no cancellation request, and the migration rolls back by removing the column.
+- `PlanJobCancellation` defines the storage transition from each job status. Queued and retry-wait jobs finish as cancelled, running jobs record a request, cancelled jobs return unchanged, and succeeded or dead-lettered jobs return `ErrJobCancellationConflict`.
+- `JobStore.RequestCancellation` locks the job row before applying the decision. Immediate cancellation writes one database transition timestamp to `cancel_requested_at`, `finished_at`, and `updated_at`; running cancellation preserves the assigned worker and lease.
+- Claims require `cancel_requested_at IS NULL` in addition to the existing eligibility rules. The cancellation-versus-claim integration test accepts either serialized winner and verifies that no cancellation-requested pending job can be claimed.
+- Lease recovery resolves an expired cancellation-requested attempt and job as cancelled without retry. The attempt stores `cancellation_requested` with the safe message `job cancellation was requested`.
+- `GET /v1/jobs/{id}` now returns nullable `cancel_requested_at`. `POST /v1/jobs/{id}/cancel`, heartbeat propagation, and worker handler cancellation remain unimplemented and unregistered for Slice 7.
+- No architecture or project-plan deviation was required.
+
+### Validation evidence
+
+- `go test -count=1 ./internal/domain ./internal/api ./internal/store/postgres/...` passed domain state-machine tests, API read-model tests, real PostgreSQL cancellation transactions and races, cancellation-aware recovery, and migration tests.
+- `pwsh ./scripts/dev.ps1 migration-test` passed migration apply, rollback, and reapplication through version 7.
+- `pwsh ./scripts/dev.ps1 generate-check` passed for committed sqlc and Protocol Buffer output.
+- `pwsh ./scripts/dev.ps1 check` passed tool checks, formatting, unit and integration tests, race detection, static analysis, builds, migration checks, distributed execution, recovery, and cleanup verification.
+- `git diff --check` passed after the completion documentation update.
+- GitHub-hosted CI was not run.
 
 ## Slice 7: cooperative running cancellation
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -639,11 +654,28 @@ Expose the cancellation API, propagate running cancellation through heartbeats, 
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- `POST /v1/jobs/{id}/cancel` returns the current public job representation with `200 OK`. It maps missing jobs to `404 Not Found`, succeeded or dead-lettered conflicts to `409 Conflict`, and keeps internal store errors out of the response.
+- Lease renewal returns `cancel_requested` from the same matching-attempt update. Stale heartbeat results cannot carry a cancellation instruction, and the dispatcher and worker client preserve each result's job and attempt identity.
+- An active attempt now has a separate handler context beneath its attempt-lifetime context. User cancellation cancels only the handler context. The attempt stays registered and keeps heartbeating while the worker retries its cancelled report; stale-lease cancellation still removes and fences the attempt.
+- Worker cancellation reports use the stable `cancellation_requested` code and `job cancellation was requested` safe message. User cancellation remains distinct from execution timeout and lease-stale causes.
+- A cancellation request converts any later failure, timeout, panic, or cancelled report to the canonical cancelled transition. Repeated reports after an acknowledgement loss remain idempotent. A valid success report still wins and may leave `cancel_requested_at` as race history on the succeeded job.
+- If timeout reporting wins before cancellation, the attempt remains timed out but cancellation immediately terminates the retry-wait job. Both race orderings prevent another attempt.
+- Real integration tests cross HTTP submission and cancellation, gRPC heartbeat and report calls, worker handler cancellation, and PostgreSQL job and attempt state.
+- No architecture or project-plan deviation was required.
+
+### Validation evidence
+
+- `go test -count=1 ./internal/api ./internal/dispatcher ./internal/store/postgres/... ./internal/worker/...` passed focused HTTP, dispatcher, real PostgreSQL, migration, gRPC client, worker cancellation, and handler tests.
+- `go test -count=20 ./internal/worker` passed repeated worker concurrency and cancellation-report tests.
+- `docker run --rm --volume "C:\Users\shai\Documents\Code\quarry:/src" --workdir /src golang:1.27.0-bookworm go test -race -count=1 ./internal/worker/... ./cmd/worker` passed the worker packages and command under the Linux race detector.
+- `pwsh ./scripts/dev.ps1 generate-check` passed for committed sqlc and Protocol Buffer output.
+- `pwsh ./scripts/dev.ps1 check` passed tool checks, formatting, unit and integration tests, static analysis, builds, migration checks, distributed execution, recovery, and cleanup verification after the final code changes.
+- `git diff --check` passed after the completion documentation update.
+- GitHub-hosted CI was not run.
 
 ## Slice 8: SIGTERM drain and Milestone 4 demonstration
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -707,28 +739,58 @@ Stop acquisition on SIGTERM, continue heartbeats while attempts drain, enforce t
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- The worker now uses the signal context only for registration and acquisition. Active attempts, heartbeats, and reports use a separate cancel-cause context that retains the signal context's values without inheriting its cancellation.
+- `QUARRY_WORKER_SHUTDOWN_TIMEOUT` defaults to ten seconds and rejects zero, negative, or malformed durations. Direct worker construction also requires a positive timeout.
+- When the drain deadline expires, the worker cancels the attempt-lifecycle context with a shutdown-specific cause and returns without waiting for a handler that ignores cancellation. Executors skip reporting once that lifecycle context is cancelled, so shutdown cannot be mistaken for user cancellation.
+- The process proof cross-builds a static Linux worker and runs it in an isolated container. This delivers a real SIGTERM on Windows while the API and dispatcher remain real host processes and PostgreSQL remains the durable authority.
+- Two consecutive standalone `pwsh ./scripts/dev.ps1 semantics-test` runs passed before the command was added to `check`. Each run proved lease renewal during graceful drain, no later acquisition, successful reporting before exit, forced-deadline exit with attempt 1 still running, lease-expiry abandonment, replacement attempt 2 success, direct PostgreSQL state, focused retry/idempotency/cancellation integrations, and complete cleanup.
+- `go test -count=20 -run 'TestWorker(DrainsActiveAttemptWithoutFurtherAcquisition|ShutdownDeadline)' ./internal/worker` passed the lifecycle tests repeatedly.
+- `pwsh ./scripts/dev.ps1 distributed-test` passed with 40 jobs, two worker processes, bounded concurrency, direct PostgreSQL verification, and cleanup.
+- `pwsh ./scripts/dev.ps1 recovery-test` passed crash recovery, stale-report fencing, direct PostgreSQL verification, and cleanup.
+- `docker run --rm --volume "C:\Users\shai\Documents\Code\quarry:/src" --workdir /src golang:1.27.0-bookworm go test -race -count=1 ./internal/worker/... ./cmd/worker` passed the worker packages and command under the race detector.
+- `pwsh ./scripts/dev.ps1 generate-check` passed for committed sqlc and Protocol Buffer output.
+- `pwsh ./scripts/dev.ps1 check` passed formatting, generated-code consistency, vet, all Go tests, builds, Compose validation, smoke testing, distributed execution, recovery, the Milestone 4 semantics proof, and every cleanup check.
+- `git diff --check` passed. `git status --short` showed only the accumulated Milestone 4 Slice 6 through Slice 8 implementation and documentation changes; no generated test artifacts remained.
+- GitHub-hosted CI was not run.
 
 ## Milestone audit
 
-Status: not started
+Status: complete
 
-After all slices pass, audit the implementation against the original Milestone 4 requirements and definition of done in `docs/project-plan.md`.
+### Requirement audit
 
-The audit must:
+- The domain and gRPC contracts distinguish retryable failures, permanent failures, cancellation, timeouts, panics, success, and dispatcher-owned lease abandonment. Workers classify handler errors and keep unrelated attempts running.
+- The dispatcher enforces `max_attempts`, uses deterministic exponential-backoff and inclusive full-jitter policy code, and commits `retry_wait` or `dead_lettered` with PostgreSQL-derived transition time and durable `available_at`.
+- PostgreSQL uniqueness on `(job_type, idempotency_key)` resolves concurrent submissions. Canonical request hashing distinguishes changed payloads, resolved maximum attempts, and timeouts.
+- Worker handler contexts apply submitted timeouts, cooperative cancellation, and panic recovery. Safe outcomes cross gRPC and persist with the attempt while unsafe errors, panic values, and stacks stay out of public responses.
+- Queued and retry-wait jobs cancel atomically. Running cancellation propagates through heartbeats to only the matching handler. Cancellation-aware reports and lease recovery never retry user-cancelled work.
+- SIGTERM stops acquisition and retains heartbeats and reports during the drain period. The shutdown deadline cancels remaining local attempt contexts without reporting user cancellation, so PostgreSQL lease recovery owns replacement execution.
+- `GET /v1/jobs/{id}` exposes cancellation state, successful results, and the latest safe failure summary derived from attempt history. `GET /v1/jobs/{id}/attempts` exposes every stored status and safe failure detail without returning job payloads or internal errors.
 
-- run the complete local validation,
-- repeat `pwsh ./scripts/dev.ps1 semantics-test`,
-- run retry, idempotency, cancellation, and lease-race tests against real PostgreSQL,
-- run worker race detection,
-- inspect all job and attempt transitions directly,
-- verify public cancellation and failure responses,
-- verify retry timing through `available_at`,
-- inspect the implementation for premature Milestone 5 behavior,
-- confirm that no Prometheus metrics, OpenTelemetry tracing, `/metrics` endpoint, collector, Grafana, or dashboard was added,
-- record decisions and deviations,
-- update `docs/current-status.md`,
-- move this plan to `docs/exec-plans/completed/milestone-4.md` only if the definition of done passes,
-- report GitHub-hosted CI as unverified unless it runs against the completed state.
+### Defect fixed during audit
 
-The milestone is complete only when the main execution semantics are implemented, directly tested, and defensible from the stored state and process behavior.
+- The slice statuses claimed the public read model was complete, but `GET /v1/jobs/{id}` omitted the required latest failure summary. `GetJob` now derives the newest failed attempt with a lateral PostgreSQL query, the HTTP response returns `latest_failure`, and focused unit plus real PostgreSQL HTTP tests cover presence, absence, and safe field mapping. No schema change was needed.
+
+### Required test evidence
+
+- Retry timing and maximum-attempt enforcement passed through deterministic policy tests, real PostgreSQL scheduling checks, claim rejection before `available_at`, claim success after eligibility, and retry-to-dead-letter worker integration.
+- Permanent failures passed the worker, gRPC, dispatcher, and PostgreSQL path without creating another attempt.
+- Concurrent identical submissions produced one logical job, identical replays deduplicated, and changed requests returned conflicts in real PostgreSQL and HTTP tests.
+- Timeout tests proved handler-context cancellation and retry exhaustion. Panic tests proved recovery, safe reporting, continued worker operation, and retry exhaustion.
+- Queued, retry-wait, and running cancellation passed through HTTP, gRPC, worker, and PostgreSQL boundaries. Cancellation races with claims, timeouts, successes, failures, and lease recovery ended in permitted stored states without retries after user cancellation.
+- Graceful-shutdown and forced-shutdown recovery passed with real Linux worker containers. The process proof checked acquisition stop, lease renewal during drain, success before the deadline, no false report after the forced deadline, abandonment of attempt 1, success of replacement attempt 2, and cleanup.
+
+### Validation evidence
+
+- `pwsh ./scripts/dev.ps1 semantics-test` passed the process proof and focused retry, permanent-failure, timeout, panic, idempotency, and cancellation integrations. It verified the final PostgreSQL rows and removed all temporary processes, worker containers, binaries, networks, and volumes.
+- The focused real-PostgreSQL audit command passed retry timing, permanent and exhausted dead-lettering, concurrent idempotency, report-versus-recovery, cancellation-versus-claim, timeout-versus-cancellation, cancellation-aware reports, and the public latest-failure response.
+- `docker run --rm --volume "C:\Users\shai\Documents\Code\quarry:/src" --workdir /src golang:1.27.0-bookworm go test -race -count=1 ./internal/worker/... ./cmd/worker` passed all worker packages under the Linux race detector.
+- The first full `pwsh ./scripts/dev.ps1 check` attempt hit the intermittent Windows Testcontainers error `rootless Docker is not supported on Windows`. Docker-backed focused tests had already passed. The unchanged rerun with normal Docker Desktop access passed module, formatting, tool, generated-code, vet, all-test, build, Compose, smoke, distributed, recovery, semantics, PostgreSQL-state, and cleanup checks.
+- `git diff --check` passed before the audit documentation update. The final documentation move and diff checks also passed.
+- GitHub-hosted CI was not run and remains unverified.
+
+### Scope and conclusion
+
+- No architecture or project-plan deviation was required.
+- No Prometheus client use, OpenTelemetry setup, `/metrics` route, collector, Grafana configuration, Jaeger configuration, dashboard, or other Milestone 5 behavior exists. Prometheus and OpenTelemetry modules in `go.mod` are indirect Testcontainers dependencies.
+- Milestone 4 meets every build item, named test obligation, and its definition of done. Quarry's main execution semantics are implemented, directly tested, and defensible from public responses, stored PostgreSQL state, and real process behavior.

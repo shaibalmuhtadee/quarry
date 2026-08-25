@@ -83,9 +83,10 @@ func TestGRPCClientPreservesRegistrationAcquisitionAndReportIdentity(t *testing.
 			TimeoutMs:   2500,
 		}},
 		heartbeats: []*dispatcherv1.HeartbeatAttemptResult{{
-			JobId:     jobID.String(),
-			AttemptNo: uint32(attempt.Int32()),
-			State:     dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID,
+			JobId:           jobID.String(),
+			AttemptNo:       uint32(attempt.Int32()),
+			State:           dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID,
+			CancelRequested: true,
 		}},
 	}
 	client, err := NewGRPCClient(rpc, time.Second)
@@ -120,7 +121,7 @@ func TestGRPCClientPreservesRegistrationAcquisitionAndReportIdentity(t *testing.
 		t.Fatal(err)
 	}
 	if len(heartbeats) != 1 || heartbeats[0].Attempt.JobID != jobID ||
-		heartbeats[0].Attempt.AttemptNumber != attempt || !heartbeats[0].Valid {
+		heartbeats[0].Attempt.AttemptNumber != attempt || !heartbeats[0].Valid || !heartbeats[0].CancelRequested {
 		t.Fatalf("heartbeat results = %#v", heartbeats)
 	}
 	succeeded, err := domain.NewSucceededOutcome(result)
@@ -179,6 +180,9 @@ func TestGRPCClientMapsWorkerFailureOutcomes(t *testing.T) {
 		{name: "permanent", outcome: domain.NewPermanentFailureOutcome, read: func(request *dispatcherv1.ReportAttemptRequest) *dispatcherv1.AttemptFailure {
 			return request.GetPermanentFailure()
 		}},
+		{name: "cancelled", outcome: domain.NewCancelledOutcome, read: func(request *dispatcherv1.ReportAttemptRequest) *dispatcherv1.AttemptFailure {
+			return request.GetCancelled()
+		}},
 		{name: "timed out", outcome: domain.NewTimedOutOutcome, read: func(request *dispatcherv1.ReportAttemptRequest) *dispatcherv1.AttemptFailure {
 			return request.GetTimedOut()
 		}},
@@ -221,6 +225,7 @@ func TestParseHeartbeatResultRejectsInvalidResponses(t *testing.T) {
 		{name: "zero attempt", value: &dispatcherv1.HeartbeatAttemptResult{JobId: jobID, State: dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID}},
 		{name: "attempt overflow", value: &dispatcherv1.HeartbeatAttemptResult{JobId: jobID, AttemptNo: uint32(^uint32(0)), State: dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID}},
 		{name: "unspecified state", value: &dispatcherv1.HeartbeatAttemptResult{JobId: jobID, AttemptNo: 1}},
+		{name: "stale cancellation", value: &dispatcherv1.HeartbeatAttemptResult{JobId: jobID, AttemptNo: 1, State: dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_STALE, CancelRequested: true}},
 	}
 
 	for _, test := range tests {

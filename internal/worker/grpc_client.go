@@ -147,6 +147,14 @@ func (client *GRPCClient) ReportAttempt(
 		request.Outcome = &dispatcherv1.ReportAttemptRequest_PermanentFailure{
 			PermanentFailure: mapAttemptFailure(failure),
 		}
+	case domain.AttemptOutcomeKindCancelled:
+		failure, ok := outcome.Failure()
+		if !ok {
+			return domain.ErrInvalidAttemptOutcome
+		}
+		request.Outcome = &dispatcherv1.ReportAttemptRequest_Cancelled{
+			Cancelled: mapAttemptFailure(failure),
+		}
 	case domain.AttemptOutcomeKindTimedOut:
 		failure, ok := outcome.Failure()
 		if !ok {
@@ -240,12 +248,16 @@ func parseHeartbeatResult(value *dispatcherv1.HeartbeatAttemptResult) (Heartbeat
 	default:
 		return HeartbeatResult{}, errors.New("heartbeat result state must be valid or stale")
 	}
+	if !valid && value.GetCancelRequested() {
+		return HeartbeatResult{}, errors.New("stale heartbeat result cannot request cancellation")
+	}
 
 	return HeartbeatResult{
 		Attempt: HeartbeatAttempt{
 			JobID:         jobID,
 			AttemptNumber: attemptNumber,
 		},
-		Valid: valid,
+		Valid:           valid,
+		CancelRequested: value.GetCancelRequested(),
 	}, nil
 }

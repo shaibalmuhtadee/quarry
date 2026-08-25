@@ -366,6 +366,9 @@ func TestDispatcherStoreHeartbeatRenewsOnlyCurrentUnexpiredAttempts(t *testing.T
 	expiredAttempt := acquireOneTestJob(t, ctx, dispatcherStore, worker, "heartbeat.expired")
 	validJob := createTestJob(t, ctx, jobStore, "heartbeat.valid", `{}`)
 	validAttempt := acquireOneTestJob(t, ctx, dispatcherStore, worker, "heartbeat.valid")
+	if _, err := jobStore.RequestCancellation(ctx, validJob.ID); err != nil {
+		t.Fatalf("request heartbeat cancellation: %v", err)
+	}
 	completedJob := createTestJob(t, ctx, jobStore, "heartbeat.completed", `{}`)
 	completedAttempt := acquireOneTestJob(t, ctx, dispatcherStore, worker, "heartbeat.completed")
 	if err := reportSuccess(ctx, dispatcherStore, worker, completedJob.ID, completedAttempt.AttemptNumber, mustResult(t, `{"ok":true}`)); err != nil {
@@ -415,7 +418,8 @@ func TestDispatcherStoreHeartbeatRenewsOnlyCurrentUnexpiredAttempts(t *testing.T
 	}
 	for i, result := range results {
 		wantValid := i == 1
-		if result.Attempt != attempts[i] || result.Valid != wantValid {
+		wantCancellation := i == 1
+		if result.Attempt != attempts[i] || result.Valid != wantValid || result.CancelRequested != wantCancellation {
 			t.Fatalf("heartbeat result %d = %#v, want attempt %#v valid %t", i, result, attempts[i], wantValid)
 		}
 	}

@@ -8,10 +8,12 @@ import (
 )
 
 const (
-	executionTimeoutCode    = "execution_timeout"
-	executionTimeoutMessage = "handler execution timed out"
-	handlerPanickedCode     = "handler_panicked"
-	handlerPanickedMessage  = "handler panicked"
+	executionTimeoutCode         = "execution_timeout"
+	executionTimeoutMessage      = "handler execution timed out"
+	handlerPanickedCode          = "handler_panicked"
+	handlerPanickedMessage       = "handler panicked"
+	cancellationRequestedCode    = "cancellation_requested"
+	cancellationRequestedMessage = "job cancellation was requested"
 )
 
 type handlerExecution struct {
@@ -52,4 +54,12 @@ func panickedOutcome() (domain.AttemptOutcome, error) {
 		return domain.AttemptOutcome{}, err
 	}
 	return domain.NewPanickedOutcome(failure)
+}
+
+func cancelledOutcome() (domain.AttemptOutcome, error) {
+	failure, err := domain.NewAttemptFailure(cancellationRequestedCode, cancellationRequestedMessage)
+	if err != nil {
+		return domain.AttemptOutcome{}, err
+	}
+	return domain.NewCancelledOutcome(failure)
 }

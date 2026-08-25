@@ -16,10 +16,12 @@ import (
 )
 
 var (
-	ErrInvalidConfiguration = errors.New("invalid worker configuration")
-	errLeaseStale           = errors.New("attempt lease is stale")
-	errAttemptLost          = errors.New("attempt report lost its lease race")
-	errExecutionTimedOut    = errors.New("attempt execution timed out")
+	ErrInvalidConfiguration  = errors.New("invalid worker configuration")
+	errLeaseStale            = errors.New("attempt lease is stale")
+	errAttemptLost           = errors.New("attempt report lost its lease race")
+	errExecutionTimedOut     = errors.New("attempt execution timed out")
+	errCancellationRequested = errors.New("job cancellation was requested")
+	errWorkerShutdown        = errors.New("worker shutdown deadline reached")
 )
 
 type Handler func(context.Context, domain.Payload) (domain.Result, error)
@@ -46,8 +48,9 @@ type HeartbeatAttempt struct {
 }
 
 type HeartbeatResult struct {
-	Attempt HeartbeatAttempt
-	Valid   bool
+	Attempt         HeartbeatAttempt
+	Valid           bool
+	CancelRequested bool
 }
 
 type Dispatcher interface {
@@ -70,6 +73,7 @@ type Config struct {
 	ReportBackoffMin  time.Duration
 	ReportBackoffMax  time.Duration
 	HeartbeatInterval time.Duration
+	ShutdownTimeout   time.Duration
 	Logger            *slog.Logger
 }
 
@@ -83,6 +87,7 @@ type Worker struct {
 	reportBackoffMin  time.Duration
 	reportBackoffMax  time.Duration
 	heartbeatInterval time.Duration
+	shutdownTimeout   time.Duration
 	logger            *slog.Logger
 }
 
@@ -113,6 +118,9 @@ func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worke
 	}
 	if cfg.HeartbeatInterval <= 0 {
 		return nil, fmt.Errorf("%w: heartbeat interval must be positive", ErrInvalidConfiguration)
+	}
+	if cfg.ShutdownTimeout <= 0 {
+		return nil, fmt.Errorf("%w: shutdown timeout must be positive", ErrInvalidConfiguration)
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -146,15 +154,18 @@ func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worke
 		reportBackoffMin:  cfg.ReportBackoffMin,
 		reportBackoffMax:  cfg.ReportBackoffMax,
 		heartbeatInterval: cfg.HeartbeatInterval,
+		shutdownTimeout:   cfg.ShutdownTimeout,
 		logger:            logger,
 	}, nil
 }
 
 type activeAttempt struct {
-	identity HeartbeatAttempt
-	job      Job
-	ctx      context.Context
-	cancel   context.CancelCauseFunc
+	identity      HeartbeatAttempt
+	job           Job
+	ctx           context.Context
+	cancel        context.CancelCauseFunc
+	handlerCtx    context.Context
+	cancelHandler context.CancelCauseFunc
 }
 
 type activeAttempts struct {
@@ -169,7 +180,15 @@ func newActiveAttempts() *activeAttempts {
 func (active *activeAttempts) add(parent context.Context, job Job) (*activeAttempt, error) {
 	identity := HeartbeatAttempt{JobID: job.ID, AttemptNumber: job.AttemptNumber}
 	ctx, cancel := context.WithCancelCause(parent)
-	attempt := &activeAttempt{identity: identity, job: job, ctx: ctx, cancel: cancel}
+	handlerCtx, cancelHandler := context.WithCancelCause(ctx)
+	attempt := &activeAttempt{
+		identity:      identity,
+		job:           job,
+		ctx:           ctx,
+		cancel:        cancel,
+		handlerCtx:    handlerCtx,
+		cancelHandler: cancelHandler,
+	}
 
 	active.mu.Lock()
 	defer active.mu.Unlock()
@@ -225,6 +244,17 @@ func (active *activeAttempts) cancel(identity HeartbeatAttempt, cause error) boo
 	return true
 }
 
+func (active *activeAttempts) signal(identity HeartbeatAttempt, cause error) bool {
+	active.mu.Lock()
+	attempt, exists := active.attempts[identity]
+	active.mu.Unlock()
+	if !exists {
+		return false
+	}
+	attempt.cancelHandler(cause)
+	return true
+}
+
 func (worker *Worker) Run(ctx context.Context) error {
 	if err := worker.dispatcher.Register(ctx, worker.registration); err != nil {
 		if ctx.Err() != nil {
@@ -233,7 +263,7 @@ func (worker *Worker) Run(ctx context.Context) error {
 		return fmt.Errorf("register worker: %w", err)
 	}
 
-	runCtx, cancel := context.WithCancel(ctx)
+	runCtx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
 
 	jobs := make(chan *activeAttempt, worker.registration.Concurrency)
 	capacityChanged := make(chan struct{}, 1)
@@ -243,7 +273,7 @@ func (worker *Worker) Run(ctx context.Context) error {
 	fail := func(err error) {
 		failOnce.Do(func() {
 			runtimeErrors <- err
-			cancel()
+			cancel(err)
 		})
 	}
 	notifyCapacityChanged := func() {
@@ -268,10 +298,34 @@ func (worker *Worker) Run(ctx context.Context) error {
 			fail(err)
 		}
 	}()
+	waitForGoroutines := true
 	defer func() {
-		cancel()
-		goroutines.Wait()
+		cancel(context.Canceled)
+		if waitForGoroutines {
+			goroutines.Wait()
+		}
 	}()
+	drain := func() error {
+		if active.len() == 0 {
+			return nil
+		}
+		timer := time.NewTimer(worker.shutdownTimeout)
+		defer timer.Stop()
+		for {
+			select {
+			case err := <-runtimeErrors:
+				return err
+			case <-capacityChanged:
+				if active.len() == 0 {
+					return nil
+				}
+			case <-timer.C:
+				waitForGoroutines = false
+				cancel(errWorkerShutdown)
+				return nil
+			}
+		}
+	}
 
 	idleBackoff := worker.idleBackoffMin
 	for {
@@ -279,14 +333,14 @@ func (worker *Worker) Run(ctx context.Context) error {
 			return err
 		}
 		if ctx.Err() != nil {
-			return nil
+			return drain()
 		}
 
 		outstanding := uint32(active.len())
 		if outstanding >= worker.registration.Concurrency {
 			select {
 			case <-ctx.Done():
-				return nil
+				return drain()
 			case err := <-runtimeErrors:
 				return err
 			case <-capacityChanged:
@@ -296,22 +350,22 @@ func (worker *Worker) Run(ctx context.Context) error {
 
 		capacity := worker.registration.Concurrency - outstanding
 		acquired, err := worker.dispatcher.Acquire(
-			runCtx,
+			ctx,
 			worker.registration.WorkerID,
 			capacity,
 			worker.supportedTypes,
 		)
 		if err != nil {
-			if runCtx.Err() != nil {
+			if ctx.Err() != nil {
 				if runtimeErr := receiveRuntimeError(runtimeErrors); runtimeErr != nil {
 					return runtimeErr
 				}
-				return nil
+				return drain()
 			}
 			if !isTransientRPCError(err) {
 				return fmt.Errorf("acquire jobs: %w", err)
 			}
-			if !wait(runCtx, jitter(idleBackoff, worker.idleBackoffMax)) {
+			if !wait(ctx, jitter(idleBackoff, worker.idleBackoffMax)) {
 				continue
 			}
 			idleBackoff = nextBackoff(idleBackoff, worker.idleBackoffMax)
@@ -321,7 +375,7 @@ func (worker *Worker) Run(ctx context.Context) error {
 			return fmt.Errorf("dispatcher returned %d jobs for capacity %d", len(acquired), capacity)
 		}
 		if len(acquired) == 0 {
-			if !wait(runCtx, jitter(idleBackoff, worker.idleBackoffMax)) {
+			if !wait(ctx, jitter(idleBackoff, worker.idleBackoffMax)) {
 				continue
 			}
 			idleBackoff = nextBackoff(idleBackoff, worker.idleBackoffMax)
@@ -370,7 +424,7 @@ func (worker *Worker) execute(
 			}
 			job := attempt.job
 			handler := worker.handlers[job.Type.String()]
-			handlerCtx, cancelHandler := context.WithTimeoutCause(attempt.ctx, job.Timeout, errExecutionTimedOut)
+			handlerCtx, cancelHandler := context.WithTimeoutCause(attempt.handlerCtx, job.Timeout, errExecutionTimedOut)
 			execution := invokeHandler(handlerCtx, handler, job.Payload)
 			cancelHandler()
 			handlerCause := context.Cause(handlerCtx)
@@ -394,6 +448,8 @@ func (worker *Worker) execute(
 			var outcome domain.AttemptOutcome
 			var err error
 			switch {
+			case errors.Is(handlerCause, errCancellationRequested):
+				outcome, err = cancelledOutcome()
 			case errors.Is(handlerCause, errExecutionTimedOut):
 				outcome, err = timedOutOutcome()
 			case execution.panicked:
@@ -455,6 +511,10 @@ func (worker *Worker) heartbeatLoop(
 		for _, result := range results {
 			if !result.Valid && active.cancel(result.Attempt, errLeaseStale) {
 				notifyCapacityChanged()
+				continue
+			}
+			if result.Valid && result.CancelRequested {
+				active.signal(result.Attempt, errCancellationRequested)
 			}
 		}
 	}

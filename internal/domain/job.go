@@ -16,13 +16,14 @@ const (
 )
 
 var (
-	ErrInvalidJobID       = errors.New("invalid job ID")
-	ErrInvalidJobType     = errors.New("invalid job type")
-	ErrInvalidPayload     = errors.New("invalid payload")
-	ErrInvalidJobStatus   = errors.New("invalid job status")
-	ErrInvalidMaxAttempts = errors.New("invalid maximum attempts")
-	ErrInvalidTimeout     = errors.New("invalid timeout")
-	ErrJobNotFound        = errors.New("job not found")
+	ErrInvalidJobID            = errors.New("invalid job ID")
+	ErrInvalidJobType          = errors.New("invalid job type")
+	ErrInvalidPayload          = errors.New("invalid payload")
+	ErrInvalidJobStatus        = errors.New("invalid job status")
+	ErrInvalidMaxAttempts      = errors.New("invalid maximum attempts")
+	ErrInvalidTimeout          = errors.New("invalid timeout")
+	ErrJobNotFound             = errors.New("job not found")
+	ErrJobCancellationConflict = errors.New("job cannot be cancelled from its current state")
 
 	jobTypePattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$`)
 )
@@ -133,18 +134,49 @@ func ParseJobStatus(value string) (JobStatus, error) {
 	}
 }
 
+type JobCancellationTransition uint8
+
+const (
+	JobCancellationNoChange JobCancellationTransition = iota
+	JobCancellationFinish
+	JobCancellationRequest
+)
+
+func PlanJobCancellation(status JobStatus, alreadyRequested bool) (JobCancellationTransition, error) {
+	switch status {
+	case JobStatusQueued, JobStatusRetryWait:
+		if alreadyRequested {
+			return JobCancellationNoChange, ErrInvalidJobStatus
+		}
+		return JobCancellationFinish, nil
+	case JobStatusRunning:
+		if alreadyRequested {
+			return JobCancellationNoChange, nil
+		}
+		return JobCancellationRequest, nil
+	case JobStatusCancelled:
+		return JobCancellationNoChange, nil
+	case JobStatusSucceeded, JobStatusDeadLettered:
+		return JobCancellationNoChange, ErrJobCancellationConflict
+	default:
+		return JobCancellationNoChange, ErrInvalidJobStatus
+	}
+}
+
 type Job struct {
-	ID           JobID
-	Type         JobType
-	Payload      Payload
-	Result       *Result
-	Status       JobStatus
-	AttemptCount int32
-	MaxAttempts  int32
-	Timeout      time.Duration
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	FinishedAt   *time.Time
+	ID                JobID
+	Type              JobType
+	Payload           Payload
+	Result            *Result
+	LatestFailure     *AttemptFailure
+	Status            JobStatus
+	AttemptCount      int32
+	MaxAttempts       int32
+	Timeout           time.Duration
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	FinishedAt        *time.Time
+	CancelRequestedAt *time.Time
 }
 
 type JobSubmission struct {

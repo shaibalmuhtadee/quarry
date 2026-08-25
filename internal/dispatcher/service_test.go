@@ -257,7 +257,7 @@ func TestHeartbeatParsesRequestAndMapsResults(t *testing.T) {
 				t.Fatalf("heartbeat = worker %s, attempts %#v", gotWorkerID, attempts)
 			}
 			return []postgres.HeartbeatResult{
-				{Attempt: attempts[0], Valid: true},
+				{Attempt: attempts[0], Valid: true, CancelRequested: true},
 				{Attempt: attempts[1], Valid: false},
 			}, nil
 		},
@@ -278,12 +278,14 @@ func TestHeartbeatParsesRequestAndMapsResults(t *testing.T) {
 	}
 	if response.GetAttempts()[0].GetJobId() != firstJobID.String() ||
 		response.GetAttempts()[0].GetAttemptNo() != 1 ||
-		response.GetAttempts()[0].GetState() != dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID {
+		response.GetAttempts()[0].GetState() != dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID ||
+		!response.GetAttempts()[0].GetCancelRequested() {
 		t.Fatalf("first heartbeat result = %#v", response.GetAttempts()[0])
 	}
 	if response.GetAttempts()[1].GetJobId() != secondJobID.String() ||
 		response.GetAttempts()[1].GetAttemptNo() != 2 ||
-		response.GetAttempts()[1].GetState() != dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_STALE {
+		response.GetAttempts()[1].GetState() != dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_STALE ||
+		response.GetAttempts()[1].GetCancelRequested() {
 		t.Fatalf("second heartbeat result = %#v", response.GetAttempts()[1])
 	}
 }

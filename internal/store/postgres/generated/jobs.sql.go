@@ -12,24 +12,73 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const cancelPendingJob = `-- name: CancelPendingJob :execrows
+UPDATE jobs
+SET status = 'cancelled',
+    cancel_requested_at = $1,
+    finished_at = $1,
+    updated_at = $1
+WHERE id = $2
+  AND status IN ('queued', 'retry_wait')
+  AND cancel_requested_at IS NULL
+`
+
+type CancelPendingJobParams struct {
+	TransitionTime pgtype.Timestamptz
+	JobID          uuid.UUID
+}
+
+func (q *Queries) CancelPendingJob(ctx context.Context, arg CancelPendingJobParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelPendingJob, arg.TransitionTime, arg.JobID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getJob = `-- name: GetJob :one
-SELECT id, job_type, payload, result, status, attempt_count, max_attempts, timeout_ms, created_at, updated_at, finished_at
+SELECT
+    jobs.id,
+    jobs.job_type,
+    jobs.payload,
+    jobs.result,
+    jobs.status,
+    jobs.attempt_count,
+    jobs.max_attempts,
+    jobs.timeout_ms,
+    jobs.created_at,
+    jobs.updated_at,
+    jobs.finished_at,
+    jobs.cancel_requested_at,
+    latest_failure.error_code AS latest_failure_error_code,
+    latest_failure.error_message AS latest_failure_error_message
 FROM jobs
-WHERE id = $1
+LEFT JOIN LATERAL (
+    SELECT error_code, error_message
+    FROM job_attempts
+    WHERE job_id = jobs.id
+      AND error_code IS NOT NULL
+    ORDER BY attempt_no DESC
+    LIMIT 1
+) AS latest_failure ON true
+WHERE jobs.id = $1
 `
 
 type GetJobRow struct {
-	ID           uuid.UUID
-	JobType      string
-	Payload      []byte
-	Result       []byte
-	Status       string
-	AttemptCount int32
-	MaxAttempts  int32
-	TimeoutMs    int64
-	CreatedAt    pgtype.Timestamptz
-	UpdatedAt    pgtype.Timestamptz
-	FinishedAt   pgtype.Timestamptz
+	ID                        uuid.UUID
+	JobType                   string
+	Payload                   []byte
+	Result                    []byte
+	Status                    string
+	AttemptCount              int32
+	MaxAttempts               int32
+	TimeoutMs                 int64
+	CreatedAt                 pgtype.Timestamptz
+	UpdatedAt                 pgtype.Timestamptz
+	FinishedAt                pgtype.Timestamptz
+	CancelRequestedAt         pgtype.Timestamptz
+	LatestFailureErrorCode    pgtype.Text
+	LatestFailureErrorMessage pgtype.Text
 }
 
 func (q *Queries) GetJob(ctx context.Context, id uuid.UUID) (GetJobRow, error) {
@@ -47,6 +96,9 @@ func (q *Queries) GetJob(ctx context.Context, id uuid.UUID) (GetJobRow, error) {
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.FinishedAt,
+		&i.CancelRequestedAt,
+		&i.LatestFailureErrorCode,
+		&i.LatestFailureErrorMessage,
 	)
 	return i, err
 }
@@ -120,6 +172,7 @@ SELECT
     created_at,
     updated_at,
     finished_at,
+    cancel_requested_at,
     request_hash
 FROM jobs
 WHERE job_type = $1 AND idempotency_key = $2
@@ -131,18 +184,19 @@ type GetJobByIdempotencyKeyParams struct {
 }
 
 type GetJobByIdempotencyKeyRow struct {
-	ID           uuid.UUID
-	JobType      string
-	Payload      []byte
-	Result       []byte
-	Status       string
-	AttemptCount int32
-	MaxAttempts  int32
-	TimeoutMs    int64
-	CreatedAt    pgtype.Timestamptz
-	UpdatedAt    pgtype.Timestamptz
-	FinishedAt   pgtype.Timestamptz
-	RequestHash  []byte
+	ID                uuid.UUID
+	JobType           string
+	Payload           []byte
+	Result            []byte
+	Status            string
+	AttemptCount      int32
+	MaxAttempts       int32
+	TimeoutMs         int64
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
+	FinishedAt        pgtype.Timestamptz
+	CancelRequestedAt pgtype.Timestamptz
+	RequestHash       []byte
 }
 
 func (q *Queries) GetJobByIdempotencyKey(ctx context.Context, arg GetJobByIdempotencyKeyParams) (GetJobByIdempotencyKeyRow, error) {
@@ -160,9 +214,51 @@ func (q *Queries) GetJobByIdempotencyKey(ctx context.Context, arg GetJobByIdempo
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.FinishedAt,
+		&i.CancelRequestedAt,
 		&i.RequestHash,
 	)
 	return i, err
+}
+
+const lockJobForCancellation = `-- name: LockJobForCancellation :one
+SELECT status, cancel_requested_at
+FROM jobs
+WHERE id = $1
+FOR UPDATE
+`
+
+type LockJobForCancellationRow struct {
+	Status            string
+	CancelRequestedAt pgtype.Timestamptz
+}
+
+func (q *Queries) LockJobForCancellation(ctx context.Context, id uuid.UUID) (LockJobForCancellationRow, error) {
+	row := q.db.QueryRow(ctx, lockJobForCancellation, id)
+	var i LockJobForCancellationRow
+	err := row.Scan(&i.Status, &i.CancelRequestedAt)
+	return i, err
+}
+
+const requestRunningJobCancellation = `-- name: RequestRunningJobCancellation :execrows
+UPDATE jobs
+SET cancel_requested_at = $1,
+    updated_at = $1
+WHERE id = $2
+  AND status = 'running'
+  AND cancel_requested_at IS NULL
+`
+
+type RequestRunningJobCancellationParams struct {
+	TransitionTime pgtype.Timestamptz
+	JobID          uuid.UUID
+}
+
+func (q *Queries) RequestRunningJobCancellation(ctx context.Context, arg RequestRunningJobCancellationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, requestRunningJobCancellation, arg.TransitionTime, arg.JobID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const submitJob = `-- name: SubmitJob :one
@@ -199,7 +295,8 @@ RETURNING
     timeout_ms,
     created_at,
     updated_at,
-    finished_at
+    finished_at,
+    cancel_requested_at
 `
 
 type SubmitJobParams struct {
@@ -213,17 +310,18 @@ type SubmitJobParams struct {
 }
 
 type SubmitJobRow struct {
-	ID           uuid.UUID
-	JobType      string
-	Payload      []byte
-	Result       []byte
-	Status       string
-	AttemptCount int32
-	MaxAttempts  int32
-	TimeoutMs    int64
-	CreatedAt    pgtype.Timestamptz
-	UpdatedAt    pgtype.Timestamptz
-	FinishedAt   pgtype.Timestamptz
+	ID                uuid.UUID
+	JobType           string
+	Payload           []byte
+	Result            []byte
+	Status            string
+	AttemptCount      int32
+	MaxAttempts       int32
+	TimeoutMs         int64
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
+	FinishedAt        pgtype.Timestamptz
+	CancelRequestedAt pgtype.Timestamptz
 }
 
 func (q *Queries) SubmitJob(ctx context.Context, arg SubmitJobParams) (SubmitJobRow, error) {
@@ -249,6 +347,7 @@ func (q *Queries) SubmitJob(ctx context.Context, arg SubmitJobParams) (SubmitJob
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.FinishedAt,
+		&i.CancelRequestedAt,
 	)
 	return i, err
 }

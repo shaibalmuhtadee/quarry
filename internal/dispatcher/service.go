@@ -178,9 +178,10 @@ func (service *Service) Heartbeat(
 			state = dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID
 		}
 		response.Attempts[i] = &dispatcherv1.HeartbeatAttemptResult{
-			JobId:     result.Attempt.JobID.String(),
-			AttemptNo: uint32(result.Attempt.AttemptNumber.Int32()),
-			State:     state,
+			JobId:           result.Attempt.JobID.String(),
+			AttemptNo:       uint32(result.Attempt.AttemptNumber.Int32()),
+			State:           state,
+			CancelRequested: result.Valid && result.CancelRequested,
 		}
 	}
 

@@ -75,6 +75,7 @@ func TestMigrationsApplyRollbackAndReapply(t *testing.T) {
 	verifyAttemptFailureBackfill(t, ctx, db)
 	applyMigrations(t, ctx, db, migrationDirectory)
 	verifyIdempotencyMigrationExistingJob(t, ctx, db)
+	verifyCancellationMigrationExistingJob(t, ctx, db)
 	verifySchema(t, ctx, db)
 
 	if err := goose.DownToContext(ctx, db, migrationDirectory, 0); err != nil {
@@ -104,7 +105,23 @@ func applyMigrations(t *testing.T, ctx context.Context, db *sql.DB, directory st
 	if err := goose.UpContext(ctx, db, directory); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
-	verifyVersion(t, ctx, db, 6)
+	verifyVersion(t, ctx, db, 7)
+}
+
+func verifyCancellationMigrationExistingJob(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+
+	var cancellationIsNull bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT cancel_requested_at IS NULL
+		FROM jobs
+		WHERE id = '00000000-0000-0000-0000-000000000021'
+	`).Scan(&cancellationIsNull); err != nil {
+		t.Fatalf("read existing job after cancellation migration: %v", err)
+	}
+	if !cancellationIsNull {
+		t.Fatal("existing job cancellation request is not null")
+	}
 }
 
 func seedPreLeaseRunningJob(t *testing.T, ctx context.Context, db *sql.DB) {

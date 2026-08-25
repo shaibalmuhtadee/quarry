@@ -42,8 +42,9 @@ type HeartbeatAttempt struct {
 }
 
 type HeartbeatResult struct {
-	Attempt HeartbeatAttempt
-	Valid   bool
+	Attempt         HeartbeatAttempt
+	Valid           bool
+	CancelRequested bool
 }
 
 type DispatcherStore struct {
@@ -182,7 +183,7 @@ func (store *DispatcherStore) Heartbeat(
 
 	results := make([]HeartbeatResult, len(attempts))
 	for i, attempt := range attempts {
-		renewedRows, err := queries.RenewAttemptLease(ctx, postgresdb.RenewAttemptLeaseParams{
+		cancelRequested, err := queries.RenewAttemptLease(ctx, postgresdb.RenewAttemptLeaseParams{
 			LeaseDurationMs: store.leaseDuration.Milliseconds(),
 			JobID:           attempt.JobID.UUID(),
 			AttemptNo:       attempt.AttemptNumber.Int32(),
@@ -191,15 +192,17 @@ func (store *DispatcherStore) Heartbeat(
 				Valid: true,
 			},
 		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			results[i] = HeartbeatResult{Attempt: attempt}
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("renew attempt lease: %w", err)
 		}
-		if renewedRows > 1 {
-			return nil, errors.New("attempt heartbeat updated an unexpected number of jobs")
-		}
 		results[i] = HeartbeatResult{
-			Attempt: attempt,
-			Valid:   renewedRows == 1,
+			Attempt:         attempt,
+			Valid:           true,
+			CancelRequested: cancelRequested,
 		}
 	}
 
@@ -240,8 +243,12 @@ func (store *DispatcherStore) RecoverExpiredAttempts(
 			return 0, fmt.Errorf("parse expired attempt number: %w", err)
 		}
 		jobStatus := domain.JobStatusRetryWait
+		attemptStatus := domain.AttemptStatusAbandoned
 		var retryDelay time.Duration
-		if expired.AttemptCount >= expired.MaxAttempts {
+		if expired.CancelRequestedAt.Valid {
+			jobStatus = domain.JobStatusCancelled
+			attemptStatus = domain.AttemptStatusCancelled
+		} else if expired.AttemptCount >= expired.MaxAttempts {
 			jobStatus = domain.JobStatusDeadLettered
 		} else {
 			retryDelay, err = store.retryPolicy.Delay(attemptNumber)
@@ -257,11 +264,20 @@ func (store *DispatcherStore) RecoverExpiredAttempts(
 			return 0, errors.New("expired attempt transition time is null")
 		}
 
-		attemptRows, err := queries.AbandonExpiredAttempt(ctx, postgresdb.AbandonExpiredAttemptParams{
-			TransitionTime: transitionTime,
-			JobID:          expired.ID,
-			AttemptNo:      expired.AttemptCount,
-		})
+		var attemptRows int64
+		if attemptStatus == domain.AttemptStatusCancelled {
+			attemptRows, err = queries.CancelExpiredAttempt(ctx, postgresdb.CancelExpiredAttemptParams{
+				TransitionTime: transitionTime,
+				JobID:          expired.ID,
+				AttemptNo:      expired.AttemptCount,
+			})
+		} else {
+			attemptRows, err = queries.AbandonExpiredAttempt(ctx, postgresdb.AbandonExpiredAttemptParams{
+				TransitionTime: transitionTime,
+				JobID:          expired.ID,
+				AttemptNo:      expired.AttemptCount,
+			})
+		}
 		if err != nil {
 			return 0, fmt.Errorf("abandon expired attempt: %w", err)
 		}
@@ -326,6 +342,12 @@ func (store *DispatcherStore) ReportAttempt(
 	}
 	if report.AttemptCount != attemptNumber.Int32() || report.WorkerID != workerID.UUID() {
 		return ErrAttemptReportConflict
+	}
+	if report.CancelRequestedAt.Valid && outcome.Kind() != domain.AttemptOutcomeKindSucceeded {
+		attemptStatus, jobStatus, resultJSON, failure, err = cancellationRequestedTransition()
+		if err != nil {
+			return err
+		}
 	}
 	if jobStatus == domain.JobStatusRetryWait && report.AttemptCount >= report.MaxAttempts {
 		jobStatus = domain.JobStatusDeadLettered
@@ -404,6 +426,20 @@ func (store *DispatcherStore) ReportAttempt(
 	}
 
 	return nil
+}
+
+func cancellationRequestedTransition() (
+	domain.AttemptStatus,
+	domain.JobStatus,
+	[]byte,
+	*domain.AttemptFailure,
+	error,
+) {
+	failure, err := domain.NewAttemptFailure("cancellation_requested", "job cancellation was requested")
+	if err != nil {
+		return "", "", nil, nil, err
+	}
+	return domain.AttemptStatusCancelled, domain.JobStatusCancelled, nil, &failure, nil
 }
 
 func reportTransition(

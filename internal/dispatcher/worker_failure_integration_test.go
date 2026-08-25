@@ -160,6 +160,7 @@ func testWorkerFailureThroughGRPCAndPostgres(
 		IdleBackoffMin: time.Millisecond, IdleBackoffMax: 2 * time.Millisecond,
 		ReportBackoffMin: time.Millisecond, ReportBackoffMax: 2 * time.Millisecond,
 		HeartbeatInterval: 5 * time.Millisecond,
+		ShutdownTimeout:   time.Second,
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {

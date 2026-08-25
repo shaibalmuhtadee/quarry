@@ -16,11 +16,12 @@ import (
 )
 
 type JobStore struct {
+	pool    *pgxpool.Pool
 	queries *postgresdb.Queries
 }
 
 func NewJobStore(pool *pgxpool.Pool) *JobStore {
-	return &JobStore{queries: postgresdb.New(pool)}
+	return &JobStore{pool: pool, queries: postgresdb.New(pool)}
 }
 
 func (store *JobStore) SubmitJob(ctx context.Context, submission domain.JobSubmission) (domain.JobSubmissionResult, error) {
@@ -53,17 +54,18 @@ func (store *JobStore) SubmitJob(ctx context.Context, submission domain.JobSubmi
 			return domain.JobSubmissionResult{}, domain.ErrIdempotencyConflict
 		}
 		job, mapErr := mapJob(jobRecord{
-			id:           existing.ID,
-			jobType:      existing.JobType,
-			payload:      existing.Payload,
-			result:       existing.Result,
-			status:       existing.Status,
-			attemptCount: existing.AttemptCount,
-			maxAttempts:  existing.MaxAttempts,
-			timeoutMS:    existing.TimeoutMs,
-			createdAt:    existing.CreatedAt,
-			updatedAt:    existing.UpdatedAt,
-			finishedAt:   existing.FinishedAt,
+			id:                existing.ID,
+			jobType:           existing.JobType,
+			payload:           existing.Payload,
+			result:            existing.Result,
+			status:            existing.Status,
+			attemptCount:      existing.AttemptCount,
+			maxAttempts:       existing.MaxAttempts,
+			timeoutMS:         existing.TimeoutMs,
+			createdAt:         existing.CreatedAt,
+			updatedAt:         existing.UpdatedAt,
+			finishedAt:        existing.FinishedAt,
+			cancelRequestedAt: existing.CancelRequestedAt,
 		})
 		if mapErr != nil {
 			return domain.JobSubmissionResult{}, fmt.Errorf("map deduplicated job: %w", mapErr)
@@ -75,17 +77,18 @@ func (store *JobStore) SubmitJob(ctx context.Context, submission domain.JobSubmi
 	}
 
 	job, err := mapJob(jobRecord{
-		id:           row.ID,
-		jobType:      row.JobType,
-		payload:      row.Payload,
-		result:       row.Result,
-		status:       row.Status,
-		attemptCount: row.AttemptCount,
-		maxAttempts:  row.MaxAttempts,
-		timeoutMS:    row.TimeoutMs,
-		createdAt:    row.CreatedAt,
-		updatedAt:    row.UpdatedAt,
-		finishedAt:   row.FinishedAt,
+		id:                row.ID,
+		jobType:           row.JobType,
+		payload:           row.Payload,
+		result:            row.Result,
+		status:            row.Status,
+		attemptCount:      row.AttemptCount,
+		maxAttempts:       row.MaxAttempts,
+		timeoutMS:         row.TimeoutMs,
+		createdAt:         row.CreatedAt,
+		updatedAt:         row.UpdatedAt,
+		finishedAt:        row.FinishedAt,
+		cancelRequestedAt: row.CancelRequestedAt,
 	})
 	if err != nil {
 		return domain.JobSubmissionResult{}, fmt.Errorf("map submitted job: %w", err)
@@ -104,20 +107,96 @@ func (store *JobStore) GetJob(ctx context.Context, id domain.JobID) (domain.Job,
 	}
 
 	job, err := mapJob(jobRecord{
-		id:           row.ID,
-		jobType:      row.JobType,
-		payload:      row.Payload,
-		result:       row.Result,
-		status:       row.Status,
-		attemptCount: row.AttemptCount,
-		maxAttempts:  row.MaxAttempts,
-		timeoutMS:    row.TimeoutMs,
-		createdAt:    row.CreatedAt,
-		updatedAt:    row.UpdatedAt,
-		finishedAt:   row.FinishedAt,
+		id:                   row.ID,
+		jobType:              row.JobType,
+		payload:              row.Payload,
+		result:               row.Result,
+		status:               row.Status,
+		attemptCount:         row.AttemptCount,
+		maxAttempts:          row.MaxAttempts,
+		timeoutMS:            row.TimeoutMs,
+		createdAt:            row.CreatedAt,
+		updatedAt:            row.UpdatedAt,
+		finishedAt:           row.FinishedAt,
+		cancelRequestedAt:    row.CancelRequestedAt,
+		latestFailureCode:    row.LatestFailureErrorCode,
+		latestFailureMessage: row.LatestFailureErrorMessage,
 	})
 	if err != nil {
 		return domain.Job{}, fmt.Errorf("map stored job: %w", err)
+	}
+
+	return job, nil
+}
+
+func (store *JobStore) RequestCancellation(ctx context.Context, id domain.JobID) (domain.Job, error) {
+	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.Job{}, fmt.Errorf("begin job cancellation: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	queries := postgresdb.New(tx)
+	state, err := queries.LockJobForCancellation(ctx, id.UUID())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Job{}, domain.ErrJobNotFound
+	}
+	if err != nil {
+		return domain.Job{}, fmt.Errorf("lock job for cancellation: %w", err)
+	}
+
+	transition, err := domain.PlanJobCancellation(domain.JobStatus(state.Status), state.CancelRequestedAt.Valid)
+	if err != nil {
+		return domain.Job{}, err
+	}
+	if transition != domain.JobCancellationNoChange {
+		transitionTime, err := queries.GetTransitionTime(ctx)
+		if err != nil {
+			return domain.Job{}, fmt.Errorf("read cancellation transition time: %w", err)
+		}
+		if !transitionTime.Valid {
+			return domain.Job{}, errors.New("cancellation transition time is null")
+		}
+
+		var changedRows int64
+		switch transition {
+		case domain.JobCancellationFinish:
+			changedRows, err = queries.CancelPendingJob(ctx, postgresdb.CancelPendingJobParams{
+				TransitionTime: transitionTime,
+				JobID:          id.UUID(),
+			})
+		case domain.JobCancellationRequest:
+			changedRows, err = queries.RequestRunningJobCancellation(ctx, postgresdb.RequestRunningJobCancellationParams{
+				TransitionTime: transitionTime,
+				JobID:          id.UUID(),
+			})
+		default:
+			return domain.Job{}, errors.New("invalid job cancellation transition")
+		}
+		if err != nil {
+			return domain.Job{}, fmt.Errorf("request job cancellation: %w", err)
+		}
+		if changedRows != 1 {
+			return domain.Job{}, errors.New("job cancellation updated an unexpected number of rows")
+		}
+	}
+
+	row, err := queries.GetJob(ctx, id.UUID())
+	if err != nil {
+		return domain.Job{}, fmt.Errorf("get cancelled job: %w", err)
+	}
+	job, err := mapJob(jobRecord{
+		id: row.ID, jobType: row.JobType, payload: row.Payload, result: row.Result,
+		status: row.Status, attemptCount: row.AttemptCount, maxAttempts: row.MaxAttempts,
+		timeoutMS: row.TimeoutMs, createdAt: row.CreatedAt, updatedAt: row.UpdatedAt,
+		finishedAt: row.FinishedAt, cancelRequestedAt: row.CancelRequestedAt,
+		latestFailureCode: row.LatestFailureErrorCode, latestFailureMessage: row.LatestFailureErrorMessage,
+	})
+	if err != nil {
+		return domain.Job{}, fmt.Errorf("map cancelled job: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Job{}, fmt.Errorf("commit job cancellation: %w", err)
 	}
 
 	return job, nil
@@ -148,17 +227,20 @@ func (store *JobStore) ListJobAttempts(ctx context.Context, id domain.JobID) ([]
 }
 
 type jobRecord struct {
-	id           uuid.UUID
-	jobType      string
-	payload      []byte
-	result       []byte
-	status       string
-	attemptCount int32
-	maxAttempts  int32
-	timeoutMS    int64
-	createdAt    pgtype.Timestamptz
-	updatedAt    pgtype.Timestamptz
-	finishedAt   pgtype.Timestamptz
+	id                   uuid.UUID
+	jobType              string
+	payload              []byte
+	result               []byte
+	status               string
+	attemptCount         int32
+	maxAttempts          int32
+	timeoutMS            int64
+	createdAt            pgtype.Timestamptz
+	updatedAt            pgtype.Timestamptz
+	finishedAt           pgtype.Timestamptz
+	cancelRequestedAt    pgtype.Timestamptz
+	latestFailureCode    pgtype.Text
+	latestFailureMessage pgtype.Text
 }
 
 func mapJob(record jobRecord) (domain.Job, error) {
@@ -193,19 +275,39 @@ func mapJob(record jobRecord) (domain.Job, error) {
 	if record.finishedAt.Valid {
 		finishedAt = &record.finishedAt.Time
 	}
+	var cancelRequestedAt *time.Time
+	if record.cancelRequestedAt.Valid {
+		cancelRequestedAt = &record.cancelRequestedAt.Time
+	}
+	var latestFailure *domain.AttemptFailure
+	if record.latestFailureCode.Valid != record.latestFailureMessage.Valid {
+		return domain.Job{}, errors.New("job has incomplete latest failure details")
+	}
+	if record.latestFailureCode.Valid {
+		parsedFailure, err := domain.NewAttemptFailure(
+			record.latestFailureCode.String,
+			record.latestFailureMessage.String,
+		)
+		if err != nil {
+			return domain.Job{}, err
+		}
+		latestFailure = &parsedFailure
+	}
 
 	return domain.Job{
-		ID:           id,
-		Type:         jobType,
-		Payload:      payload,
-		Result:       result,
-		Status:       status,
-		AttemptCount: record.attemptCount,
-		MaxAttempts:  record.maxAttempts,
-		Timeout:      time.Duration(record.timeoutMS) * time.Millisecond,
-		CreatedAt:    record.createdAt.Time,
-		UpdatedAt:    record.updatedAt.Time,
-		FinishedAt:   finishedAt,
+		ID:                id,
+		Type:              jobType,
+		Payload:           payload,
+		Result:            result,
+		LatestFailure:     latestFailure,
+		Status:            status,
+		AttemptCount:      record.attemptCount,
+		MaxAttempts:       record.maxAttempts,
+		Timeout:           time.Duration(record.timeoutMS) * time.Millisecond,
+		CreatedAt:         record.createdAt.Time,
+		UpdatedAt:         record.updatedAt.Time,
+		FinishedAt:        finishedAt,
+		CancelRequestedAt: cancelRequestedAt,
 	}, nil
 }
 

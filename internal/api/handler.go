@@ -20,6 +20,7 @@ const (
 type JobStore interface {
 	SubmitJob(context.Context, domain.JobSubmission) (domain.JobSubmissionResult, error)
 	GetJob(context.Context, domain.JobID) (domain.Job, error)
+	RequestCancellation(context.Context, domain.JobID) (domain.Job, error)
 	ListJobAttempts(context.Context, domain.JobID) ([]domain.Attempt, error)
 }
 
@@ -36,6 +37,7 @@ func NewHandler(store JobStore, readiness ReadinessChecker, logger *slog.Logger)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/jobs", handler.createJob)
 	mux.HandleFunc("GET /v1/jobs/{id}", handler.getJob)
+	mux.HandleFunc("POST /v1/jobs/{id}/cancel", handler.cancelJob)
 	mux.HandleFunc("GET /v1/jobs/{id}/attempts", handler.getJobAttempts)
 	mux.HandleFunc("GET /healthz", handler.health)
 	mux.HandleFunc("GET /readyz", handler.ready)
@@ -58,16 +60,23 @@ type createJobResponse struct {
 }
 
 type jobResponse struct {
-	ID           string           `json:"id"`
-	Type         string           `json:"type"`
-	Status       domain.JobStatus `json:"status"`
-	AttemptCount int32            `json:"attempt_count"`
-	MaxAttempts  int32            `json:"max_attempts"`
-	TimeoutMS    int64            `json:"timeout_ms"`
-	Result       json.RawMessage  `json:"result"`
-	CreatedAt    time.Time        `json:"created_at"`
-	UpdatedAt    time.Time        `json:"updated_at"`
-	FinishedAt   *time.Time       `json:"finished_at"`
+	ID                string           `json:"id"`
+	Type              string           `json:"type"`
+	Status            domain.JobStatus `json:"status"`
+	AttemptCount      int32            `json:"attempt_count"`
+	MaxAttempts       int32            `json:"max_attempts"`
+	TimeoutMS         int64            `json:"timeout_ms"`
+	Result            json.RawMessage  `json:"result"`
+	CreatedAt         time.Time        `json:"created_at"`
+	UpdatedAt         time.Time        `json:"updated_at"`
+	FinishedAt        *time.Time       `json:"finished_at"`
+	CancelRequestedAt *time.Time       `json:"cancel_requested_at"`
+	LatestFailure     *failureResponse `json:"latest_failure,omitempty"`
+}
+
+type failureResponse struct {
+	ErrorCode    string `json:"error_code"`
+	ErrorMessage string `json:"error_message"`
 }
 
 type jobAttemptsResponse struct {
@@ -218,21 +227,59 @@ func (handler *handler) getJob(writer http.ResponseWriter, request *http.Request
 		return
 	}
 
+	writeJobResponse(writer, http.StatusOK, job)
+}
+
+func (handler *handler) cancelJob(writer http.ResponseWriter, request *http.Request) {
+	id, err := domain.ParseJobID(request.PathValue("id"))
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_job_id", "job ID must be a valid UUID")
+		return
+	}
+	setRequestJobID(request, id.String())
+
+	job, err := handler.store.RequestCancellation(request.Context(), id)
+	if errors.Is(err, domain.ErrJobNotFound) {
+		writeError(writer, http.StatusNotFound, "job_not_found", "job not found")
+		return
+	}
+	if errors.Is(err, domain.ErrJobCancellationConflict) {
+		writeError(writer, http.StatusConflict, "cancellation_conflict", "job is already complete and cannot be cancelled")
+		return
+	}
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+
+	writeJobResponse(writer, http.StatusOK, job)
+}
+
+func writeJobResponse(writer http.ResponseWriter, status int, job domain.Job) {
 	var result json.RawMessage
 	if job.Result != nil {
 		result = job.Result.JSON()
 	}
-	writeJSON(writer, http.StatusOK, jobResponse{
-		ID:           job.ID.String(),
-		Type:         job.Type.String(),
-		Status:       job.Status,
-		AttemptCount: job.AttemptCount,
-		MaxAttempts:  job.MaxAttempts,
-		TimeoutMS:    job.Timeout.Milliseconds(),
-		Result:       result,
-		CreatedAt:    job.CreatedAt,
-		UpdatedAt:    job.UpdatedAt,
-		FinishedAt:   job.FinishedAt,
+	var latestFailure *failureResponse
+	if job.LatestFailure != nil {
+		latestFailure = &failureResponse{
+			ErrorCode:    job.LatestFailure.Code(),
+			ErrorMessage: job.LatestFailure.Message(),
+		}
+	}
+	writeJSON(writer, status, jobResponse{
+		ID:                job.ID.String(),
+		Type:              job.Type.String(),
+		Status:            job.Status,
+		AttemptCount:      job.AttemptCount,
+		MaxAttempts:       job.MaxAttempts,
+		TimeoutMS:         job.Timeout.Milliseconds(),
+		Result:            result,
+		CreatedAt:         job.CreatedAt,
+		UpdatedAt:         job.UpdatedAt,
+		FinishedAt:        job.FinishedAt,
+		CancelRequestedAt: job.CancelRequestedAt,
+		LatestFailure:     latestFailure,
 	})
 }
 

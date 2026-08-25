@@ -487,6 +487,17 @@ func TestActiveAttemptsTrackIdentityAndCancelOnlyTheStaleAttempt(t *testing.T) {
 	if len(snapshot) != 2 || !slices.Contains(snapshot, first.identity) || !slices.Contains(snapshot, second.identity) {
 		t.Fatalf("active snapshot = %#v", snapshot)
 	}
+	if !active.signal(first.identity, errCancellationRequested) {
+		t.Fatal("active attempt did not receive cancellation signal")
+	}
+	if !errors.Is(context.Cause(first.handlerCtx), errCancellationRequested) || context.Cause(first.ctx) != nil || active.len() != 2 {
+		t.Fatalf("cancellation signal changed attempt lifetime: handler cause %v, attempt cause %v, active %d", context.Cause(first.handlerCtx), context.Cause(first.ctx), active.len())
+	}
+	select {
+	case <-second.handlerCtx.Done():
+		t.Fatalf("unrelated handler was canceled: %v", context.Cause(second.handlerCtx))
+	default:
+	}
 	if !active.cancel(first.identity, errLeaseStale) {
 		t.Fatal("stale attempt was not removed")
 	}
@@ -500,6 +511,130 @@ func TestActiveAttemptsTrackIdentityAndCancelOnlyTheStaleAttempt(t *testing.T) {
 	}
 	if active.len() != 1 || !active.remove(second, nil) || active.len() != 0 {
 		t.Fatalf("active registry did not converge to empty")
+	}
+}
+
+func TestWorkerCancelsOnlyMatchingHandlerAndRetriesCancelledReport(t *testing.T) {
+	t.Parallel()
+
+	jobs := makeJobs(t, 2, "demo.cancel")
+	keepType, err := domain.ParseJobType("demo.keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs[1].Type = keepType
+	var acquired atomic.Bool
+	dispatcher := &fakeDispatcher{}
+	dispatcher.acquire = func(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error) {
+		if acquired.CompareAndSwap(false, true) {
+			return jobs, nil
+		}
+		return nil, nil
+	}
+
+	cancelHandlerStarted := make(chan struct{})
+	cancelHandlerStopped := make(chan error, 1)
+	keepHandlerStarted := make(chan struct{})
+	releaseKeepHandler := make(chan struct{})
+	keepHandlerCancelled := make(chan error, 1)
+	handlers := map[string]Handler{
+		"demo.cancel": func(ctx context.Context, _ domain.Payload) (domain.Result, error) {
+			close(cancelHandlerStarted)
+			<-ctx.Done()
+			cancelHandlerStopped <- context.Cause(ctx)
+			return domain.Result{}, ctx.Err()
+		},
+		"demo.keep": func(ctx context.Context, _ domain.Payload) (domain.Result, error) {
+			close(keepHandlerStarted)
+			select {
+			case <-ctx.Done():
+				keepHandlerCancelled <- context.Cause(ctx)
+				return domain.Result{}, ctx.Err()
+			case <-releaseKeepHandler:
+				return mustResult(t, `{"ok":true}`), nil
+			}
+		},
+	}
+
+	cancellationSent := make(chan struct{})
+	reportingHeartbeat := make(chan struct{})
+	var cancellationOnce, reportingHeartbeatOnce sync.Once
+	var reportCalls atomic.Int32
+	dispatcher.heartbeat = func(
+		_ context.Context,
+		_ domain.WorkerID,
+		attempts []HeartbeatAttempt,
+	) ([]HeartbeatResult, error) {
+		results := make([]HeartbeatResult, len(attempts))
+		for i, attempt := range attempts {
+			requestCancellation := attempt.JobID == jobs[0].ID
+			results[i] = HeartbeatResult{Attempt: attempt, Valid: true, CancelRequested: requestCancellation}
+			if requestCancellation {
+				cancellationOnce.Do(func() { close(cancellationSent) })
+				if reportCalls.Load() > 0 {
+					reportingHeartbeatOnce.Do(func() { close(reportingHeartbeat) })
+				}
+			}
+		}
+		return results, nil
+	}
+	cancelledReported := make(chan struct{})
+	keepReported := make(chan struct{})
+	var cancelledReportedOnce, keepReportedOnce sync.Once
+	dispatcher.report = func(
+		ctx context.Context,
+		_ domain.WorkerID,
+		jobID domain.JobID,
+		_ domain.AttemptNumber,
+		outcome domain.AttemptOutcome,
+	) error {
+		if jobID == jobs[0].ID {
+			if ctx.Err() != nil {
+				t.Errorf("cancelled report used a cancelled attempt context: %v", ctx.Err())
+			}
+			assertExecutionFailure(t, outcome, domain.AttemptOutcomeKindCancelled, cancellationRequestedCode, cancellationRequestedMessage)
+			if reportCalls.Add(1) == 1 {
+				return status.Error(codes.Unavailable, "temporary")
+			}
+			select {
+			case <-reportingHeartbeat:
+			case <-time.After(3 * time.Second):
+				return errors.New("cancelled attempt was not heartbeated while its report retried")
+			}
+			cancelledReportedOnce.Do(func() { close(cancelledReported) })
+			return nil
+		}
+		if outcome.Kind() != domain.AttemptOutcomeKindSucceeded {
+			t.Errorf("unrelated outcome = %q, want succeeded", outcome.Kind())
+		}
+		keepReportedOnce.Do(func() { close(keepReported) })
+		return nil
+	}
+
+	runtime := newTestWorker(t, dispatcher, 2, handlers)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runWorker(runtime, ctx)
+	awaitSignal(t, cancelHandlerStarted)
+	awaitSignal(t, keepHandlerStarted)
+	awaitSignal(t, cancellationSent)
+	if cause := <-cancelHandlerStopped; !errors.Is(cause, errCancellationRequested) {
+		t.Fatalf("cancelled handler cause = %v", cause)
+	}
+	awaitSignal(t, reportingHeartbeat)
+	awaitSignal(t, cancelledReported)
+	select {
+	case cause := <-keepHandlerCancelled:
+		t.Fatalf("unrelated handler was cancelled: %v", cause)
+	default:
+	}
+	close(releaseKeepHandler)
+	awaitSignal(t, keepReported)
+	cancel()
+	if err := awaitRun(t, done); err != nil {
+		t.Fatal(err)
+	}
+	if reportCalls.Load() < 2 {
+		t.Fatalf("cancelled report calls = %d, want at least 2", reportCalls.Load())
 	}
 }
 
@@ -750,6 +885,161 @@ func TestWorkerTreatsFailedPreconditionReportAsLostAttempt(t *testing.T) {
 	}
 }
 
+func TestWorkerDrainsActiveAttemptWithoutFurtherAcquisition(t *testing.T) {
+	job := makeJobs(t, 1, "demo.test")[0]
+	secondAcquireStarted := make(chan struct{})
+	var acquireCalls atomic.Int32
+	dispatcher := &fakeDispatcher{}
+	dispatcher.acquire = func(ctx context.Context, _ domain.WorkerID, _ uint32, _ []domain.JobType) ([]Job, error) {
+		switch acquireCalls.Add(1) {
+		case 1:
+			return []Job{job}, nil
+		case 2:
+			close(secondAcquireStarted)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		default:
+			t.Errorf("acquisition continued after shutdown signal")
+			return nil, nil
+		}
+	}
+	heartbeatedDuringDrain := make(chan struct{}, 1)
+	dispatcher.heartbeat = func(
+		_ context.Context,
+		_ domain.WorkerID,
+		attempts []HeartbeatAttempt,
+	) ([]HeartbeatResult, error) {
+		if len(attempts) == 1 {
+			select {
+			case heartbeatedDuringDrain <- struct{}{}:
+			default:
+			}
+		}
+		results := make([]HeartbeatResult, len(attempts))
+		for i, attempt := range attempts {
+			results[i] = HeartbeatResult{Attempt: attempt, Valid: true}
+		}
+		return results, nil
+	}
+	reported := make(chan struct{})
+	dispatcher.report = func(
+		context.Context,
+		domain.WorkerID,
+		domain.JobID,
+		domain.AttemptNumber,
+		domain.AttemptOutcome,
+	) error {
+		close(reported)
+		return nil
+	}
+	handlerStarted := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	runtime := newTestWorker(t, dispatcher, 2, map[string]Handler{
+		"demo.test": func(context.Context, domain.Payload) (domain.Result, error) {
+			close(handlerStarted)
+			<-releaseHandler
+			return mustResult(t, `{"ok":true}`), nil
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runWorker(runtime, ctx)
+	awaitSignal(t, handlerStarted)
+	awaitSignal(t, secondAcquireStarted)
+	cancel()
+	awaitSignal(t, heartbeatedDuringDrain)
+	close(releaseHandler)
+	awaitSignal(t, reported)
+	if err := awaitRun(t, done); err != nil {
+		t.Fatal(err)
+	}
+	if calls := acquireCalls.Load(); calls != 2 {
+		t.Fatalf("acquisition calls = %d, want 2", calls)
+	}
+}
+
+func TestWorkerShutdownDeadlineCancelsAttemptWithoutReporting(t *testing.T) {
+	job := makeJobs(t, 1, "demo.test")[0]
+	var acquired atomic.Bool
+	var reports atomic.Int32
+	dispatcher := &fakeDispatcher{}
+	dispatcher.acquire = func(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error) {
+		if acquired.CompareAndSwap(false, true) {
+			return []Job{job}, nil
+		}
+		return nil, nil
+	}
+	dispatcher.report = func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error {
+		reports.Add(1)
+		return nil
+	}
+	handlerStarted := make(chan struct{})
+	shutdownCause := make(chan error, 1)
+	runtime := newTestWorker(t, dispatcher, 1, map[string]Handler{
+		"demo.test": func(ctx context.Context, _ domain.Payload) (domain.Result, error) {
+			close(handlerStarted)
+			<-ctx.Done()
+			shutdownCause <- context.Cause(ctx)
+			return domain.Result{}, ctx.Err()
+		},
+	})
+	runtime.shutdownTimeout = 20 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runWorker(runtime, ctx)
+	awaitSignal(t, handlerStarted)
+	cancel()
+	if err := awaitRun(t, done); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case cause := <-shutdownCause:
+		if !errors.Is(cause, errWorkerShutdown) {
+			t.Fatalf("handler cancellation cause = %v, want worker shutdown", cause)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler context was not cancelled at shutdown deadline")
+	}
+	if got := reports.Load(); got != 0 {
+		t.Fatalf("attempt reports = %d, want 0", got)
+	}
+}
+
+func TestWorkerShutdownDeadlineDoesNotWaitForHandlerIgnoringContext(t *testing.T) {
+	job := makeJobs(t, 1, "demo.test")[0]
+	var acquired atomic.Bool
+	dispatcher := &fakeDispatcher{}
+	dispatcher.acquire = func(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error) {
+		if acquired.CompareAndSwap(false, true) {
+			return []Job{job}, nil
+		}
+		return nil, nil
+	}
+	dispatcher.report = func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error {
+		t.Error("worker reported an unfinished attempt during forced shutdown")
+		return nil
+	}
+	handlerStarted := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	runtime := newTestWorker(t, dispatcher, 1, map[string]Handler{
+		"demo.test": func(context.Context, domain.Payload) (domain.Result, error) {
+			close(handlerStarted)
+			<-releaseHandler
+			return mustResult(t, `{"ok":true}`), nil
+		},
+	})
+	runtime.shutdownTimeout = 20 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runWorker(runtime, ctx)
+	awaitSignal(t, handlerStarted)
+	cancel()
+	if err := awaitRun(t, done); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseHandler)
+}
+
 func newTestWorker(
 	t *testing.T,
 	dispatcher Dispatcher,
@@ -804,6 +1094,7 @@ func newTestWorkerWithIDAndLogger(
 		ReportBackoffMin:  time.Millisecond,
 		ReportBackoffMax:  2 * time.Millisecond,
 		HeartbeatInterval: 5 * time.Millisecond,
+		ShutdownTimeout:   time.Second,
 		Logger:            logger,
 	})
 	if err != nil {

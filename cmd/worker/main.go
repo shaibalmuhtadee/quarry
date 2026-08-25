@@ -24,6 +24,7 @@ const (
 	defaultConcurrency       = uint32(4)
 	defaultVersion           = "dev"
 	defaultHeartbeatInterval = 5 * time.Second
+	defaultShutdownTimeout   = 10 * time.Second
 	rpcTimeout               = 5 * time.Second
 	idleBackoffMin           = 50 * time.Millisecond
 	idleBackoffMax           = time.Second
@@ -37,6 +38,7 @@ type config struct {
 	version           string
 	concurrency       uint32
 	heartbeatInterval time.Duration
+	shutdownTimeout   time.Duration
 }
 
 func main() {
@@ -89,6 +91,14 @@ func loadConfig() (config, error) {
 		}
 		heartbeatInterval = parsed
 	}
+	shutdownTimeout := defaultShutdownTimeout
+	if rawTimeout := os.Getenv("QUARRY_WORKER_SHUTDOWN_TIMEOUT"); rawTimeout != "" {
+		parsed, err := time.ParseDuration(rawTimeout)
+		if err != nil || parsed <= 0 {
+			return config{}, fmt.Errorf("QUARRY_WORKER_SHUTDOWN_TIMEOUT must be a positive duration")
+		}
+		shutdownTimeout = parsed
+	}
 
 	return config{
 		dispatcherAddress: dispatcherAddress,
@@ -96,6 +106,7 @@ func loadConfig() (config, error) {
 		version:           version,
 		concurrency:       concurrency,
 		heartbeatInterval: heartbeatInterval,
+		shutdownTimeout:   shutdownTimeout,
 	}, nil
 }
 
@@ -132,6 +143,7 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 		ReportBackoffMin:  reportBackoffMin,
 		ReportBackoffMax:  reportBackoffMax,
 		HeartbeatInterval: cfg.heartbeatInterval,
+		ShutdownTimeout:   cfg.shutdownTimeout,
 		Logger:            logger,
 	})
 	if err != nil {

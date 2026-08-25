@@ -4,7 +4,7 @@ param(
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
         "generate", "generate-check", "format-check", "vet", "build",
-        "smoke-test", "distributed-test", "recovery-test"
+        "smoke-test", "distributed-test", "recovery-test", "semantics-test"
     )]
     [string]$Command = "check"
 )
@@ -1099,6 +1099,457 @@ function Test-DistributedProcesses {
     }
 }
 
+function Build-LinuxWorkerBinary {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Output
+    )
+
+    $previousGOOS = $env:GOOS
+    $previousGOARCH = $env:GOARCH
+    $previousCGOEnabled = $env:CGO_ENABLED
+    try {
+        $env:GOOS = "linux"
+        $env:GOARCH = "amd64"
+        $env:CGO_ENABLED = "0"
+        Invoke-Go -Arguments @("build", "-o", $Output, "./cmd/worker")
+    }
+    finally {
+        $env:GOOS = $previousGOOS
+        $env:GOARCH = $previousGOARCH
+        $env:CGO_ENABLED = $previousCGOEnabled
+    }
+}
+
+function Start-SemanticsWorker {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ContainerName,
+
+        [Parameter(Mandatory)]
+        [string]$TemporaryDirectory,
+
+        [Parameter(Mandatory)]
+        [string]$DispatcherAddress,
+
+        [Parameter(Mandatory)]
+        [string]$HostName,
+
+        [Parameter(Mandatory)]
+        [string]$ShutdownTimeout
+    )
+
+    Invoke-Docker -Arguments @(
+        "run", "--detach",
+        "--name", $ContainerName,
+        "--add-host", "host.docker.internal:host-gateway",
+        "--volume", "${TemporaryDirectory}:/work:ro",
+        "--env", "QUARRY_DISPATCHER_ADDR=$DispatcherAddress",
+        "--env", "QUARRY_WORKER_CONCURRENCY=1",
+        "--env", "QUARRY_WORKER_HOSTNAME=$HostName",
+        "--env", "QUARRY_WORKER_VERSION=semantics-test",
+        "--env", "QUARRY_HEARTBEAT_INTERVAL=100ms",
+        "--env", "QUARRY_WORKER_SHUTDOWN_TIMEOUT=$ShutdownTimeout",
+        "postgres:18.6", "/work/quarry-worker-linux"
+    ) | Out-Null
+}
+
+function Test-SemanticsWorkerRunning {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ContainerName
+    )
+
+    $running = @(
+        Invoke-Docker -Arguments @(
+            "inspect", "--format", "{{.State.Running}}", $ContainerName
+        )
+    )
+    return $running.Count -eq 1 -and $running[0].Trim() -eq "true"
+}
+
+function Wait-SemanticsWorker {
+    param(
+        [Parameter(Mandatory)]
+        [string]$HostName,
+
+        [Parameter(Mandatory)]
+        [string]$ContainerName
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (-not (Test-SemanticsWorkerRunning -ContainerName $ContainerName)) {
+            throw "Semantics-test worker '$ContainerName' exited before registration."
+        }
+        $rows = @(
+            Invoke-PostgresRows -Query "SELECT id::text FROM workers WHERE hostname = '$HostName';" |
+                ForEach-Object { $_.Trim() } |
+                Where-Object { $_ -match '^[0-9a-f-]{36}$' }
+        )
+        if ($rows.Count -eq 1) {
+            return $rows[0]
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Semantics-test worker '$HostName' did not register within 30 seconds."
+}
+
+function Submit-SemanticsJob {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$Type,
+
+        [Parameter(Mandatory)]
+        [object]$Payload
+    )
+
+    $body = @{
+        type = $Type
+        payload = $Payload
+        max_attempts = 3
+        timeout_ms = 30000
+    } | ConvertTo-Json -Compress -Depth 4
+    $submitted = Invoke-RestMethod `
+        -Method Post `
+        -Uri "$BaseURL/v1/jobs" `
+        -ContentType "application/json" `
+        -Body $body `
+        -TimeoutSec 10
+    if ([string]::IsNullOrWhiteSpace($submitted.id) -or $submitted.status -ne "queued") {
+        throw "Semantics-test submission did not return a queued job with an ID."
+    }
+    return $submitted.id
+}
+
+function Wait-SemanticsAttemptRenewal {
+    param(
+        [Parameter(Mandatory)]
+        [string]$JobID,
+
+        [Parameter(Mandatory)]
+        [string]$ContainerName
+    )
+
+    $initial = $null
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (-not (Test-SemanticsWorkerRunning -ContainerName $ContainerName)) {
+            throw "Semantics-test worker exited before renewing job '$JobID'."
+        }
+        $state = Get-RecoveryAttemptOneState -JobID $JobID
+        if ($null -ne $state -and $state.Status -eq "running" -and $state.AttemptCount -eq "1") {
+            if ($null -eq $initial) {
+                $initial = $state
+            }
+            elseif ($state.WorkerID -eq $initial.WorkerID -and
+                $state.LeaseExpiresAt -ne $initial.LeaseExpiresAt -and
+                $state.LastSeenAt -ne $initial.LastSeenAt) {
+                return $state
+            }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Semantics-test job '$JobID' did not start and renew within 30 seconds."
+}
+
+function Stop-SemanticsWorkerGracefully {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ContainerName
+    )
+
+    Invoke-Docker -Arguments @("kill", "--signal", "SIGTERM", $ContainerName) | Out-Null
+    $exitCodes = @(Invoke-Docker -Arguments @("wait", $ContainerName))
+    if ($exitCodes.Count -ne 1 -or $exitCodes[0].Trim() -ne "0") {
+        throw "Semantics-test worker '$ContainerName' exited with '$($exitCodes -join ',')', expected 0."
+    }
+}
+
+function Remove-SemanticsWorker {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ContainerName
+    )
+
+    $existing = @(
+        Invoke-Docker -Arguments @(
+            "ps", "--all", "--quiet", "--filter", "name=^/$ContainerName$"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($existing.Count -gt 0) {
+        Invoke-Docker -Arguments @("rm", "--force", $ContainerName) | Out-Null
+    }
+}
+
+function Wait-SemanticsJobStatus {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedStatus,
+
+        [int]$TimeoutSeconds = 30
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $state = Invoke-RestMethod -Method Get -Uri "$BaseURL/v1/jobs/$JobID" -TimeoutSec 10
+        if ($state.status -eq $ExpectedStatus) {
+            return $state
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Semantics-test job '$JobID' did not reach '$ExpectedStatus' within $TimeoutSeconds seconds."
+}
+
+function Assert-SemanticsRows {
+    param(
+        [Parameter(Mandatory)]
+        [string]$GracefulJobID,
+
+        [Parameter(Mandatory)]
+        [string]$CancelledJobID,
+
+        [Parameter(Mandatory)]
+        [string]$ForcedJobID,
+
+        [Parameter(Mandatory)]
+        [string]$GracefulWorkerID,
+
+        [Parameter(Mandatory)]
+        [string]$ForcedWorkerID,
+
+        [Parameter(Mandatory)]
+        [string]$ReplacementWorkerID
+    )
+
+    $query = @"
+SELECT
+    jobs.id::text,
+    jobs.status,
+    jobs.attempt_count,
+    jobs.cancel_requested_at IS NOT NULL,
+    attempts.attempt_no,
+    attempts.worker_id::text,
+    attempts.status,
+    attempts.error_code,
+    attempts.finished_at IS NOT NULL
+FROM jobs
+LEFT JOIN job_attempts AS attempts ON attempts.job_id = jobs.id
+WHERE jobs.id IN (
+    '$GracefulJobID'::uuid,
+    '$CancelledJobID'::uuid,
+    '$ForcedJobID'::uuid
+)
+ORDER BY jobs.id, attempts.attempt_no;
+"@
+    $rows = @(
+        Invoke-PostgresRows -Query $query |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -match '\|' }
+    )
+    if ($rows.Count -ne 4) {
+        throw "PostgreSQL returned $($rows.Count) semantics rows, expected four."
+    }
+
+    $expected = @{
+        "$GracefulJobID|1" = @("succeeded", "1", "f", $GracefulWorkerID, "succeeded", "", "t")
+        "$CancelledJobID|" = @("cancelled", "0", "t", "", "", "", "f")
+        "$ForcedJobID|1" = @("succeeded", "2", "f", $ForcedWorkerID, "abandoned", "lease_expired", "t")
+        "$ForcedJobID|2" = @("succeeded", "2", "f", $ReplacementWorkerID, "succeeded", "", "t")
+    }
+    foreach ($row in $rows) {
+        $columns = $row.Split('|')
+        if ($columns.Count -ne 9) {
+            throw "PostgreSQL returned an unexpected semantics row: '$row'."
+        }
+        $key = "$($columns[0])|$($columns[4])"
+        if (-not $expected.ContainsKey($key)) {
+            throw "PostgreSQL returned an unexpected semantics row key '$key'."
+        }
+        $want = $expected[$key]
+        $actual = @($columns[1], $columns[2], $columns[3], $columns[5], $columns[6], $columns[7], $columns[8])
+        if (-not [System.Linq.Enumerable]::SequenceEqual([string[]]$actual, [string[]]$want)) {
+            throw "PostgreSQL semantics row '$row' did not match expected state."
+        }
+        $expected.Remove($key)
+    }
+    if ($expected.Count -ne 0) {
+        throw "PostgreSQL did not return every expected semantics row."
+    }
+}
+
+function Test-SemanticsProcesses {
+    $testID = [Guid]::NewGuid().ToString("N")
+    $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "quarry-semantics-$testID"
+    $apiBinary = Join-Path $temporaryDirectory "quarry-api.exe"
+    $dispatcherBinary = Join-Path $temporaryDirectory "quarry-dispatcher.exe"
+    if (-not $IsWindows) {
+        $apiBinary = Join-Path $temporaryDirectory "quarry-api"
+        $dispatcherBinary = Join-Path $temporaryDirectory "quarry-dispatcher"
+    }
+    $linuxWorkerBinary = Join-Path $temporaryDirectory "quarry-worker-linux"
+    $composeProject = "quarry-m4-$testID"
+    $gracefulContainer = "quarry-m4-graceful-$testID"
+    $forcedContainer = "quarry-m4-forced-$testID"
+    $replacementContainer = "quarry-m4-replacement-$testID"
+    $workerContainers = @($gracefulContainer, $forcedContainer, $replacementContainer)
+    $previousComposeProject = $env:COMPOSE_PROJECT_NAME
+    $previousPostgresPort = $env:QUARRY_POSTGRES_PORT
+    $apiProcess = $null
+    $dispatcherProcess = $null
+    $processIDs = [System.Collections.Generic.List[int]]::new()
+
+    $env:COMPOSE_PROJECT_NAME = $composeProject
+    $env:QUARRY_POSTGRES_PORT = [string](Get-AvailableLoopbackPort)
+    $databaseURL = Get-PostgresConnectionString
+
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        Invoke-Go -Arguments @("build", "-o", $apiBinary, "./cmd/api")
+        Invoke-Go -Arguments @("build", "-o", $dispatcherBinary, "./cmd/dispatcher")
+        Build-LinuxWorkerBinary -Output $linuxWorkerBinary
+        Invoke-Docker -Arguments @("compose", "up", "--detach", "--wait", "postgres")
+        Invoke-Goose -MigrationCommand "up"
+
+        $httpPort = Get-AvailableLoopbackPort
+        $dispatcherPort = Get-AvailableLoopbackPort
+        $httpAddress = "127.0.0.1:$httpPort"
+        $dispatcherListenAddress = "0.0.0.0:$dispatcherPort"
+        $containerDispatcherAddress = "host.docker.internal:$dispatcherPort"
+        $baseURL = "http://$httpAddress"
+        $apiProcess = Start-DistributedProcess -Binary $apiBinary -Environment @{
+            QUARRY_DATABASE_URL = $databaseURL
+            QUARRY_HTTP_ADDR = $httpAddress
+        }
+        $processIDs.Add($apiProcess.Id)
+        Wait-ApiReady -Process $apiProcess -BaseURL $baseURL
+        $dispatcherProcess = Start-DistributedProcess -Binary $dispatcherBinary -Environment @{
+            QUARRY_DATABASE_URL = $databaseURL
+            QUARRY_DISPATCHER_ADDR = $dispatcherListenAddress
+            QUARRY_LEASE_DURATION = "1s"
+            QUARRY_REAPER_INTERVAL = "100ms"
+            QUARRY_REAPER_BATCH_SIZE = "10"
+            QUARRY_WORKER_LIVENESS_TIMEOUT = "1s"
+            QUARRY_RETRY_BASE_DELAY = "1ms"
+            QUARRY_RETRY_MAX_DELAY = "1ms"
+        }
+        $processIDs.Add($dispatcherProcess.Id)
+        Wait-TcpReady -Process $dispatcherProcess -HostName "127.0.0.1" -Port $dispatcherPort -ProcessName "Dispatcher"
+
+        $gracefulJobID = Submit-SemanticsJob -BaseURL $baseURL -Type "demo.sleep" -Payload @{ duration_ms = 1500 }
+        $gracefulHost = "semantics-graceful-$testID"
+        Start-SemanticsWorker -ContainerName $gracefulContainer -TemporaryDirectory $temporaryDirectory `
+            -DispatcherAddress $containerDispatcherAddress -HostName $gracefulHost -ShutdownTimeout "3s"
+        $gracefulWorkerID = Wait-SemanticsWorker -HostName $gracefulHost -ContainerName $gracefulContainer
+        $null = Wait-SemanticsAttemptRenewal -JobID $gracefulJobID -ContainerName $gracefulContainer
+        $cancelledJobID = Submit-SemanticsJob -BaseURL $baseURL -Type "demo.echo" -Payload "must-not-run"
+        Stop-SemanticsWorkerGracefully -ContainerName $gracefulContainer
+        $null = Wait-SemanticsJobStatus -BaseURL $baseURL -JobID $gracefulJobID -ExpectedStatus "succeeded"
+        $queued = Invoke-RestMethod -Method Get -Uri "$baseURL/v1/jobs/$cancelledJobID" -TimeoutSec 10
+        if ($queued.status -ne "queued" -or $queued.attempt_count -ne 0) {
+            throw "Graceful worker acquired work after SIGTERM."
+        }
+        $cancelled = Invoke-RestMethod -Method Post -Uri "$baseURL/v1/jobs/$cancelledJobID/cancel" -TimeoutSec 10
+        if ($cancelled.status -ne "cancelled") {
+            throw "Queued semantics job did not cancel."
+        }
+
+        $forcedJobID = Submit-SemanticsJob -BaseURL $baseURL -Type "demo.sleep" -Payload @{ duration_ms = 1500 }
+        $forcedHost = "semantics-forced-$testID"
+        Start-SemanticsWorker -ContainerName $forcedContainer -TemporaryDirectory $temporaryDirectory `
+            -DispatcherAddress $containerDispatcherAddress -HostName $forcedHost -ShutdownTimeout "200ms"
+        $forcedWorkerID = Wait-SemanticsWorker -HostName $forcedHost -ContainerName $forcedContainer
+        $null = Wait-SemanticsAttemptRenewal -JobID $forcedJobID -ContainerName $forcedContainer
+        Stop-SemanticsWorkerGracefully -ContainerName $forcedContainer
+        $forcedRows = @(
+            Invoke-PostgresRows -Query @"
+SELECT jobs.status, jobs.attempt_count, jobs.cancel_requested_at IS NULL, attempts.status, attempts.finished_at IS NULL
+FROM jobs
+JOIN job_attempts AS attempts ON attempts.job_id = jobs.id
+WHERE jobs.id = '$forcedJobID'::uuid AND attempts.attempt_no = 1;
+"@ | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '\|' }
+        )
+        if ($forcedRows.Count -ne 1 -or $forcedRows[0] -ne "running|1|t|running|t") {
+            throw "Forced shutdown reported or cancelled unfinished attempt 1: '$($forcedRows -join ',')'."
+        }
+
+        $replacementHost = "semantics-replacement-$testID"
+        Start-SemanticsWorker -ContainerName $replacementContainer -TemporaryDirectory $temporaryDirectory `
+            -DispatcherAddress $containerDispatcherAddress -HostName $replacementHost -ShutdownTimeout "3s"
+        $replacementWorkerID = Wait-SemanticsWorker -HostName $replacementHost -ContainerName $replacementContainer
+        $finalState = Wait-SemanticsJobStatus -BaseURL $baseURL -JobID $forcedJobID -ExpectedStatus "succeeded" -TimeoutSeconds 30
+        if ($finalState.attempt_count -ne 2 -or $finalState.result.slept_ms -ne 1500) {
+            throw "Replacement attempt did not complete forced-shutdown job."
+        }
+        Stop-SemanticsWorkerGracefully -ContainerName $replacementContainer
+        Assert-SemanticsRows -GracefulJobID $gracefulJobID -CancelledJobID $cancelledJobID `
+            -ForcedJobID $forcedJobID -GracefulWorkerID $gracefulWorkerID `
+            -ForcedWorkerID $forcedWorkerID -ReplacementWorkerID $replacementWorkerID
+        Write-Host "Semantics process test passed: SIGTERM drain, acquisition stop, forced lease recovery, and PostgreSQL state verified."
+    }
+    finally {
+        try {
+            foreach ($container in $workerContainers) {
+                Remove-SemanticsWorker -ContainerName $container
+            }
+            foreach ($process in @($dispatcherProcess, $apiProcess)) {
+                if ($null -ne $process) {
+                    Stop-DistributedProcess -Process $process
+                }
+            }
+        }
+        finally {
+            try {
+                Invoke-Docker -Arguments @("compose", "down", "--volumes")
+            }
+            finally {
+                try {
+                    Remove-DistributedTestDirectory -Directory $temporaryDirectory
+                }
+                finally {
+                    $env:COMPOSE_PROJECT_NAME = $previousComposeProject
+                    $env:QUARRY_POSTGRES_PORT = $previousPostgresPort
+                }
+            }
+        }
+    }
+
+    Assert-RecoveryCleanup -ComposeProject $composeProject -TemporaryDirectory $temporaryDirectory -ProcessIDs $processIDs.ToArray()
+    foreach ($container in $workerContainers) {
+        $remaining = @(
+            Invoke-Docker -Arguments @("ps", "--all", "--quiet", "--filter", "name=^/$container$") |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        if ($remaining.Count -ne 0) {
+            throw "Semantics-test worker container '$container' remains after cleanup."
+        }
+    }
+    Write-Host "Semantics-test cleanup verified: processes, worker containers, temporary binaries, Compose resources, network, and volume removed."
+}
+
+function Test-Semantics {
+    Test-SemanticsProcesses
+    Invoke-Go -Arguments @(
+        "test", "-count=1",
+        "-run", "^(TestWorkerRetryableFailureRetriesUntilMaximumAttempts|TestWorkerPermanentFailureDoesNotRetry|TestWorkerTimeoutRetriesUntilMaximumAttempts|TestWorkerPanicRetriesUntilMaximumAttempts|TestPendingJobsCancelThroughHTTPAndPostgres|TestRunningJobCancelsThroughHTTPGRPCWorkerAndPostgres)$",
+        "./internal/dispatcher"
+    )
+    Invoke-Go -Arguments @(
+        "test", "-count=1",
+        "-run", "^(TestDispatcherStoreSchedulesRetryableFailureWithExactDelay|TestAPIConcurrentIdempotentSubmissionsCreateOneJob)$",
+        "./internal/store/postgres"
+    )
+}
+
 function Test-RecoveryProcesses {
     $testID = [Guid]::NewGuid().ToString("N")
     $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "quarry-recovery-$testID"
@@ -1343,6 +1794,7 @@ try {
             Test-ComposeSmoke
             Test-DistributedProcesses
             Test-Recovery
+            Test-Semantics
         }
         "db-config" {
             Invoke-Docker -Arguments @("compose", "config")
@@ -1403,6 +1855,9 @@ try {
         }
         "recovery-test" {
             Test-Recovery
+        }
+        "semantics-test" {
+            Test-Semantics
         }
     }
 }

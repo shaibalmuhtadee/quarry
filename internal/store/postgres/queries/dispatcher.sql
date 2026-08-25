@@ -43,7 +43,7 @@ WHERE state = 'active'
   AND last_seen_at <= statement_timestamp()
         - sqlc.arg(liveness_timeout_ms)::bigint * interval '1 millisecond';
 
--- name: RenewAttemptLease :execrows
+-- name: RenewAttemptLease :one
 UPDATE jobs
 SET lease_expires_at = statement_timestamp()
         + sqlc.arg(lease_duration_ms)::bigint * interval '1 millisecond',
@@ -52,7 +52,8 @@ WHERE id = sqlc.arg(job_id)
   AND attempt_count = sqlc.arg(attempt_no)
   AND current_worker_id = sqlc.arg(worker_id)
   AND status = 'running'
-  AND lease_expires_at > statement_timestamp();
+  AND lease_expires_at > statement_timestamp()
+RETURNING CAST(cancel_requested_at IS NOT NULL AS boolean) AS cancel_requested;
 
 -- name: ClaimJobs :many
 WITH eligible AS (
@@ -60,6 +61,7 @@ WITH eligible AS (
     FROM jobs
     WHERE status IN ('queued', 'retry_wait')
       AND available_at <= now()
+      AND cancel_requested_at IS NULL
       AND job_type = ANY(sqlc.arg(supported_job_types)::text[])
     ORDER BY available_at, created_at
     FOR UPDATE SKIP LOCKED
@@ -116,6 +118,7 @@ SELECT
     jobs.max_attempts,
     CAST(jobs.result IS NOT DISTINCT FROM sqlc.narg(result_json)::jsonb AS boolean) AS result_matches,
     jobs.lease_expires_at,
+    jobs.cancel_requested_at,
     job_attempts.worker_id,
     job_attempts.status AS attempt_status,
     job_attempts.error_code,
@@ -165,7 +168,7 @@ WHERE id = sqlc.arg(job_id)
   AND lease_expires_at > sqlc.arg(transition_time)::timestamptz;
 
 -- name: LockExpiredJobs :many
-SELECT id, attempt_count, max_attempts
+SELECT id, attempt_count, max_attempts, cancel_requested_at
 FROM jobs
 WHERE status = 'running'
   AND lease_expires_at <= statement_timestamp()
@@ -183,6 +186,16 @@ WHERE job_id = sqlc.arg(job_id)
   AND attempt_no = sqlc.arg(attempt_no)
   AND status = 'running';
 
+-- name: CancelExpiredAttempt :execrows
+UPDATE job_attempts
+SET status = 'cancelled',
+    error_code = 'cancellation_requested',
+    error_message = 'job cancellation was requested',
+    finished_at = sqlc.arg(transition_time)
+WHERE job_id = sqlc.arg(job_id)
+  AND attempt_no = sqlc.arg(attempt_no)
+  AND status = 'running';
+
 -- name: RecoverExpiredJob :execrows
 UPDATE jobs
 SET status = sqlc.arg(job_status),
@@ -194,7 +207,8 @@ SET status = sqlc.arg(job_status),
         ELSE available_at
     END,
     finished_at = CASE
-        WHEN sqlc.arg(job_status) = 'dead_lettered' THEN sqlc.arg(transition_time)::timestamptz
+        WHEN sqlc.arg(job_status) IN ('dead_lettered', 'cancelled')
+            THEN sqlc.arg(transition_time)::timestamptz
         ELSE NULL
     END,
     updated_at = sqlc.arg(transition_time)::timestamptz
