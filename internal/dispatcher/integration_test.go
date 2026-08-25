@@ -41,7 +41,7 @@ func TestConcurrentAcquireJobsThroughGRPCAndPostgres(t *testing.T) {
 	server := grpc.NewServer()
 	dispatcherv1.RegisterDispatcherServiceServer(
 		server,
-		dispatcher.NewService(postgres.NewDispatcherStore(pool, 20*time.Second)),
+		dispatcher.NewService(newIntegrationDispatcherStore(t, pool, 20*time.Second)),
 	)
 	serveDone := make(chan error, 1)
 	go func() {
@@ -223,7 +223,7 @@ func TestStaleAttemptReportAfterRecoveryThroughGRPCAndPostgres(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	pool := startDispatcherTestPostgres(t, ctx)
-	store := postgres.NewDispatcherStore(pool, 20*time.Second)
+	store := newIntegrationDispatcherStore(t, pool, 20*time.Second)
 	jobStore := postgres.NewJobStore(pool)
 
 	listener := bufconn.Listen(1 << 20)
@@ -384,6 +384,19 @@ func startDispatcherTestPostgres(t *testing.T, ctx context.Context) *pgxpool.Poo
 	}
 	t.Cleanup(pool.Close)
 	return pool
+}
+
+func newIntegrationDispatcherStore(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	leaseDuration time.Duration,
+) *postgres.DispatcherStore {
+	t.Helper()
+	retryPolicy, err := domain.NewRetryPolicy(time.Second, time.Minute, func(int64) int64 { return 0 })
+	if err != nil {
+		t.Fatalf("create integration retry policy: %v", err)
+	}
+	return postgres.NewDispatcherStore(pool, leaseDuration, retryPolicy)
 }
 
 func dispatcherMigrationDirectory(t *testing.T) string {

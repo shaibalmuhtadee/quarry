@@ -12,6 +12,31 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const abandonExpiredAttempt = `-- name: AbandonExpiredAttempt :execrows
+UPDATE job_attempts
+SET status = 'abandoned',
+    error_code = 'lease_expired',
+    error_message = 'worker lease expired before the attempt completed',
+    finished_at = $1
+WHERE job_id = $2
+  AND attempt_no = $3
+  AND status = 'running'
+`
+
+type AbandonExpiredAttemptParams struct {
+	TransitionTime pgtype.Timestamptz
+	JobID          uuid.UUID
+	AttemptNo      int32
+}
+
+func (q *Queries) AbandonExpiredAttempt(ctx context.Context, arg AbandonExpiredAttemptParams) (int64, error) {
+	result, err := q.db.Exec(ctx, abandonExpiredAttempt, arg.TransitionTime, arg.JobID, arg.AttemptNo)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const claimJobs = `-- name: ClaimJobs :many
 WITH eligible AS (
     SELECT id
@@ -128,26 +153,34 @@ func (q *Queries) CountWorkerRunningJobs(ctx context.Context, currentWorkerID pg
 	return count, err
 }
 
-const finishAttemptSuccess = `-- name: FinishAttemptSuccess :execrows
+const finishAttempt = `-- name: FinishAttempt :execrows
 UPDATE job_attempts
-SET status = 'succeeded',
-    finished_at = $1
-WHERE job_id = $2
-  AND attempt_no = $3
-  AND worker_id = $4
+SET status = $1,
+    error_code = $2,
+    error_message = $3,
+    finished_at = $4
+WHERE job_id = $5
+  AND attempt_no = $6
+  AND worker_id = $7
   AND status = 'running'
 `
 
-type FinishAttemptSuccessParams struct {
-	FinishedAt pgtype.Timestamptz
-	JobID      uuid.UUID
-	AttemptNo  int32
-	WorkerID   uuid.UUID
+type FinishAttemptParams struct {
+	AttemptStatus  string
+	ErrorCode      pgtype.Text
+	ErrorMessage   pgtype.Text
+	TransitionTime pgtype.Timestamptz
+	JobID          uuid.UUID
+	AttemptNo      int32
+	WorkerID       uuid.UUID
 }
 
-func (q *Queries) FinishAttemptSuccess(ctx context.Context, arg FinishAttemptSuccessParams) (int64, error) {
-	result, err := q.db.Exec(ctx, finishAttemptSuccess,
-		arg.FinishedAt,
+func (q *Queries) FinishAttempt(ctx context.Context, arg FinishAttemptParams) (int64, error) {
+	result, err := q.db.Exec(ctx, finishAttempt,
+		arg.AttemptStatus,
+		arg.ErrorCode,
+		arg.ErrorMessage,
+		arg.TransitionTime,
 		arg.JobID,
 		arg.AttemptNo,
 		arg.WorkerID,
@@ -158,33 +191,46 @@ func (q *Queries) FinishAttemptSuccess(ctx context.Context, arg FinishAttemptSuc
 	return result.RowsAffected(), nil
 }
 
-const finishJobSuccess = `-- name: FinishJobSuccess :execrows
+const finishJob = `-- name: FinishJob :execrows
 UPDATE jobs
-SET status = 'succeeded',
-    result = $1::jsonb,
+SET status = $1,
+    result = $2::jsonb,
     current_worker_id = NULL,
     lease_expires_at = NULL,
-    finished_at = $2,
-    updated_at = $2
-WHERE id = $3
-  AND attempt_count = $4
-  AND current_worker_id = $5
+    available_at = CASE
+        WHEN $1 = 'retry_wait' THEN $3::timestamptz
+            + $4::bigint * interval '1 millisecond'
+        ELSE available_at
+    END,
+    finished_at = CASE
+        WHEN $1 IN ('succeeded', 'dead_lettered', 'cancelled')
+            THEN $3::timestamptz
+        ELSE NULL
+    END,
+    updated_at = $3::timestamptz
+WHERE id = $5
+  AND attempt_count = $6
+  AND current_worker_id = $7
   AND status = 'running'
-  AND lease_expires_at > statement_timestamp()
+  AND lease_expires_at > $3::timestamptz
 `
 
-type FinishJobSuccessParams struct {
-	ResultJson []byte
-	FinishedAt pgtype.Timestamptz
-	JobID      uuid.UUID
-	AttemptNo  int32
-	WorkerID   pgtype.UUID
+type FinishJobParams struct {
+	JobStatus      string
+	ResultJson     []byte
+	TransitionTime pgtype.Timestamptz
+	RetryDelayMs   int64
+	JobID          uuid.UUID
+	AttemptNo      int32
+	WorkerID       pgtype.UUID
 }
 
-func (q *Queries) FinishJobSuccess(ctx context.Context, arg FinishJobSuccessParams) (int64, error) {
-	result, err := q.db.Exec(ctx, finishJobSuccess,
+func (q *Queries) FinishJob(ctx context.Context, arg FinishJobParams) (int64, error) {
+	result, err := q.db.Exec(ctx, finishJob,
+		arg.JobStatus,
 		arg.ResultJson,
-		arg.FinishedAt,
+		arg.TransitionTime,
+		arg.RetryDelayMs,
 		arg.JobID,
 		arg.AttemptNo,
 		arg.WorkerID,
@@ -193,16 +239,30 @@ func (q *Queries) FinishJobSuccess(ctx context.Context, arg FinishJobSuccessPara
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const getTransitionTime = `-- name: GetTransitionTime :one
+SELECT statement_timestamp()::timestamptz
+`
+
+func (q *Queries) GetTransitionTime(ctx context.Context) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, getTransitionTime)
+	var column_1 pgtype.Timestamptz
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const lockAttemptReport = `-- name: LockAttemptReport :one
 SELECT
     jobs.status AS job_status,
     jobs.attempt_count,
-    CAST(COALESCE(jobs.result = $1::jsonb, false) AS boolean) AS result_matches,
-    CAST(COALESCE(jobs.lease_expires_at > statement_timestamp(), false) AS boolean) AS lease_valid,
+    jobs.max_attempts,
+    CAST(jobs.result IS NOT DISTINCT FROM $1::jsonb AS boolean) AS result_matches,
+    jobs.lease_expires_at,
     job_attempts.worker_id,
-    job_attempts.status AS attempt_status
+    job_attempts.status AS attempt_status,
+    job_attempts.error_code,
+    job_attempts.error_message
 FROM jobs
 JOIN job_attempts
   ON job_attempts.job_id = jobs.id
@@ -218,12 +278,15 @@ type LockAttemptReportParams struct {
 }
 
 type LockAttemptReportRow struct {
-	JobStatus     string
-	AttemptCount  int32
-	ResultMatches bool
-	LeaseValid    bool
-	WorkerID      uuid.UUID
-	AttemptStatus string
+	JobStatus      string
+	AttemptCount   int32
+	MaxAttempts    int32
+	ResultMatches  bool
+	LeaseExpiresAt pgtype.Timestamptz
+	WorkerID       uuid.UUID
+	AttemptStatus  string
+	ErrorCode      pgtype.Text
+	ErrorMessage   pgtype.Text
 }
 
 func (q *Queries) LockAttemptReport(ctx context.Context, arg LockAttemptReportParams) (LockAttemptReportRow, error) {
@@ -232,12 +295,51 @@ func (q *Queries) LockAttemptReport(ctx context.Context, arg LockAttemptReportPa
 	err := row.Scan(
 		&i.JobStatus,
 		&i.AttemptCount,
+		&i.MaxAttempts,
 		&i.ResultMatches,
-		&i.LeaseValid,
+		&i.LeaseExpiresAt,
 		&i.WorkerID,
 		&i.AttemptStatus,
+		&i.ErrorCode,
+		&i.ErrorMessage,
 	)
 	return i, err
+}
+
+const lockExpiredJobs = `-- name: LockExpiredJobs :many
+SELECT id, attempt_count, max_attempts
+FROM jobs
+WHERE status = 'running'
+  AND lease_expires_at <= statement_timestamp()
+ORDER BY lease_expires_at, id
+FOR UPDATE SKIP LOCKED
+LIMIT $1
+`
+
+type LockExpiredJobsRow struct {
+	ID           uuid.UUID
+	AttemptCount int32
+	MaxAttempts  int32
+}
+
+func (q *Queries) LockExpiredJobs(ctx context.Context, batchSize int32) ([]LockExpiredJobsRow, error) {
+	rows, err := q.db.Query(ctx, lockExpiredJobs, batchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []LockExpiredJobsRow
+	for rows.Next() {
+		var i LockExpiredJobsRow
+		if err := rows.Scan(&i.ID, &i.AttemptCount, &i.MaxAttempts); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const lockWorker = `-- name: LockWorker :one
@@ -270,70 +372,47 @@ func (q *Queries) MarkLostWorkers(ctx context.Context, livenessTimeoutMs int64) 
 	return result.RowsAffected(), nil
 }
 
-const recoverExpiredJobs = `-- name: RecoverExpiredJobs :many
-WITH expired AS MATERIALIZED (
-    SELECT
-        id,
-        attempt_count,
-        attempt_count >= max_attempts AS attempts_exhausted
-    FROM jobs
-    WHERE status = 'running'
-      AND lease_expires_at <= statement_timestamp()
-    ORDER BY lease_expires_at, id
-    FOR UPDATE SKIP LOCKED
-    LIMIT $1
-), abandoned AS (
-    UPDATE job_attempts
-    SET status = 'abandoned',
-        finished_at = statement_timestamp()
-    FROM expired
-    WHERE job_attempts.job_id = expired.id
-      AND job_attempts.attempt_no = expired.attempt_count
-      AND job_attempts.status = 'running'
-    RETURNING job_attempts.job_id, job_attempts.attempt_no
-), recovered AS (
-    UPDATE jobs
-    SET status = CASE
-            WHEN expired.attempts_exhausted THEN 'dead_lettered'
-            ELSE 'retry_wait'
-        END,
-        current_worker_id = NULL,
-        lease_expires_at = NULL,
-        available_at = statement_timestamp(),
-        finished_at = CASE
-            WHEN expired.attempts_exhausted THEN statement_timestamp()
-            ELSE NULL
-        END,
-        updated_at = statement_timestamp()
-    FROM expired
-    JOIN abandoned
-      ON abandoned.job_id = expired.id
-     AND abandoned.attempt_no = expired.attempt_count
-    WHERE jobs.id = expired.id
-    RETURNING jobs.id
-)
-SELECT id
-FROM recovered
+const recoverExpiredJob = `-- name: RecoverExpiredJob :execrows
+UPDATE jobs
+SET status = $1,
+    current_worker_id = NULL,
+    lease_expires_at = NULL,
+    available_at = CASE
+        WHEN $1 = 'retry_wait' THEN $2::timestamptz
+            + $3::bigint * interval '1 millisecond'
+        ELSE available_at
+    END,
+    finished_at = CASE
+        WHEN $1 = 'dead_lettered' THEN $2::timestamptz
+        ELSE NULL
+    END,
+    updated_at = $2::timestamptz
+WHERE id = $4
+  AND status = 'running'
+  AND attempt_count = $5
+  AND lease_expires_at <= statement_timestamp()
 `
 
-func (q *Queries) RecoverExpiredJobs(ctx context.Context, batchSize int32) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, recoverExpiredJobs, batchSize)
+type RecoverExpiredJobParams struct {
+	JobStatus      string
+	TransitionTime pgtype.Timestamptz
+	RetryDelayMs   int64
+	JobID          uuid.UUID
+	AttemptNo      int32
+}
+
+func (q *Queries) RecoverExpiredJob(ctx context.Context, arg RecoverExpiredJobParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recoverExpiredJob,
+		arg.JobStatus,
+		arg.TransitionTime,
+		arg.RetryDelayMs,
+		arg.JobID,
+		arg.AttemptNo,
+	)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	defer rows.Close()
-	var items []uuid.UUID
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		items = append(items, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+	return result.RowsAffected(), nil
 }
 
 const refreshWorkerHeartbeat = `-- name: RefreshWorkerHeartbeat :execrows

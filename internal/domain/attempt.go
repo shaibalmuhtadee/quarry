@@ -66,6 +66,7 @@ type Attempt struct {
 	Number     AttemptNumber
 	WorkerID   WorkerID
 	Status     AttemptStatus
+	Failure    *AttemptFailure
 	StartedAt  time.Time
 	FinishedAt *time.Time
 }

@@ -75,11 +75,13 @@ type jobAttemptsResponse struct {
 }
 
 type attemptResponse struct {
-	Number     int32                `json:"attempt_no"`
-	WorkerID   string               `json:"worker_id"`
-	Status     domain.AttemptStatus `json:"status"`
-	StartedAt  time.Time            `json:"started_at"`
-	FinishedAt *time.Time           `json:"finished_at"`
+	Number       int32                `json:"attempt_no"`
+	WorkerID     string               `json:"worker_id"`
+	Status       domain.AttemptStatus `json:"status"`
+	ErrorCode    *string              `json:"error_code"`
+	ErrorMessage *string              `json:"error_message"`
+	StartedAt    time.Time            `json:"started_at"`
+	FinishedAt   *time.Time           `json:"finished_at"`
 }
 
 type errorResponse struct {
@@ -231,12 +233,21 @@ func (handler *handler) getJobAttempts(writer http.ResponseWriter, request *http
 		Attempts: make([]attemptResponse, 0, len(attempts)),
 	}
 	for _, attempt := range attempts {
+		var errorCode, errorMessage *string
+		if attempt.Failure != nil {
+			code := attempt.Failure.Code()
+			message := attempt.Failure.Message()
+			errorCode = &code
+			errorMessage = &message
+		}
 		response.Attempts = append(response.Attempts, attemptResponse{
-			Number:     attempt.Number.Int32(),
-			WorkerID:   attempt.WorkerID.String(),
-			Status:     attempt.Status,
-			StartedAt:  attempt.StartedAt,
-			FinishedAt: attempt.FinishedAt,
+			Number:       attempt.Number.Int32(),
+			WorkerID:     attempt.WorkerID.String(),
+			Status:       attempt.Status,
+			ErrorCode:    errorCode,
+			ErrorMessage: errorMessage,
+			StartedAt:    attempt.StartedAt,
+			FinishedAt:   attempt.FinishedAt,
 		})
 	}
 

@@ -333,6 +333,10 @@ func TestGetJobAttemptsReturnsAttemptsInStoreOrder(t *testing.T) {
 	firstFinishedAt := firstStartedAt.Add(time.Second)
 	secondStartedAt := firstFinishedAt.Add(time.Second)
 	secondFinishedAt := secondStartedAt.Add(time.Second)
+	failure, err := domain.NewAttemptFailure("invalid_input", "handler rejected the input")
+	if err != nil {
+		t.Fatalf("create attempt failure: %v", err)
+	}
 	store := &fakeJobStore{
 		listJobAttempts: func(context.Context, domain.JobID) ([]domain.Attempt, error) {
 			return []domain.Attempt{
@@ -348,7 +352,8 @@ func TestGetJobAttemptsReturnsAttemptsInStoreOrder(t *testing.T) {
 					JobID:      id,
 					Number:     secondNumber,
 					WorkerID:   workerID,
-					Status:     domain.AttemptStatusSucceeded,
+					Status:     domain.AttemptStatusPermanentFailed,
+					Failure:    &failure,
 					StartedAt:  secondStartedAt,
 					FinishedAt: &secondFinishedAt,
 				},
@@ -366,11 +371,13 @@ func TestGetJobAttemptsReturnsAttemptsInStoreOrder(t *testing.T) {
 	}
 	var body struct {
 		Attempts []struct {
-			Number     int32                `json:"attempt_no"`
-			WorkerID   string               `json:"worker_id"`
-			Status     domain.AttemptStatus `json:"status"`
-			StartedAt  time.Time            `json:"started_at"`
-			FinishedAt *time.Time           `json:"finished_at"`
+			Number       int32                `json:"attempt_no"`
+			WorkerID     string               `json:"worker_id"`
+			Status       domain.AttemptStatus `json:"status"`
+			ErrorCode    *string              `json:"error_code"`
+			ErrorMessage *string              `json:"error_message"`
+			StartedAt    time.Time            `json:"started_at"`
+			FinishedAt   *time.Time           `json:"finished_at"`
 		} `json:"attempts"`
 	}
 	decodeJSONResponse(t, response, &body)
@@ -381,12 +388,20 @@ func TestGetJobAttemptsReturnsAttemptsInStoreOrder(t *testing.T) {
 		t.Fatalf("attempt order = [%d, %d], want [1, 2]", body.Attempts[0].Number, body.Attempts[1].Number)
 	}
 	for i, attempt := range body.Attempts {
-		if attempt.WorkerID != workerID.String() || attempt.Status != domain.AttemptStatusSucceeded {
-			t.Fatalf("attempt %d identity or status = (%q, %q)", i, attempt.WorkerID, attempt.Status)
+		if attempt.WorkerID != workerID.String() {
+			t.Fatalf("attempt %d worker = %q", i, attempt.WorkerID)
 		}
 		if attempt.FinishedAt == nil {
 			t.Fatalf("attempt %d has null finish time", i)
 		}
+	}
+	if body.Attempts[0].Status != domain.AttemptStatusSucceeded || body.Attempts[0].ErrorCode != nil || body.Attempts[0].ErrorMessage != nil {
+		t.Fatalf("successful attempt = %#v", body.Attempts[0])
+	}
+	if body.Attempts[1].Status != domain.AttemptStatusPermanentFailed || body.Attempts[1].ErrorCode == nil ||
+		*body.Attempts[1].ErrorCode != "invalid_input" || body.Attempts[1].ErrorMessage == nil ||
+		*body.Attempts[1].ErrorMessage != "handler rejected the input" {
+		t.Fatalf("failed attempt = %#v", body.Attempts[1])
 	}
 }
 

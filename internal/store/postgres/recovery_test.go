@@ -16,7 +16,7 @@ func TestDispatcherStoreRecoversExpiredAttemptAndFencesStaleSuccess(t *testing.T
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	store := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	store := newDispatcherTestStore(t, pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	firstWorker := registerTestWorker(t, ctx, store, 1)
 	secondWorker := registerTestWorker(t, ctx, store, 1)
@@ -77,7 +77,7 @@ func TestDispatcherStoreRecoversExpiredAttemptAndFencesStaleSuccess(t *testing.T
 	if secondAttempt.ID != job.ID || secondAttempt.AttemptNumber.Int32() != 2 {
 		t.Fatalf("replacement attempt = (%s, %d), want (%s, 2)", secondAttempt.ID, secondAttempt.AttemptNumber.Int32(), job.ID)
 	}
-	if err := store.ReportSuccess(ctx, firstWorker, job.ID, firstAttempt.AttemptNumber, mustResult(t, `{"stale":true}`)); !errors.Is(err, postgres.ErrAttemptReportConflict) {
+	if err := reportSuccess(ctx, store, firstWorker, job.ID, firstAttempt.AttemptNumber, mustResult(t, `{"stale":true}`)); !errors.Is(err, postgres.ErrAttemptReportConflict) {
 		t.Fatalf("stale attempt success error = %v, want ErrAttemptReportConflict", err)
 	}
 	stored, err = jobStore.GetJob(ctx, job.ID)
@@ -99,11 +99,52 @@ func TestDispatcherStoreRecoversExpiredAttemptAndFencesStaleSuccess(t *testing.T
 	}
 }
 
+func TestDispatcherStoreSchedulesExpiredLeaseWithExactBackoff(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := newDispatcherTestPool(t, ctx)
+	retryPolicy, err := domain.NewRetryPolicy(time.Second, time.Minute, func(upperExclusive int64) int64 {
+		if upperExclusive != 1001 {
+			t.Fatalf("retry jitter upper bound = %d, want 1001", upperExclusive)
+		}
+		return 625
+	})
+	if err != nil {
+		t.Fatalf("create retry policy: %v", err)
+	}
+	store := postgres.NewDispatcherStore(pool, testLeaseDuration, retryPolicy)
+	jobStore := postgres.NewJobStore(pool)
+	worker := registerTestWorker(t, ctx, store, 1)
+	job := createTestJob(t, ctx, jobStore, "recovery.backoff", `{}`)
+	acquireOneTestJob(t, ctx, store, worker, "recovery.backoff")
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at = statement_timestamp() - interval '1 second' WHERE id = $1`, job.ID.UUID()); err != nil {
+		t.Fatalf("expire attempt: %v", err)
+	}
+
+	if recovered, err := store.RecoverExpiredAttempts(ctx, 1, time.Hour); err != nil || recovered != 1 {
+		t.Fatalf("recover expired attempt = (%d, %v), want (1, nil)", recovered, err)
+	}
+	var availableAt, updatedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT available_at, updated_at FROM jobs WHERE id = $1`, job.ID.UUID()).Scan(&availableAt, &updatedAt); err != nil {
+		t.Fatalf("read recovery schedule: %v", err)
+	}
+	if got := availableAt.Sub(updatedAt); got != 625*time.Millisecond {
+		t.Fatalf("recovery delay = %s, want 625ms", got)
+	}
+	attempts, err := jobStore.ListJobAttempts(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("list abandoned attempt: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Failure == nil || attempts[0].Failure.Code() != "lease_expired" {
+		t.Fatalf("abandoned attempt = %#v", attempts)
+	}
+}
+
 func TestDispatcherStoreDeadLettersExpiredFinalAttempt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	store := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	store := newDispatcherTestStore(t, pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, store, 1)
 	job := createTestJob(t, ctx, jobStore, "recovery.exhausted", `{}`)
@@ -139,7 +180,7 @@ func TestDispatcherStoreConcurrentReapersTransitionEachExpiredAttemptOnce(t *tes
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	store := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	store := newDispatcherTestStore(t, pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, store, 12)
 	for i := 0; i < 12; i++ {
@@ -205,7 +246,7 @@ func TestDispatcherStoreRecoverySkipsLockedExpiredJob(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	store := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	store := newDispatcherTestStore(t, pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, store, 2)
 	first := createTestJob(t, ctx, jobStore, "recovery.locked", `{"order":1}`)
@@ -260,7 +301,7 @@ func TestDispatcherStoreRenewalAndRecoveryRaceHasOneConsistentWinner(t *testing.
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
 	const shortLease = 250 * time.Millisecond
-	store := postgres.NewDispatcherStore(pool, shortLease)
+	store := newDispatcherTestStore(t, pool, shortLease)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, store, 1)
 	job := createTestJob(t, ctx, jobStore, "recovery.race", `{}`)
@@ -314,11 +355,81 @@ func TestDispatcherStoreRenewalAndRecoveryRaceHasOneConsistentWinner(t *testing.
 	}
 }
 
+func TestDispatcherStoreFailureReportAndRecoveryRaceHasOneConsistentWinner(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := newDispatcherTestPool(t, ctx)
+	const shortLease = 250 * time.Millisecond
+	store := newDispatcherTestStore(t, pool, shortLease)
+	jobStore := postgres.NewJobStore(pool)
+	worker := registerTestWorker(t, ctx, store, 1)
+	job := createTestJob(t, ctx, jobStore, "recovery.failure-race", `{}`)
+	attempt := acquireOneTestJob(t, ctx, store, worker, "recovery.failure-race")
+	outcome := mustFailureOutcome(t, domain.NewRetryableFailureOutcome)
+
+	lock, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin race lock: %v", err)
+	}
+	defer func() { _ = lock.Rollback(ctx) }()
+	if _, err := lock.Exec(ctx, `SELECT id FROM jobs WHERE id = $1 FOR UPDATE`, job.ID.UUID()); err != nil {
+		t.Fatalf("lock racing job: %v", err)
+	}
+	reportDone := make(chan error, 1)
+	go func() {
+		reportDone <- store.ReportAttempt(ctx, worker, job.ID, attempt.AttemptNumber, outcome)
+	}()
+	time.Sleep(300 * time.Millisecond)
+	recoveryDone := make(chan int64, 1)
+	recoveryErrors := make(chan error, 1)
+	go func() {
+		recovered, err := store.RecoverExpiredAttempts(ctx, 1, time.Hour)
+		recoveryDone <- recovered
+		recoveryErrors <- err
+	}()
+	time.Sleep(25 * time.Millisecond)
+	if err := lock.Commit(ctx); err != nil {
+		t.Fatalf("release race lock: %v", err)
+	}
+	reportErr := <-reportDone
+	recovered, recoveryErr := <-recoveryDone, <-recoveryErrors
+	if recoveryErr != nil {
+		t.Fatalf("recovery race error: %v", recoveryErr)
+	}
+	if errors.Is(reportErr, postgres.ErrAttemptReportConflict) && recovered == 0 {
+		recovered, recoveryErr = store.RecoverExpiredAttempts(ctx, 1, time.Hour)
+		if recoveryErr != nil {
+			t.Fatalf("retry recovery after locked-row skip: %v", recoveryErr)
+		}
+	}
+
+	stored, err := jobStore.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("get raced job: %v", err)
+	}
+	attempts, err := jobStore.ListJobAttempts(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("list raced attempts: %v", err)
+	}
+	if stored.Status != domain.JobStatusRetryWait || len(attempts) != 1 {
+		t.Fatalf("raced state = report %v, recovered %d, job %#v, attempts %#v", reportErr, recovered, stored, attempts)
+	}
+	if reportErr == nil {
+		if recovered != 0 || attempts[0].Status != domain.AttemptStatusRetryableFailed {
+			t.Fatalf("report winner = recovered %d, attempt %q; want 0, retryable_failed", recovered, attempts[0].Status)
+		}
+		return
+	}
+	if !errors.Is(reportErr, postgres.ErrAttemptReportConflict) || recovered != 1 || attempts[0].Status != domain.AttemptStatusAbandoned {
+		t.Fatalf("recovery winner = report %v, recovered %d, attempt %q", reportErr, recovered, attempts[0].Status)
+	}
+}
+
 func TestDispatcherStoreRejectsSuccessAfterLeaseExpiryBeforeRecovery(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	store := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	store := newDispatcherTestStore(t, pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, store, 1)
 	job := createTestJob(t, ctx, jobStore, "recovery.expired-success", `{}`)
@@ -327,7 +438,7 @@ func TestDispatcherStoreRejectsSuccessAfterLeaseExpiryBeforeRecovery(t *testing.
 		t.Fatalf("expire success lease: %v", err)
 	}
 
-	err := store.ReportSuccess(ctx, worker, job.ID, attempt.AttemptNumber, mustResult(t, `{"ok":true}`))
+	err := reportSuccess(ctx, store, worker, job.ID, attempt.AttemptNumber, mustResult(t, `{"ok":true}`))
 	if !errors.Is(err, postgres.ErrAttemptReportConflict) {
 		t.Fatalf("expired success error = %v, want ErrAttemptReportConflict", err)
 	}

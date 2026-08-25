@@ -22,7 +22,7 @@ type fakeStore struct {
 	registerWorker func(context.Context, postgres.WorkerRegistration) error
 	acquireJobs    func(context.Context, domain.WorkerID, int32, []domain.JobType) ([]postgres.AcquiredJob, error)
 	heartbeat      func(context.Context, domain.WorkerID, []postgres.HeartbeatAttempt) ([]postgres.HeartbeatResult, error)
-	reportSuccess  func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.Result) error
+	reportAttempt  func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error
 }
 
 func (store *fakeStore) RegisterWorker(ctx context.Context, registration postgres.WorkerRegistration) error {
@@ -55,17 +55,17 @@ func (store *fakeStore) Heartbeat(
 	return store.heartbeat(ctx, workerID, attempts)
 }
 
-func (store *fakeStore) ReportSuccess(
+func (store *fakeStore) ReportAttempt(
 	ctx context.Context,
 	workerID domain.WorkerID,
 	jobID domain.JobID,
 	attemptNumber domain.AttemptNumber,
-	result domain.Result,
+	outcome domain.AttemptOutcome,
 ) error {
-	if store.reportSuccess == nil {
+	if store.reportAttempt == nil {
 		return nil
 	}
-	return store.reportSuccess(ctx, workerID, jobID, attemptNumber, result)
+	return store.reportAttempt(ctx, workerID, jobID, attemptNumber, outcome)
 }
 
 func TestRegisterWorkerParsesRequest(t *testing.T) {
@@ -336,19 +336,19 @@ func TestHeartbeatRequiresRegisteredWorker(t *testing.T) {
 func TestReportAttemptParsesSuccessfulOutcome(t *testing.T) {
 	workerID := domain.NewWorkerID()
 	jobID := domain.NewJobID()
-	var capturedResult domain.Result
+	var capturedOutcome domain.AttemptOutcome
 	service := dispatcher.NewService(&fakeStore{
-		reportSuccess: func(
+		reportAttempt: func(
 			_ context.Context,
 			gotWorkerID domain.WorkerID,
 			gotJobID domain.JobID,
 			attemptNumber domain.AttemptNumber,
-			result domain.Result,
+			outcome domain.AttemptOutcome,
 		) error {
 			if gotWorkerID != workerID || gotJobID != jobID || attemptNumber.Int32() != 1 {
 				t.Fatalf("reported identity = worker %s, job %s, attempt %d", gotWorkerID, gotJobID, attemptNumber.Int32())
 			}
-			capturedResult = result
+			capturedOutcome = outcome
 			return nil
 		},
 	})
@@ -364,8 +364,67 @@ func TestReportAttemptParsesSuccessfulOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReportAttempt: %v", err)
 	}
-	if response == nil || string(capturedResult.JSON()) != `{"ok":true}` {
-		t.Fatalf("captured result = %s", capturedResult.JSON())
+	capturedResult, ok := capturedOutcome.Result()
+	if response == nil || !ok || string(capturedResult.JSON()) != `{"ok":true}` {
+		t.Fatalf("captured outcome = %#v", capturedOutcome)
+	}
+}
+
+func TestReportAttemptParsesFailureOutcomes(t *testing.T) {
+	workerID := domain.NewWorkerID()
+	jobID := domain.NewJobID()
+	tests := []struct {
+		name    string
+		kind    domain.AttemptOutcomeKind
+		request func() *dispatcherv1.ReportAttemptRequest
+	}{
+		{name: "retryable failure", kind: domain.AttemptOutcomeKindRetryableFailure, request: func() *dispatcherv1.ReportAttemptRequest {
+			return &dispatcherv1.ReportAttemptRequest{WorkerId: workerID.String(), JobId: jobID.String(), AttemptNo: 1, Outcome: &dispatcherv1.ReportAttemptRequest_RetryableFailure{RetryableFailure: testRPCFailure()}}
+		}},
+		{name: "permanent failure", kind: domain.AttemptOutcomeKindPermanentFailure, request: func() *dispatcherv1.ReportAttemptRequest {
+			return &dispatcherv1.ReportAttemptRequest{WorkerId: workerID.String(), JobId: jobID.String(), AttemptNo: 1, Outcome: &dispatcherv1.ReportAttemptRequest_PermanentFailure{PermanentFailure: testRPCFailure()}}
+		}},
+		{name: "cancelled", kind: domain.AttemptOutcomeKindCancelled, request: func() *dispatcherv1.ReportAttemptRequest {
+			return &dispatcherv1.ReportAttemptRequest{WorkerId: workerID.String(), JobId: jobID.String(), AttemptNo: 1, Outcome: &dispatcherv1.ReportAttemptRequest_Cancelled{Cancelled: testRPCFailure()}}
+		}},
+		{name: "timed out", kind: domain.AttemptOutcomeKindTimedOut, request: func() *dispatcherv1.ReportAttemptRequest {
+			return &dispatcherv1.ReportAttemptRequest{WorkerId: workerID.String(), JobId: jobID.String(), AttemptNo: 1, Outcome: &dispatcherv1.ReportAttemptRequest_TimedOut{TimedOut: testRPCFailure()}}
+		}},
+		{name: "panicked", kind: domain.AttemptOutcomeKindPanicked, request: func() *dispatcherv1.ReportAttemptRequest {
+			return &dispatcherv1.ReportAttemptRequest{WorkerId: workerID.String(), JobId: jobID.String(), AttemptNo: 1, Outcome: &dispatcherv1.ReportAttemptRequest_Panicked{Panicked: testRPCFailure()}}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var captured domain.AttemptOutcome
+			service := dispatcher.NewService(&fakeStore{
+				reportAttempt: func(
+					_ context.Context,
+					_ domain.WorkerID,
+					_ domain.JobID,
+					_ domain.AttemptNumber,
+					outcome domain.AttemptOutcome,
+				) error {
+					captured = outcome
+					return nil
+				},
+			})
+			_, err := service.ReportAttempt(context.Background(), test.request())
+			if err != nil {
+				t.Fatalf("ReportAttempt: %v", err)
+			}
+			failure, ok := captured.Failure()
+			if captured.Kind() != test.kind || !ok || failure.Code() != "dependency_timeout" || failure.Message() != "dependency timed out" {
+				t.Fatalf("captured outcome = %#v", captured)
+			}
+		})
+	}
+}
+
+func testRPCFailure() *dispatcherv1.AttemptFailure {
+	return &dispatcherv1.AttemptFailure{
+		ErrorCode:    "dependency_timeout",
+		ErrorMessage: "dependency timed out",
 	}
 }
 
@@ -402,6 +461,18 @@ func TestReportAttemptRejectsInvalidRequests(t *testing.T) {
 		{name: "malformed result", request: func() *dispatcherv1.ReportAttemptRequest {
 			value := valid()
 			value.GetSucceeded().ResultJson = []byte(`{"ok":`)
+			return value
+		}},
+		{name: "missing failure", request: func() *dispatcherv1.ReportAttemptRequest {
+			value := valid()
+			value.Outcome = &dispatcherv1.ReportAttemptRequest_RetryableFailure{}
+			return value
+		}},
+		{name: "invalid failure code", request: func() *dispatcherv1.ReportAttemptRequest {
+			value := valid()
+			value.Outcome = &dispatcherv1.ReportAttemptRequest_PermanentFailure{PermanentFailure: &dispatcherv1.AttemptFailure{
+				ErrorCode: "BAD-CODE", ErrorMessage: "safe",
+			}}
 			return value
 		}},
 	}
@@ -455,7 +526,7 @@ func TestServiceMapsStoreErrorsToStableStatusCodes(t *testing.T) {
 		{
 			name: "attempt conflict",
 			service: dispatcher.NewService(&fakeStore{
-				reportSuccess: func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.Result) error {
+				reportAttempt: func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error {
 					return postgres.ErrAttemptReportConflict
 				},
 			}),

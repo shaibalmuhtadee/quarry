@@ -21,7 +21,7 @@ func TestSuccessfulJobAndAttemptHistoryThroughHTTP(t *testing.T) {
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
 	jobStore := postgres.NewJobStore(pool)
-	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	dispatcherStore := newDispatcherTestStore(t, pool, testLeaseDuration)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	server := httptest.NewServer(api.NewHandler(jobStore, pool, logger))
 	t.Cleanup(server.Close)
@@ -52,7 +52,7 @@ func TestSuccessfulJobAndAttemptHistoryThroughHTTP(t *testing.T) {
 	workerID := registerTestWorker(t, ctx, dispatcherStore, 1)
 	acquired := acquireOneTestJob(t, ctx, dispatcherStore, workerID, "http.success")
 	result := mustResult(t, `{"message":"hello","handled":true}`)
-	if err := dispatcherStore.ReportSuccess(ctx, workerID, jobID, acquired.AttemptNumber, result); err != nil {
+	if err := reportSuccess(ctx, dispatcherStore, workerID, jobID, acquired.AttemptNumber, result); err != nil {
 		t.Fatalf("report successful attempt: %v", err)
 	}
 

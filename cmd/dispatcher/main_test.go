@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -24,6 +25,8 @@ func TestLoadConfig(t *testing.T) {
 		t.Setenv("QUARRY_REAPER_INTERVAL", "")
 		t.Setenv("QUARRY_REAPER_BATCH_SIZE", "")
 		t.Setenv("QUARRY_WORKER_LIVENESS_TIMEOUT", "")
+		t.Setenv("QUARRY_RETRY_BASE_DELAY", "")
+		t.Setenv("QUARRY_RETRY_MAX_DELAY", "")
 
 		got, err := loadConfig()
 		if err != nil {
@@ -44,6 +47,9 @@ func TestLoadConfig(t *testing.T) {
 		if got.workerLiveness != defaultLeaseDuration {
 			t.Fatalf("worker liveness timeout = %s, want default lease duration %s", got.workerLiveness, defaultLeaseDuration)
 		}
+		if got.retryBaseDelay != domain.DefaultRetryBaseDelay || got.retryMaxDelay != domain.DefaultRetryMaxDelay {
+			t.Fatalf("retry policy = (%s, %s), want (%s, %s)", got.retryBaseDelay, got.retryMaxDelay, domain.DefaultRetryBaseDelay, domain.DefaultRetryMaxDelay)
+		}
 	})
 
 	t.Run("environment overrides", func(t *testing.T) {
@@ -53,6 +59,8 @@ func TestLoadConfig(t *testing.T) {
 		t.Setenv("QUARRY_REAPER_INTERVAL", "250ms")
 		t.Setenv("QUARRY_REAPER_BATCH_SIZE", "25")
 		t.Setenv("QUARRY_WORKER_LIVENESS_TIMEOUT", "1m")
+		t.Setenv("QUARRY_RETRY_BASE_DELAY", "250ms")
+		t.Setenv("QUARRY_RETRY_MAX_DELAY", "5s")
 
 		got, err := loadConfig()
 		if err != nil {
@@ -72,6 +80,9 @@ func TestLoadConfig(t *testing.T) {
 		}
 		if got.workerLiveness != time.Minute {
 			t.Fatalf("worker liveness timeout = %s, want 1m", got.workerLiveness)
+		}
+		if got.retryBaseDelay != 250*time.Millisecond || got.retryMaxDelay != 5*time.Second {
+			t.Fatalf("retry policy = (%s, %s), want (250ms, 5s)", got.retryBaseDelay, got.retryMaxDelay)
 		}
 	})
 
@@ -95,17 +106,33 @@ func TestLoadConfig(t *testing.T) {
 		"worker liveness syntax": {variable: "QUARRY_WORKER_LIVENESS_TIMEOUT", value: "invalid"},
 		"worker liveness zero":   {variable: "QUARRY_WORKER_LIVENESS_TIMEOUT", value: "0s"},
 		"worker liveness sub-ms": {variable: "QUARRY_WORKER_LIVENESS_TIMEOUT", value: "500us"},
+		"retry base syntax":      {variable: "QUARRY_RETRY_BASE_DELAY", value: "invalid"},
+		"retry base zero":        {variable: "QUARRY_RETRY_BASE_DELAY", value: "0s"},
+		"retry base sub-ms":      {variable: "QUARRY_RETRY_BASE_DELAY", value: "500us"},
+		"retry maximum syntax":   {variable: "QUARRY_RETRY_MAX_DELAY", value: "invalid"},
+		"retry maximum zero":     {variable: "QUARRY_RETRY_MAX_DELAY", value: "0s"},
+		"retry maximum sub-ms":   {variable: "QUARRY_RETRY_MAX_DELAY", value: "500us"},
 	} {
 		t.Run("invalid "+name, func(t *testing.T) {
 			t.Setenv("QUARRY_REAPER_INTERVAL", "")
 			t.Setenv("QUARRY_REAPER_BATCH_SIZE", "")
 			t.Setenv("QUARRY_WORKER_LIVENESS_TIMEOUT", "")
+			t.Setenv("QUARRY_RETRY_BASE_DELAY", "")
+			t.Setenv("QUARRY_RETRY_MAX_DELAY", "")
 			t.Setenv(test.variable, test.value)
 			if _, err := loadConfig(); err == nil {
 				t.Fatalf("loadConfig accepted %s=%q", test.variable, test.value)
 			}
 		})
 	}
+
+	t.Run("retry maximum below base", func(t *testing.T) {
+		t.Setenv("QUARRY_RETRY_BASE_DELAY", "2s")
+		t.Setenv("QUARRY_RETRY_MAX_DELAY", "1s")
+		if _, err := loadConfig(); err == nil {
+			t.Fatal("loadConfig accepted retry maximum below base")
+		}
+	})
 }
 
 func TestServeDispatcherStartsAndShutsDownWithoutLeakingListener(t *testing.T) {

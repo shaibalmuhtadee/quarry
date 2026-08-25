@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 
@@ -17,7 +18,7 @@ type store interface {
 	RegisterWorker(context.Context, postgres.WorkerRegistration) error
 	AcquireJobs(context.Context, domain.WorkerID, int32, []domain.JobType) ([]postgres.AcquiredJob, error)
 	Heartbeat(context.Context, domain.WorkerID, []postgres.HeartbeatAttempt) ([]postgres.HeartbeatResult, error)
-	ReportSuccess(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.Result) error
+	ReportAttempt(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error
 }
 
 type Service struct {
@@ -208,16 +209,12 @@ func (service *Service) ReportAttempt(
 	if err != nil {
 		return nil, invalidArgument("attempt_no must be positive")
 	}
-	succeeded := request.GetSucceeded()
-	if succeeded == nil {
-		return nil, invalidArgument("a succeeded outcome is required")
-	}
-	result, err := domain.ParseResult(succeeded.GetResultJson())
+	outcome, err := parseAttemptOutcome(request)
 	if err != nil {
-		return nil, invalidArgument("succeeded.result_json must contain one JSON value")
+		return nil, invalidArgument(err.Error())
 	}
 
-	err = service.store.ReportSuccess(ctx, workerID, jobID, attemptNumber, result)
+	err = service.store.ReportAttempt(ctx, workerID, jobID, attemptNumber, outcome)
 	if errors.Is(err, postgres.ErrAttemptReportConflict) {
 		return nil, status.Error(codes.FailedPrecondition, "attempt report does not match the current stored attempt")
 	}
@@ -226,6 +223,47 @@ func (service *Service) ReportAttempt(
 	}
 
 	return &dispatcherv1.ReportAttemptResponse{}, nil
+}
+
+func parseAttemptOutcome(request *dispatcherv1.ReportAttemptRequest) (domain.AttemptOutcome, error) {
+	switch value := request.GetOutcome().(type) {
+	case *dispatcherv1.ReportAttemptRequest_Succeeded:
+		if value.Succeeded == nil {
+			return domain.AttemptOutcome{}, errors.New("succeeded outcome is required")
+		}
+		result, err := domain.ParseResult(value.Succeeded.GetResultJson())
+		if err != nil {
+			return domain.AttemptOutcome{}, errors.New("succeeded.result_json must contain one JSON value")
+		}
+		return domain.NewSucceededOutcome(result)
+	case *dispatcherv1.ReportAttemptRequest_RetryableFailure:
+		return parseFailureOutcome(value.RetryableFailure, "retryable_failure", domain.NewRetryableFailureOutcome)
+	case *dispatcherv1.ReportAttemptRequest_PermanentFailure:
+		return parseFailureOutcome(value.PermanentFailure, "permanent_failure", domain.NewPermanentFailureOutcome)
+	case *dispatcherv1.ReportAttemptRequest_Cancelled:
+		return parseFailureOutcome(value.Cancelled, "cancelled", domain.NewCancelledOutcome)
+	case *dispatcherv1.ReportAttemptRequest_TimedOut:
+		return parseFailureOutcome(value.TimedOut, "timed_out", domain.NewTimedOutOutcome)
+	case *dispatcherv1.ReportAttemptRequest_Panicked:
+		return parseFailureOutcome(value.Panicked, "panicked", domain.NewPanickedOutcome)
+	default:
+		return domain.AttemptOutcome{}, errors.New("an outcome is required")
+	}
+}
+
+func parseFailureOutcome(
+	value *dispatcherv1.AttemptFailure,
+	field string,
+	constructor func(domain.AttemptFailure) (domain.AttemptOutcome, error),
+) (domain.AttemptOutcome, error) {
+	if value == nil {
+		return domain.AttemptOutcome{}, fmt.Errorf("%s outcome is required", field)
+	}
+	failure, err := domain.NewAttemptFailure(value.GetErrorCode(), value.GetErrorMessage())
+	if err != nil {
+		return domain.AttemptOutcome{}, fmt.Errorf("%s must contain a valid error_code and error_message", field)
+	}
+	return constructor(failure)
 }
 
 func invalidArgument(message string) error {

@@ -113,10 +113,13 @@ ORDER BY claimed.available_at, claimed.created_at;
 SELECT
     jobs.status AS job_status,
     jobs.attempt_count,
-    CAST(COALESCE(jobs.result = sqlc.arg(result_json)::jsonb, false) AS boolean) AS result_matches,
-    CAST(COALESCE(jobs.lease_expires_at > statement_timestamp(), false) AS boolean) AS lease_valid,
+    jobs.max_attempts,
+    CAST(jobs.result IS NOT DISTINCT FROM sqlc.narg(result_json)::jsonb AS boolean) AS result_matches,
+    jobs.lease_expires_at,
     job_attempts.worker_id,
-    job_attempts.status AS attempt_status
+    job_attempts.status AS attempt_status,
+    job_attempts.error_code,
+    job_attempts.error_message
 FROM jobs
 JOIN job_attempts
   ON job_attempts.job_id = jobs.id
@@ -124,70 +127,78 @@ JOIN job_attempts
 WHERE jobs.id = sqlc.arg(job_id)
 FOR UPDATE OF jobs, job_attempts;
 
--- name: FinishAttemptSuccess :execrows
+-- name: GetTransitionTime :one
+SELECT statement_timestamp()::timestamptz;
+
+-- name: FinishAttempt :execrows
 UPDATE job_attempts
-SET status = 'succeeded',
-    finished_at = sqlc.arg(finished_at)
+SET status = sqlc.arg(attempt_status),
+    error_code = sqlc.narg(error_code),
+    error_message = sqlc.narg(error_message),
+    finished_at = sqlc.arg(transition_time)
 WHERE job_id = sqlc.arg(job_id)
   AND attempt_no = sqlc.arg(attempt_no)
   AND worker_id = sqlc.arg(worker_id)
   AND status = 'running';
 
--- name: FinishJobSuccess :execrows
+-- name: FinishJob :execrows
 UPDATE jobs
-SET status = 'succeeded',
-    result = sqlc.arg(result_json)::jsonb,
+SET status = sqlc.arg(job_status),
+    result = sqlc.narg(result_json)::jsonb,
     current_worker_id = NULL,
     lease_expires_at = NULL,
-    finished_at = sqlc.arg(finished_at),
-    updated_at = sqlc.arg(finished_at)
+    available_at = CASE
+        WHEN sqlc.arg(job_status) = 'retry_wait' THEN sqlc.arg(transition_time)::timestamptz
+            + sqlc.arg(retry_delay_ms)::bigint * interval '1 millisecond'
+        ELSE available_at
+    END,
+    finished_at = CASE
+        WHEN sqlc.arg(job_status) IN ('succeeded', 'dead_lettered', 'cancelled')
+            THEN sqlc.arg(transition_time)::timestamptz
+        ELSE NULL
+    END,
+    updated_at = sqlc.arg(transition_time)::timestamptz
 WHERE id = sqlc.arg(job_id)
   AND attempt_count = sqlc.arg(attempt_no)
   AND current_worker_id = sqlc.arg(worker_id)
   AND status = 'running'
-  AND lease_expires_at > statement_timestamp();
+  AND lease_expires_at > sqlc.arg(transition_time)::timestamptz;
 
--- name: RecoverExpiredJobs :many
-WITH expired AS MATERIALIZED (
-    SELECT
-        id,
-        attempt_count,
-        attempt_count >= max_attempts AS attempts_exhausted
-    FROM jobs
-    WHERE status = 'running'
-      AND lease_expires_at <= statement_timestamp()
-    ORDER BY lease_expires_at, id
-    FOR UPDATE SKIP LOCKED
-    LIMIT sqlc.arg(batch_size)
-), abandoned AS (
-    UPDATE job_attempts
-    SET status = 'abandoned',
-        finished_at = statement_timestamp()
-    FROM expired
-    WHERE job_attempts.job_id = expired.id
-      AND job_attempts.attempt_no = expired.attempt_count
-      AND job_attempts.status = 'running'
-    RETURNING job_attempts.job_id, job_attempts.attempt_no
-), recovered AS (
-    UPDATE jobs
-    SET status = CASE
-            WHEN expired.attempts_exhausted THEN 'dead_lettered'
-            ELSE 'retry_wait'
-        END,
-        current_worker_id = NULL,
-        lease_expires_at = NULL,
-        available_at = statement_timestamp(),
-        finished_at = CASE
-            WHEN expired.attempts_exhausted THEN statement_timestamp()
-            ELSE NULL
-        END,
-        updated_at = statement_timestamp()
-    FROM expired
-    JOIN abandoned
-      ON abandoned.job_id = expired.id
-     AND abandoned.attempt_no = expired.attempt_count
-    WHERE jobs.id = expired.id
-    RETURNING jobs.id
-)
-SELECT id
-FROM recovered;
+-- name: LockExpiredJobs :many
+SELECT id, attempt_count, max_attempts
+FROM jobs
+WHERE status = 'running'
+  AND lease_expires_at <= statement_timestamp()
+ORDER BY lease_expires_at, id
+FOR UPDATE SKIP LOCKED
+LIMIT sqlc.arg(batch_size);
+
+-- name: AbandonExpiredAttempt :execrows
+UPDATE job_attempts
+SET status = 'abandoned',
+    error_code = 'lease_expired',
+    error_message = 'worker lease expired before the attempt completed',
+    finished_at = sqlc.arg(transition_time)
+WHERE job_id = sqlc.arg(job_id)
+  AND attempt_no = sqlc.arg(attempt_no)
+  AND status = 'running';
+
+-- name: RecoverExpiredJob :execrows
+UPDATE jobs
+SET status = sqlc.arg(job_status),
+    current_worker_id = NULL,
+    lease_expires_at = NULL,
+    available_at = CASE
+        WHEN sqlc.arg(job_status) = 'retry_wait' THEN sqlc.arg(transition_time)::timestamptz
+            + sqlc.arg(retry_delay_ms)::bigint * interval '1 millisecond'
+        ELSE available_at
+    END,
+    finished_at = CASE
+        WHEN sqlc.arg(job_status) = 'dead_lettered' THEN sqlc.arg(transition_time)::timestamptz
+        ELSE NULL
+    END,
+    updated_at = sqlc.arg(transition_time)::timestamptz
+WHERE id = sqlc.arg(job_id)
+  AND status = 'running'
+  AND attempt_count = sqlc.arg(attempt_no)
+  AND lease_expires_at <= statement_timestamp();

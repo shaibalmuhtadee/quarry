@@ -89,7 +89,7 @@ func TestJobStoreListsAttemptsInAttemptNumberOrder(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool := newDispatcherTestPool(t, ctx)
-	dispatcherStore := postgres.NewDispatcherStore(pool, testLeaseDuration)
+	dispatcherStore := newDispatcherTestStore(t, pool, testLeaseDuration)
 	jobStore := postgres.NewJobStore(pool)
 	worker := registerTestWorker(t, ctx, dispatcherStore, 1)
 	job := createTestJob(t, ctx, jobStore, "history.test", `{}`)
@@ -123,16 +123,29 @@ func TestJobStoreListsAttemptsInAttemptNumberOrder(t *testing.T) {
 			t.Fatalf("insert attempt %d: %v", attempt.number, err)
 		}
 	}
+	thirdStartedAt := secondStartedAt.Add(time.Minute)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO job_attempts (
+			job_id, attempt_no, worker_id, status, error_code, error_message, started_at, finished_at
+		)
+		VALUES ($1, 3, $2, 'permanent_failed', 'invalid_input', 'handler rejected the input', $3, $3)
+	`, job.ID.UUID(), worker.UUID(), thirdStartedAt); err != nil {
+		t.Fatalf("insert failed attempt: %v", err)
+	}
 
 	attempts, err := jobStore.ListJobAttempts(ctx, job.ID)
 	if err != nil {
 		t.Fatalf("list stored attempts: %v", err)
 	}
-	if len(attempts) != 2 {
-		t.Fatalf("stored attempt count = %d, want 2", len(attempts))
+	if len(attempts) != 3 {
+		t.Fatalf("stored attempt count = %d, want 3", len(attempts))
 	}
-	if attempts[0].Number.Int32() != 1 || attempts[1].Number.Int32() != 2 {
-		t.Fatalf("stored attempt order = [%d, %d], want [1, 2]", attempts[0].Number.Int32(), attempts[1].Number.Int32())
+	if attempts[0].Number.Int32() != 1 || attempts[1].Number.Int32() != 2 || attempts[2].Number.Int32() != 3 {
+		t.Fatalf("stored attempt order = [%d, %d, %d], want [1, 2, 3]", attempts[0].Number.Int32(), attempts[1].Number.Int32(), attempts[2].Number.Int32())
+	}
+	if attempts[0].Failure != nil || attempts[1].Failure != nil || attempts[2].Failure == nil ||
+		attempts[2].Failure.Code() != "invalid_input" || attempts[2].Failure.Message() != "handler rejected the input" {
+		t.Fatalf("stored attempt failures = [%#v, %#v, %#v]", attempts[0].Failure, attempts[1].Failure, attempts[2].Failure)
 	}
 }
 

@@ -178,7 +178,7 @@ Define the complete attempt outcome model, handler-failure classification, heart
 
 ## Slice 2: durable failure transitions and retry scheduling
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -245,7 +245,25 @@ Finish reported failures atomically, schedule eligible retries, dead-letter perm
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- Migration 5 adds nullable `error_code` and `error_message` columns to `job_attempts`, backfills existing abandoned attempts with the stable `lease_expired` failure, and constrains every stored attempt status to the matching presence or absence of validated failure details.
+- `DispatcherStore.ReportAttempt` now owns one transaction for success and every declared failure outcome. It fences on job ID, current attempt number, worker ID, running state, and an unexpired lease; updates the attempt and job together; and accepts only an exact repeated report after completion.
+- Retryable failures, timeouts, panics, and non-final abandoned attempts enter `retry_wait`. Permanent failures and exhausted retryable outcomes enter `dead_lettered`. Cancelled reports enter `cancelled`, but worker cancellation propagation and the public cancellation command remain deferred to Slices 6 and 7.
+- The store receives a `RetryPolicy` at construction. `cmd/dispatcher` builds it from `QUARRY_RETRY_BASE_DELAY` and `QUARRY_RETRY_MAX_DELAY`, defaulting to one second and sixty seconds, and rejects invalid or sub-millisecond values and a maximum below the base.
+- PostgreSQL supplies one `statement_timestamp()` after the report row lock is acquired. The transaction uses that value for lease fencing, attempt completion, job completion, and retry eligibility. This fixed a report-versus-expiry race where evaluating time on separate SQL statements could pass the initial fence and then update zero job rows.
+- Lease recovery locks a bounded batch with `FOR UPDATE SKIP LOCKED`, calculates a separate jittered delay for each non-final attempt, and applies every selected transition in the same transaction. Abandoned attempts store the safe `lease_expired` failure.
+- Attempt history now maps stored failure details into the domain and returns `error_code` and `error_message` through `GET /v1/jobs/{id}/attempts`. Successful and running attempts return null failure fields.
+- Workers still report only success. Handler failure classification and reporting remain deferred to Slice 3; timeout, panic, cancellation, idempotency, and shutdown behavior remain in their approved later slices.
+- No architecture or project-plan deviation was required.
+
+### Validation result
+
+- `go test -count=1 ./internal/store/postgres/... ./internal/dispatcher ./cmd/dispatcher` passed in 49.903 seconds for the PostgreSQL store package, 4.518 seconds for migration tests, 6.489 seconds for dispatcher tests, and 0.993 seconds for dispatcher command tests.
+- The failure-report versus lease-recovery race test passed three consecutive runs after the lock-time fencing fix.
+- `pwsh ./scripts/dev.ps1 migration-test` passed migration apply, rollback, and reapplication through version 5, including the abandoned-attempt failure backfill and outcome constraints.
+- `pwsh ./scripts/dev.ps1 generate-check` passed the sqlc comparison and fresh Protocol Buffer generation comparison.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned tool checks, generated-code checks, vet, all uncached tests, builds, Compose rendering, migrations through version 5, the HTTP smoke test, the 40-job distributed process test, the worker-crash recovery process test, stale-report coverage, and cleanup verification.
+- `git diff --check` passed after the completion documentation update.
+- GitHub-hosted CI was not run.
 
 ## Slice 3: worker handler-failure reporting
 

@@ -193,12 +193,24 @@ func mapAttempt(row postgresdb.GetJobAttemptsRow) (domain.Attempt, error) {
 	if row.FinishedAt.Valid {
 		finishedAt = &row.FinishedAt.Time
 	}
+	var failure *domain.AttemptFailure
+	if row.ErrorCode.Valid != row.ErrorMessage.Valid {
+		return domain.Attempt{}, errors.New("attempt has incomplete failure details")
+	}
+	if row.ErrorCode.Valid {
+		parsedFailure, err := domain.NewAttemptFailure(row.ErrorCode.String, row.ErrorMessage.String)
+		if err != nil {
+			return domain.Attempt{}, err
+		}
+		failure = &parsedFailure
+	}
 
 	return domain.Attempt{
 		JobID:      jobID,
 		Number:     number,
 		WorkerID:   workerID,
 		Status:     status,
+		Failure:    failure,
 		StartedAt:  row.StartedAt.Time,
 		FinishedAt: finishedAt,
 	}, nil

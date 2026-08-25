@@ -117,6 +117,8 @@ SELECT
     job_attempts.attempt_no,
     job_attempts.worker_id,
     job_attempts.status,
+    job_attempts.error_code,
+    job_attempts.error_message,
     job_attempts.started_at,
     job_attempts.finished_at
 FROM jobs
@@ -126,12 +128,14 @@ ORDER BY job_attempts.attempt_no
 `
 
 type GetJobAttemptsRow struct {
-	JobID      uuid.UUID
-	AttemptNo  pgtype.Int4
-	WorkerID   pgtype.UUID
-	Status     pgtype.Text
-	StartedAt  pgtype.Timestamptz
-	FinishedAt pgtype.Timestamptz
+	JobID        uuid.UUID
+	AttemptNo    pgtype.Int4
+	WorkerID     pgtype.UUID
+	Status       pgtype.Text
+	ErrorCode    pgtype.Text
+	ErrorMessage pgtype.Text
+	StartedAt    pgtype.Timestamptz
+	FinishedAt   pgtype.Timestamptz
 }
 
 func (q *Queries) GetJobAttempts(ctx context.Context, id uuid.UUID) ([]GetJobAttemptsRow, error) {
@@ -148,6 +152,8 @@ func (q *Queries) GetJobAttempts(ctx context.Context, id uuid.UUID) ([]GetJobAtt
 			&i.AttemptNo,
 			&i.WorkerID,
 			&i.Status,
+			&i.ErrorCode,
+			&i.ErrorMessage,
 			&i.StartedAt,
 			&i.FinishedAt,
 		); err != nil {

@@ -21,6 +21,8 @@ SELECT
     job_attempts.attempt_no,
     job_attempts.worker_id,
     job_attempts.status,
+    job_attempts.error_code,
+    job_attempts.error_message,
     job_attempts.started_at,
     job_attempts.finished_at
 FROM jobs
