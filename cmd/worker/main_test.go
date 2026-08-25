@@ -158,7 +158,7 @@ func (service *workerLifecycleService) AcquireJobs(
 	if request.GetAvailableCapacity() != 2 {
 		return nil, status.Errorf(codes.Internal, "capacity = %d", request.GetAvailableCapacity())
 	}
-	wantTypes := []string{"demo.echo", "demo.payload_size"}
+	wantTypes := []string{"demo.echo", "demo.payload_size", "demo.sleep"}
 	if !slices.Equal(request.GetSupportedJobTypes(), wantTypes) {
 		return nil, status.Errorf(codes.Internal, "types = %v", request.GetSupportedJobTypes())
 	}

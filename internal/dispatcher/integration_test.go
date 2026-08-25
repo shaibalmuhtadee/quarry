@@ -22,7 +22,9 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	postgrescontainer "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -214,6 +216,133 @@ func TestConcurrentAcquireJobsThroughGRPCAndPostgres(t *testing.T) {
 	}
 	if !completedResult.OK {
 		t.Fatalf("completed result = %s, want ok true", completed.Result.JSON())
+	}
+}
+
+func TestStaleAttemptReportAfterRecoveryThroughGRPCAndPostgres(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	pool := startDispatcherTestPostgres(t, ctx)
+	store := postgres.NewDispatcherStore(pool, 20*time.Second)
+	jobStore := postgres.NewJobStore(pool)
+
+	listener := bufconn.Listen(1 << 20)
+	server := grpc.NewServer()
+	dispatcherv1.RegisterDispatcherServiceServer(server, dispatcher.NewService(store))
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = listener.Close()
+		<-serveDone
+	})
+	connection, err := grpc.NewClient(
+		"passthrough:///dispatcher-recovery-test",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		}),
+	)
+	if err != nil {
+		t.Fatalf("create gRPC client connection: %v", err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	client := dispatcherv1.NewDispatcherServiceClient(connection)
+
+	jobType := mustJobType(t, "grpc.recovery")
+	payload, err := domain.ParsePayload([]byte(`{"test":"stale-report"}`))
+	if err != nil {
+		t.Fatalf("parse recovery payload: %v", err)
+	}
+	submission, err := domain.NewJobSubmission(jobType, payload, 3, 30*time.Second)
+	if err != nil {
+		t.Fatalf("create recovery submission: %v", err)
+	}
+	job, err := jobStore.CreateJob(ctx, submission)
+	if err != nil {
+		t.Fatalf("create recovery job: %v", err)
+	}
+
+	workers := []domain.WorkerID{domain.NewWorkerID(), domain.NewWorkerID()}
+	for index, workerID := range workers {
+		if _, err := client.RegisterWorker(ctx, &dispatcherv1.RegisterWorkerRequest{
+			WorkerId:    workerID.String(),
+			Hostname:    fmt.Sprintf("recovery-worker-%d", index+1),
+			Version:     "test",
+			Concurrency: 1,
+			StartedAt:   timestamppb.Now(),
+		}); err != nil {
+			t.Fatalf("register recovery worker %d: %v", index+1, err)
+		}
+	}
+
+	firstResponse, err := client.AcquireJobs(ctx, &dispatcherv1.AcquireJobsRequest{
+		WorkerId:          workers[0].String(),
+		AvailableCapacity: 1,
+		SupportedJobTypes: []string{jobType.String()},
+	})
+	if err != nil || len(firstResponse.GetJobs()) != 1 {
+		t.Fatalf("acquire attempt 1 = (%d jobs, %v), want (1, nil)", len(firstResponse.GetJobs()), err)
+	}
+	firstAttempt := firstResponse.GetJobs()[0]
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at = statement_timestamp() - interval '1 second' WHERE id = $1`, job.ID.UUID()); err != nil {
+		t.Fatalf("expire attempt 1: %v", err)
+	}
+	if recovered, err := store.RecoverExpiredAttempts(ctx, 1, time.Hour); err != nil || recovered != 1 {
+		t.Fatalf("recover attempt 1 = (%d, %v), want (1, nil)", recovered, err)
+	}
+
+	secondResponse, err := client.AcquireJobs(ctx, &dispatcherv1.AcquireJobsRequest{
+		WorkerId:          workers[1].String(),
+		AvailableCapacity: 1,
+		SupportedJobTypes: []string{jobType.String()},
+	})
+	if err != nil || len(secondResponse.GetJobs()) != 1 {
+		t.Fatalf("acquire attempt 2 = (%d jobs, %v), want (1, nil)", len(secondResponse.GetJobs()), err)
+	}
+	secondAttempt := secondResponse.GetJobs()[0]
+	if secondAttempt.GetJobId() != job.ID.String() || secondAttempt.GetAttemptNo() != 2 {
+		t.Fatalf("attempt 2 = (%s, %d), want (%s, 2)", secondAttempt.GetJobId(), secondAttempt.GetAttemptNo(), job.ID)
+	}
+
+	_, err = client.ReportAttempt(ctx, &dispatcherv1.ReportAttemptRequest{
+		WorkerId:  workers[0].String(),
+		JobId:     firstAttempt.GetJobId(),
+		AttemptNo: firstAttempt.GetAttemptNo(),
+		Outcome: &dispatcherv1.ReportAttemptRequest_Succeeded{
+			Succeeded: &dispatcherv1.AttemptSucceeded{ResultJson: []byte(`{"stale":true}`)},
+		},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("stale attempt report status = %s, want FailedPrecondition", status.Code(err))
+	}
+	current, err := jobStore.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("get job after stale report: %v", err)
+	}
+	if current.Status != domain.JobStatusRunning || current.AttemptCount != 2 || current.Result != nil {
+		t.Fatalf("job after stale report = %#v, want running attempt 2 without result", current)
+	}
+
+	_, err = client.ReportAttempt(ctx, &dispatcherv1.ReportAttemptRequest{
+		WorkerId:  workers[1].String(),
+		JobId:     secondAttempt.GetJobId(),
+		AttemptNo: secondAttempt.GetAttemptNo(),
+		Outcome: &dispatcherv1.ReportAttemptRequest_Succeeded{
+			Succeeded: &dispatcherv1.AttemptSucceeded{ResultJson: []byte(`{"attempt":2}`)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("report attempt 2: %v", err)
+	}
+	attempts, err := jobStore.ListJobAttempts(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("list recovered attempts: %v", err)
+	}
+	if len(attempts) != 2 || attempts[0].Status != domain.AttemptStatusAbandoned ||
+		attempts[1].Status != domain.AttemptStatusSucceeded || attempts[0].WorkerID != workers[0] ||
+		attempts[1].WorkerID != workers[1] {
+		t.Fatalf("recovered attempts = %#v", attempts)
 	}
 }
 

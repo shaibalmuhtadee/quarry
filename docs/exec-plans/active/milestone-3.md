@@ -417,7 +417,7 @@ Recover expired work safely when one or several dispatcher processes run reapers
 
 ## Slice 6: worker-crash acceptance test and developer flow
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -473,11 +473,58 @@ Prove the Milestone 3 definition of done with real API, dispatcher, worker, and 
 
 ### Decisions and deviations discovered during implementation
 
-- Pending implementation.
+- `demo.sleep` accepts `{"duration_ms": N}` with a positive whole-millisecond
+  integer and returns `{"slept_ms": N}`. It waits on either its timer or context
+  cancellation. It does not inspect or enforce the submitted job timeout.
+- The process test uses a two-second lease, 250-millisecond worker heartbeats,
+  a 200-millisecond reaper interval, and a six-second sleep. These values keep
+  the crash window observable while bounding the full test.
+- The test observes both the lease and `workers.last_seen_at` advance before
+  force-killing worker 1. It then observes both values remain unchanged for
+  750 milliseconds before starting worker 2.
+- The test treats HTTP as the client verification boundary and also queries
+  PostgreSQL for the final job, both attempts, both worker identities, worker
+  states, cleared lease, stored result, and finish timestamps.
+- `recovery-test` always force-kills worker 1, even on platforms where normal
+  process cleanup first requests termination. Its cleanup path removes all
+  remaining processes, temporary binaries, and the isolated Compose container,
+  network, and volume, then queries the host to confirm their removal.
+- The focused gRPC integration test recovers attempt 1, starts attempt 2, and
+  proves a stale success report returns `FailedPrecondition` without changing
+  attempt 2. `recovery-test` runs this test after the process test.
+- The standalone recovery command passed twice before it was added to `check`.
+- Adding `demo.sleep` changed the worker's advertised handler list. The first
+  canonical check exposed an outdated two-handler assertion in the worker
+  command lifecycle test; the assertion now expects all three registered
+  handlers. No production behavior changed to satisfy the test.
+- No handler failure outcome, retry backoff, timeout enforcement, panic
+  recovery, cancellation API, graceful drain, or idempotency behavior was
+  added.
 
 ### Validation result
 
-- Pending implementation.
+- Deterministic `demo.sleep` tests passed timer completion, exact result,
+  context cancellation, invalid durations, and registry membership.
+- `TestStaleAttemptReportAfterRecoveryThroughGRPCAndPostgres` passed against
+  PostgreSQL 18.6.
+- `pwsh ./scripts/dev.ps1 recovery-test` passed twice as a standalone command.
+  Each run proved attempt 1 renewal and forced worker death, stopped lease and
+  liveness updates, attempt 1 abandonment, attempt 2 success on another worker,
+  HTTP and direct PostgreSQL state, stale-report rejection, and cleanup.
+- `pwsh ./scripts/dev.ps1 distributed-test` passed 40 jobs with two worker
+  processes at concurrency two and direct PostgreSQL verification.
+- `docker run --rm --volume "C:\Users\shai\Documents\Code\quarry:/src"
+  --workdir /src golang:1.27.0-bookworm go test -race -count=1
+  ./internal/worker/... ./cmd/worker` passed the worker runtime, handlers, and
+  command lifecycle under the Linux race detector.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned
+  tool checks, generated-code checks, vet, all uncached tests, builds, Compose
+  rendering, migrations through version 4, the HTTP smoke test, the distributed
+  process test, the crash-recovery process test, cleanup verification, and the
+  stale-report gRPC integration test.
+- `git diff --check` passed. `git status --short` contains only the seven files
+  changed for Slice 6.
+- GitHub-hosted CI was not run.
 
 ## Milestone audit
 

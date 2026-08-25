@@ -2,7 +2,7 @@
 
 Quarry is a distributed job execution system written in Go. PostgreSQL stores jobs and attempts, the HTTP API accepts and reads jobs, the gRPC dispatcher claims work, and bounded worker processes run registered handlers.
 
-The current successful path provides at-least-once execution without crash recovery. A worker crash after acquisition can leave a job in `running` until Milestone 3 adds leases and recovery.
+The current successful path provides at-least-once execution with leased attempts. The dispatcher recovers work after a worker crash, abandons the expired attempt, and makes the logical job eligible for another worker.
 
 ## Requirements
 
@@ -57,7 +57,10 @@ $state
 Invoke-RestMethod -Uri "http://localhost:8080/v1/jobs/$($job.id)/attempts"
 ```
 
-Workers also register `demo.payload_size`. It returns the number of bytes in the JSON value received from the dispatcher.
+Workers also register these demonstration handlers:
+
+- `demo.payload_size` returns the number of bytes in the JSON value received from the dispatcher.
+- `demo.sleep` accepts `{"duration_ms": N}`, waits for that duration or context cancellation, and returns `{"slept_ms": N}`. It does not enforce the submitted job timeout.
 
 The API also exposes liveness and readiness endpoints:
 
@@ -81,9 +84,14 @@ The processes accept these environment variables:
 - `QUARRY_DATABASE_URL`: PostgreSQL connection string. The default connects to the development database on port 5432.
 - `QUARRY_HTTP_ADDR`: HTTP listen address. The default is `:8080`.
 - `QUARRY_DISPATCHER_ADDR`: dispatcher gRPC listen address for the dispatcher and target address for workers. The default is `localhost:9090`.
+- `QUARRY_LEASE_DURATION`: dispatcher lease duration. The default is `20s`.
+- `QUARRY_REAPER_INTERVAL`: dispatcher expired-lease scan interval. The default is `1s`.
+- `QUARRY_REAPER_BATCH_SIZE`: maximum jobs recovered in one transaction. The default is `100`.
+- `QUARRY_WORKER_LIVENESS_TIMEOUT`: dispatcher worker-liveness threshold. The default matches `QUARRY_LEASE_DURATION`.
 - `QUARRY_WORKER_CONCURRENCY`: positive worker executor count. The default is `4`.
 - `QUARRY_WORKER_HOSTNAME`: worker registration hostname. The default is the operating-system hostname.
 - `QUARRY_WORKER_VERSION`: worker registration version. The default is `dev`.
+- `QUARRY_HEARTBEAT_INTERVAL`: worker heartbeat interval. The default is `5s`.
 
 The development script also accepts `QUARRY_POSTGRES_PORT` to change the host port used by Docker Compose and migration commands. Set `QUARRY_DATABASE_URL` to the matching port when you run the API.
 
@@ -103,7 +111,15 @@ Run the distributed process test by itself:
 pwsh ./scripts/dev.ps1 distributed-test
 ```
 
-The distributed test builds temporary binaries and starts an isolated PostgreSQL database, one API process, one dispatcher process, and two worker processes with concurrency two. It submits 40 jobs across both demonstration handlers, waits for every job to succeed, checks every result and attempt through HTTP and directly in PostgreSQL, and requires both workers to complete work. The test removes its processes, binaries, Compose volume, and network before it exits.
+The distributed test builds temporary binaries and starts an isolated PostgreSQL database, one API process, one dispatcher process, and two worker processes with concurrency two. It submits 40 jobs across `demo.echo` and `demo.payload_size`, waits for every job to succeed, checks every result and attempt through HTTP and directly in PostgreSQL, and requires both workers to complete work. The test removes its processes, binaries, Compose volume, and network before it exits.
+
+Run the worker-crash recovery test by itself:
+
+```powershell
+pwsh ./scripts/dev.ps1 recovery-test
+```
+
+The recovery test starts isolated API, dispatcher, worker, and PostgreSQL processes. It submits a long-running `demo.sleep` job, proves worker 1 renews attempt 1, kills that worker without graceful shutdown, and proves the lease and worker heartbeat stop advancing. Worker 2 then completes attempt 2. The test verifies both attempts through HTTP and PostgreSQL, runs a stale-report gRPC integration test, and checks that all temporary processes and Docker resources were removed.
 
 Run the HTTP smoke test by itself:
 
@@ -132,4 +148,4 @@ pwsh ./scripts/dev.ps1 generate-check
 
 ## Current limits
 
-Quarry does not yet recover jobs after worker crashes. It also does not yet provide failure outcomes, durable retries, timeout enforcement, panic recovery, cancellation, idempotent submission, metrics, or tracing. These capabilities belong to later milestones.
+Quarry does not yet provide handler failure outcomes, general durable retry policy or backoff, timeout enforcement, panic recovery, cancellation, graceful worker draining, idempotent submission, metrics, or tracing. These capabilities belong to later milestones.
