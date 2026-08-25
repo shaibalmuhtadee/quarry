@@ -172,3 +172,34 @@ func TestParseHeartbeatResultRejectsInvalidResponses(t *testing.T) {
 		})
 	}
 }
+
+func TestGRPCClientRejectsHeartbeatResponseThatDoesNotMatchRequest(t *testing.T) {
+	attemptNumber, err := domain.NewAttemptNumber(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := HeartbeatAttempt{JobID: domain.NewJobID(), AttemptNumber: attemptNumber}
+	tests := []struct {
+		name    string
+		results []*dispatcherv1.HeartbeatAttemptResult
+	}{
+		{name: "missing result"},
+		{name: "wrong identity", results: []*dispatcherv1.HeartbeatAttemptResult{{
+			JobId:     domain.NewJobID().String(),
+			AttemptNo: 1,
+			State:     dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID,
+		}}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := NewGRPCClient(&recordingRPCClient{heartbeats: test.results}, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Heartbeat(context.Background(), domain.NewWorkerID(), []HeartbeatAttempt{attempt}); err == nil {
+				t.Fatal("Heartbeat accepted a mismatched response")
+			}
+		})
+	}
+}

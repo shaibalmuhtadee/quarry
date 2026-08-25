@@ -2,6 +2,8 @@ package worker
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,9 +15,25 @@ import (
 )
 
 type fakeDispatcher struct {
-	register func(context.Context, Registration) error
-	acquire  func(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error)
-	report   func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.Result) error
+	register  func(context.Context, Registration) error
+	acquire   func(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error)
+	heartbeat func(context.Context, domain.WorkerID, []HeartbeatAttempt) ([]HeartbeatResult, error)
+	report    func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.Result) error
+}
+
+func (dispatcher *fakeDispatcher) Heartbeat(
+	ctx context.Context,
+	workerID domain.WorkerID,
+	attempts []HeartbeatAttempt,
+) ([]HeartbeatResult, error) {
+	if dispatcher.heartbeat != nil {
+		return dispatcher.heartbeat(ctx, workerID, attempts)
+	}
+	results := make([]HeartbeatResult, len(attempts))
+	for i, attempt := range attempts {
+		results[i] = HeartbeatResult{Attempt: attempt, Valid: true}
+	}
+	return results, nil
 }
 
 func (dispatcher *fakeDispatcher) Register(ctx context.Context, registration Registration) error {
@@ -264,6 +282,286 @@ func TestWorkerRetriesTransientReportWithSameIdentity(t *testing.T) {
 	}
 }
 
+func TestActiveAttemptsTrackIdentityAndCancelOnlyTheStaleAttempt(t *testing.T) {
+	t.Parallel()
+
+	jobs := makeJobs(t, 2, "demo.test")
+	active := newActiveAttempts()
+	first, err := active.add(context.Background(), jobs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := active.add(context.Background(), jobs[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := active.snapshot()
+	if len(snapshot) != 2 || !slices.Contains(snapshot, first.identity) || !slices.Contains(snapshot, second.identity) {
+		t.Fatalf("active snapshot = %#v", snapshot)
+	}
+	if !active.cancel(first.identity, errLeaseStale) {
+		t.Fatal("stale attempt was not removed")
+	}
+	if !errors.Is(context.Cause(first.ctx), errLeaseStale) {
+		t.Fatalf("stale attempt cause = %v", context.Cause(first.ctx))
+	}
+	select {
+	case <-second.ctx.Done():
+		t.Fatalf("unrelated attempt was canceled: %v", context.Cause(second.ctx))
+	default:
+	}
+	if active.len() != 1 || !active.remove(second, nil) || active.len() != 0 {
+		t.Fatalf("active registry did not converge to empty")
+	}
+}
+
+func TestWorkerHeartbeatsExecutingAndReportingAttemptUntilAcknowledged(t *testing.T) {
+	t.Parallel()
+
+	job := makeJobs(t, 1, "demo.test")[0]
+	var acquired atomic.Bool
+	dispatcher := &fakeDispatcher{}
+	dispatcher.acquire = func(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error) {
+		if acquired.CompareAndSwap(false, true) {
+			return []Job{job}, nil
+		}
+		return nil, nil
+	}
+	heartbeats := make(chan []HeartbeatAttempt, 32)
+	executingHeartbeated := make(chan struct{})
+	reportingHeartbeated := make(chan struct{})
+	var executingOnce, reportingOnce sync.Once
+	var reporting atomic.Bool
+	dispatcher.heartbeat = func(
+		_ context.Context,
+		_ domain.WorkerID,
+		attempts []HeartbeatAttempt,
+	) ([]HeartbeatResult, error) {
+		copyOfAttempts := append([]HeartbeatAttempt(nil), attempts...)
+		select {
+		case heartbeats <- copyOfAttempts:
+		default:
+		}
+		results := make([]HeartbeatResult, len(attempts))
+		for i, attempt := range attempts {
+			if attempt.JobID == job.ID {
+				if reporting.Load() {
+					reportingOnce.Do(func() { close(reportingHeartbeated) })
+				} else {
+					executingOnce.Do(func() { close(executingHeartbeated) })
+				}
+			}
+			results[i] = HeartbeatResult{Attempt: attempt, Valid: true}
+		}
+		return results, nil
+	}
+	handlerStarted := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	reportStarted := make(chan struct{})
+	releaseReport := make(chan struct{})
+	reported := make(chan struct{})
+	dispatcher.report = func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.Result) error {
+		reporting.Store(true)
+		close(reportStarted)
+		<-releaseReport
+		close(reported)
+		return nil
+	}
+	runtime := newTestWorker(t, dispatcher, 1, map[string]Handler{
+		"demo.test": func(context.Context, domain.Payload) (domain.Result, error) {
+			close(handlerStarted)
+			<-releaseHandler
+			return mustResult(t, `{"ok":true}`), nil
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runWorker(runtime, ctx)
+	awaitSignal(t, handlerStarted)
+	awaitSignal(t, executingHeartbeated)
+	close(releaseHandler)
+	awaitSignal(t, reportStarted)
+	awaitSignal(t, reportingHeartbeated)
+	close(releaseReport)
+	awaitSignal(t, reported)
+	awaitHeartbeatWithoutAttempts(t, heartbeats)
+	cancel()
+	if err := awaitRun(t, done); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkerHeartbeatsAttemptBufferedAfterStaleExecutionCancellation(t *testing.T) {
+	t.Parallel()
+
+	jobs := makeJobs(t, 2, "demo.test")
+	var acquireCalls atomic.Int32
+	replacementAcquisition := make(chan struct{})
+	var replacementOnce sync.Once
+	dispatcher := &fakeDispatcher{}
+	dispatcher.acquire = func(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error) {
+		call := acquireCalls.Add(1)
+		if call <= 2 {
+			return []Job{jobs[call-1]}, nil
+		}
+		replacementOnce.Do(func() { close(replacementAcquisition) })
+		return nil, nil
+	}
+	staleCanceled := make(chan struct{})
+	bufferedHeartbeated := make(chan struct{})
+	var staleOnce, bufferedOnce sync.Once
+	dispatcher.heartbeat = func(
+		_ context.Context,
+		_ domain.WorkerID,
+		attempts []HeartbeatAttempt,
+	) ([]HeartbeatResult, error) {
+		results := make([]HeartbeatResult, len(attempts))
+		for i, attempt := range attempts {
+			valid := false
+			if !valid {
+				staleOnce.Do(func() { close(staleCanceled) })
+			}
+			if attempt.JobID == jobs[1].ID {
+				bufferedOnce.Do(func() { close(bufferedHeartbeated) })
+			}
+			results[i] = HeartbeatResult{Attempt: attempt, Valid: valid}
+		}
+		return results, nil
+	}
+	releaseStaleHandler := make(chan struct{})
+	handlerStarted := make(chan struct{})
+	unexpectedSecondHandler := make(chan struct{})
+	var handlerCalls atomic.Int32
+	dispatcher.report = func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.Result) error {
+		return nil
+	}
+	runtime := newTestWorker(t, dispatcher, 1, map[string]Handler{
+		"demo.test": func(ctx context.Context, _ domain.Payload) (domain.Result, error) {
+			if handlerCalls.Add(1) > 1 {
+				close(unexpectedSecondHandler)
+				return domain.Result{}, errors.New("stale buffered attempt executed")
+			}
+			close(handlerStarted)
+			<-ctx.Done()
+			<-releaseStaleHandler
+			return domain.Result{}, ctx.Err()
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runWorker(runtime, ctx)
+	awaitSignal(t, handlerStarted)
+	awaitSignal(t, staleCanceled)
+	awaitSignal(t, bufferedHeartbeated)
+	awaitSignal(t, replacementAcquisition)
+	close(releaseStaleHandler)
+	select {
+	case <-unexpectedSecondHandler:
+		t.Fatal("worker executed a buffered attempt after its lease became stale")
+	case <-time.After(25 * time.Millisecond):
+	}
+	cancel()
+	if err := awaitRun(t, done); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkerRetriesTransientHeartbeatOnNextInterval(t *testing.T) {
+	t.Parallel()
+
+	job := makeJobs(t, 1, "demo.test")[0]
+	var acquired atomic.Bool
+	dispatcher := &fakeDispatcher{}
+	dispatcher.acquire = func(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error) {
+		if acquired.CompareAndSwap(false, true) {
+			return []Job{job}, nil
+		}
+		return nil, nil
+	}
+	secondHeartbeat := make(chan struct{})
+	var calls atomic.Int32
+	var secondOnce sync.Once
+	dispatcher.heartbeat = func(
+		_ context.Context,
+		_ domain.WorkerID,
+		attempts []HeartbeatAttempt,
+	) ([]HeartbeatResult, error) {
+		if len(attempts) == 0 {
+			return []HeartbeatResult{}, nil
+		}
+		if calls.Add(1) == 1 {
+			return nil, status.Error(codes.Unavailable, "temporary")
+		}
+		secondOnce.Do(func() { close(secondHeartbeat) })
+		return []HeartbeatResult{{Attempt: attempts[0], Valid: true}}, nil
+	}
+	dispatcher.report = func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.Result) error {
+		return nil
+	}
+	handlerStarted := make(chan struct{})
+	runtime := newTestWorker(t, dispatcher, 1, map[string]Handler{
+		"demo.test": func(ctx context.Context, _ domain.Payload) (domain.Result, error) {
+			close(handlerStarted)
+			<-ctx.Done()
+			return domain.Result{}, ctx.Err()
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runWorker(runtime, ctx)
+	awaitSignal(t, handlerStarted)
+	awaitSignal(t, secondHeartbeat)
+	cancel()
+	if err := awaitRun(t, done); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("non-empty heartbeat calls = %d, want at least 2", calls.Load())
+	}
+}
+
+func TestWorkerTreatsFailedPreconditionReportAsLostAttempt(t *testing.T) {
+	t.Parallel()
+
+	jobs := makeJobs(t, 2, "demo.test")
+	var acquireCalls atomic.Int32
+	dispatcher := &fakeDispatcher{}
+	dispatcher.acquire = func(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error) {
+		call := acquireCalls.Add(1)
+		if call <= 2 {
+			return []Job{jobs[call-1]}, nil
+		}
+		return nil, nil
+	}
+	secondReported := make(chan struct{})
+	dispatcher.report = func(
+		_ context.Context,
+		_ domain.WorkerID,
+		jobID domain.JobID,
+		_ domain.AttemptNumber,
+		_ domain.Result,
+	) error {
+		if jobID == jobs[0].ID {
+			return status.Error(codes.FailedPrecondition, "stale")
+		}
+		close(secondReported)
+		return nil
+	}
+	runtime := newTestWorker(t, dispatcher, 1, map[string]Handler{
+		"demo.test": func(context.Context, domain.Payload) (domain.Result, error) {
+			return mustResult(t, `{"ok":true}`), nil
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runWorker(runtime, ctx)
+	awaitSignal(t, secondReported)
+	cancel()
+	if err := awaitRun(t, done); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func newTestWorker(
 	t *testing.T,
 	dispatcher Dispatcher,
@@ -290,10 +588,11 @@ func newTestWorkerWithID(
 			Concurrency: concurrency,
 			StartedAt:   time.Now(),
 		},
-		IdleBackoffMin:   time.Millisecond,
-		IdleBackoffMax:   2 * time.Millisecond,
-		ReportBackoffMin: time.Millisecond,
-		ReportBackoffMax: 2 * time.Millisecond,
+		IdleBackoffMin:    time.Millisecond,
+		IdleBackoffMax:    2 * time.Millisecond,
+		ReportBackoffMin:  time.Millisecond,
+		ReportBackoffMax:  2 * time.Millisecond,
+		HeartbeatInterval: 5 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -362,5 +661,20 @@ func awaitRun(t *testing.T, done <-chan error) error {
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for worker")
 		return nil
+	}
+}
+
+func awaitHeartbeatWithoutAttempts(t *testing.T, heartbeats <-chan []HeartbeatAttempt) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case attempts := <-heartbeats:
+			if len(attempts) == 0 {
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for empty heartbeat")
+		}
 	}
 }

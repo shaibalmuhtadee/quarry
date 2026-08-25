@@ -237,7 +237,7 @@ Renew valid leases and update worker liveness through the dispatcher.
 
 ## Slice 4: worker heartbeat loop and active-attempt registry
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -291,11 +291,26 @@ Make the worker heartbeat every acquired but unfinished attempt while preserving
 
 ### Decisions and deviations discovered during implementation
 
-- Pending implementation.
+- The worker owns one mutex-protected registry keyed by typed job ID and attempt number. The acquisition loop, executor goroutines, and heartbeat loop share this set because it is the authoritative local record of acquired but unfinished work.
+- The acquisition loop adds each attempt to the registry before it sends the attempt to the bounded work channel. Registry size, not a separate counter, determines advertised capacity.
+- A buffered notification channel only wakes the acquisition loop after registry capacity changes. The registry remains authoritative, so coalesced notifications cannot corrupt capacity accounting.
+- Each registry entry owns a `context.WithCancelCause` context derived from the worker lifecycle. A stale heartbeat removes only the matching entry and cancels only that attempt with the stale-lease cause.
+- Executors check the stale cause before handler invocation and after handler return. A buffered attempt that becomes stale never starts, and an executing attempt that observes cancellation does not report success.
+- Attempts remain registered while their handlers execute and while success reporting retries. Successful acknowledgement removes the attempt. A `FailedPrecondition` success response removes the raced attempt without stopping the worker.
+- One periodic heartbeat loop sends the full registry snapshot, including buffered, executing, and success-reporting attempts. It also sends empty heartbeats to refresh worker liveness.
+- Transient heartbeat errors wait for the next configured interval. A non-transient heartbeat error stops the worker because it cannot safely maintain leases.
+- The worker gRPC client requires one response entry for each request entry in the same identity order. It rejects missing, extra, reordered, or substituted results before the registry can act on them.
+- `QUARRY_HEARTBEAT_INTERVAL` configures a positive duration and defaults to five seconds.
+- No architecture deviation was required. Slice 4 added no reaper, expired-attempt recovery, retry scheduling, execution timeout, panic recovery, cancellation instruction, or graceful drain behavior.
 
 ### Validation result
 
-- Pending implementation.
+- `go test -count=1 ./internal/worker/... ./cmd/worker` passed heartbeat identity, registry, buffered, executing, reporting, stale cancellation, transient failure, raced report, concurrency, capacity, gRPC client, handler, configuration, and process lifecycle tests. The first restricted run could not read the Windows Go build cache; the rerun with normal cache access passed.
+- `go test -count=20 ./internal/worker ./cmd/worker` passed twenty consecutive runs of the timing-sensitive worker and process tests.
+- `docker run --rm --volume "C:\Users\shai\Documents\Code\quarry:/src" --workdir /src golang:1.27.0-bookworm go test -race -count=1 ./internal/worker/... ./cmd/worker` passed the required race detector on Linux after the final stale-buffer guard.
+- `pwsh ./scripts/dev.ps1 check` passed module consistency, formatting, pinned tool checks, generated-code checks, vet, all uncached tests, builds, Compose rendering, migrations through version 4, the HTTP smoke test, and the distributed process test. The distributed test processed 40 jobs with two heartbeating workers and verified PostgreSQL state.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
 
 ## Slice 5: bounded lease reaper and expired-attempt recovery
 

@@ -23,6 +23,7 @@ const (
 	defaultDispatcherAddress = "localhost:9090"
 	defaultConcurrency       = uint32(4)
 	defaultVersion           = "dev"
+	defaultHeartbeatInterval = 5 * time.Second
 	rpcTimeout               = 5 * time.Second
 	idleBackoffMin           = 50 * time.Millisecond
 	idleBackoffMax           = time.Second
@@ -35,6 +36,7 @@ type config struct {
 	hostname          string
 	version           string
 	concurrency       uint32
+	heartbeatInterval time.Duration
 }
 
 func main() {
@@ -79,12 +81,21 @@ func loadConfig() (config, error) {
 		}
 		concurrency = uint32(parsed)
 	}
+	heartbeatInterval := defaultHeartbeatInterval
+	if rawInterval := os.Getenv("QUARRY_HEARTBEAT_INTERVAL"); rawInterval != "" {
+		parsed, err := time.ParseDuration(rawInterval)
+		if err != nil || parsed <= 0 {
+			return config{}, fmt.Errorf("QUARRY_HEARTBEAT_INTERVAL must be a positive duration")
+		}
+		heartbeatInterval = parsed
+	}
 
 	return config{
 		dispatcherAddress: dispatcherAddress,
 		hostname:          hostname,
 		version:           version,
 		concurrency:       concurrency,
+		heartbeatInterval: heartbeatInterval,
 	}, nil
 }
 
@@ -116,10 +127,11 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 			Concurrency: cfg.concurrency,
 			StartedAt:   startedAt,
 		},
-		IdleBackoffMin:   idleBackoffMin,
-		IdleBackoffMax:   idleBackoffMax,
-		ReportBackoffMin: reportBackoffMin,
-		ReportBackoffMax: reportBackoffMax,
+		IdleBackoffMin:    idleBackoffMin,
+		IdleBackoffMax:    idleBackoffMax,
+		ReportBackoffMin:  reportBackoffMin,
+		ReportBackoffMax:  reportBackoffMax,
+		HeartbeatInterval: cfg.heartbeatInterval,
 	})
 	if err != nil {
 		return err

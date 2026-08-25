@@ -17,16 +17,6 @@ type GRPCClient struct {
 	timeout time.Duration
 }
 
-type HeartbeatAttempt struct {
-	JobID         domain.JobID
-	AttemptNumber domain.AttemptNumber
-}
-
-type HeartbeatResult struct {
-	Attempt HeartbeatAttempt
-	Valid   bool
-}
-
 func NewGRPCClient(client dispatcherv1.DispatcherServiceClient, timeout time.Duration) (*GRPCClient, error) {
 	if client == nil || timeout <= 0 {
 		return nil, fmt.Errorf("%w: gRPC client and positive timeout are required", ErrInvalidConfiguration)
@@ -102,12 +92,18 @@ func (client *GRPCClient) Heartbeat(
 	if err != nil {
 		return nil, err
 	}
+	if len(response.GetAttempts()) != len(attempts) {
+		return nil, fmt.Errorf("heartbeat returned %d results for %d attempts", len(response.GetAttempts()), len(attempts))
+	}
 
 	results := make([]HeartbeatResult, len(response.GetAttempts()))
 	for i, value := range response.GetAttempts() {
 		result, err := parseHeartbeatResult(value)
 		if err != nil {
 			return nil, fmt.Errorf("parse heartbeat result %d: %w", i, err)
+		}
+		if result.Attempt != attempts[i] {
+			return nil, fmt.Errorf("heartbeat result %d identity does not match its request", i)
 		}
 		results[i] = result
 	}
