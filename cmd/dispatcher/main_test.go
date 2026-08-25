@@ -27,6 +27,10 @@ func TestLoadConfig(t *testing.T) {
 		t.Setenv("QUARRY_WORKER_LIVENESS_TIMEOUT", "")
 		t.Setenv("QUARRY_RETRY_BASE_DELAY", "")
 		t.Setenv("QUARRY_RETRY_MAX_DELAY", "")
+		t.Setenv("QUARRY_DISPATCHER_METRICS_ADDR", "")
+		t.Setenv("OTEL_SERVICE_NAME", "")
+		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "")
 
 		got, err := loadConfig()
 		if err != nil {
@@ -50,6 +54,9 @@ func TestLoadConfig(t *testing.T) {
 		if got.retryBaseDelay != domain.DefaultRetryBaseDelay || got.retryMaxDelay != domain.DefaultRetryMaxDelay {
 			t.Fatalf("retry policy = (%s, %s), want (%s, %s)", got.retryBaseDelay, got.retryMaxDelay, domain.DefaultRetryBaseDelay, domain.DefaultRetryMaxDelay)
 		}
+		if got.telemetry.ServiceName != defaultServiceName || got.telemetry.MetricsAddress != defaultMetricsAddress {
+			t.Fatalf("telemetry config = %#v", got.telemetry)
+		}
 	})
 
 	t.Run("environment overrides", func(t *testing.T) {
@@ -61,6 +68,8 @@ func TestLoadConfig(t *testing.T) {
 		t.Setenv("QUARRY_WORKER_LIVENESS_TIMEOUT", "1m")
 		t.Setenv("QUARRY_RETRY_BASE_DELAY", "250ms")
 		t.Setenv("QUARRY_RETRY_MAX_DELAY", "5s")
+		t.Setenv("QUARRY_DISPATCHER_METRICS_ADDR", "127.0.0.1:19464")
+		t.Setenv("OTEL_SERVICE_NAME", "custom-dispatcher")
 
 		got, err := loadConfig()
 		if err != nil {
@@ -83,6 +92,9 @@ func TestLoadConfig(t *testing.T) {
 		}
 		if got.retryBaseDelay != 250*time.Millisecond || got.retryMaxDelay != 5*time.Second {
 			t.Fatalf("retry policy = (%s, %s), want (250ms, 5s)", got.retryBaseDelay, got.retryMaxDelay)
+		}
+		if got.telemetry.ServiceName != "custom-dispatcher" || got.telemetry.MetricsAddress != "127.0.0.1:19464" {
+			t.Fatalf("telemetry config = %#v", got.telemetry)
 		}
 	})
 
@@ -131,6 +143,13 @@ func TestLoadConfig(t *testing.T) {
 		t.Setenv("QUARRY_RETRY_MAX_DELAY", "1s")
 		if _, err := loadConfig(); err == nil {
 			t.Fatal("loadConfig accepted retry maximum below base")
+		}
+	})
+
+	t.Run("invalid metrics address", func(t *testing.T) {
+		t.Setenv("QUARRY_DISPATCHER_METRICS_ADDR", "invalid address")
+		if _, err := loadConfig(); err == nil {
+			t.Fatal("loadConfig accepted an invalid metrics address")
 		}
 	})
 }

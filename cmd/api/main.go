@@ -14,6 +14,7 @@ import (
 
 	"github.com/shaibalmuhtadee/quarry/internal/api"
 	"github.com/shaibalmuhtadee/quarry/internal/store/postgres"
+	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
 )
 
 const (
@@ -24,11 +25,13 @@ const (
 	responseWriteTimeout = 15 * time.Second
 	idleTimeout          = 60 * time.Second
 	shutdownTimeout      = 10 * time.Second
+	defaultServiceName   = "quarry-api"
 )
 
 type config struct {
 	databaseURL string
 	httpAddress string
+	telemetry   telemetry.Config
 }
 
 func main() {
@@ -36,14 +39,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, loadConfig(), logger); err != nil {
+	cfg, err := loadConfig()
+	if err == nil {
+		err = run(ctx, cfg, logger)
+	}
+	if err != nil {
 		logger.Error("api stopped", slog.Any("error", err))
 		os.Exit(1)
 	}
 	logger.Info("api stopped")
 }
 
-func loadConfig() config {
+func loadConfig() (config, error) {
 	databaseURL := os.Getenv("QUARRY_DATABASE_URL")
 	if databaseURL == "" {
 		databaseURL = defaultDatabaseURL
@@ -53,13 +60,32 @@ func loadConfig() config {
 		httpAddress = defaultHTTPAddress
 	}
 
+	telemetryConfig, err := telemetry.LoadConfig(defaultServiceName, "", "")
+	if err != nil {
+		return config{}, err
+	}
+
 	return config{
 		databaseURL: databaseURL,
 		httpAddress: httpAddress,
-	}
+		telemetry:   telemetryConfig,
+	}, nil
 }
 
-func run(ctx context.Context, cfg config, logger *slog.Logger) error {
+func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
+	telemetryRuntime, err := telemetry.New(ctx, cfg.telemetry)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := telemetryRuntime.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("telemetry shutdown failed", slog.Any("error", err))
+		}
+	}()
+	logger = slog.New(telemetry.NewTraceHandler(logger.Handler()))
+
 	pool, err := postgres.NewPool(ctx, cfg.databaseURL)
 	if err != nil {
 		return err
@@ -70,7 +96,10 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("listen on %q: %w", cfg.httpAddress, err)
 	}
-	server := newHTTPServer(cfg.httpAddress, api.NewHandler(postgres.NewJobStore(pool), pool, logger))
+	server := newHTTPServer(
+		cfg.httpAddress,
+		api.NewHandlerWithMetrics(postgres.NewJobStore(pool), pool, logger, telemetryRuntime.MetricsHandler()),
+	)
 	logger.Info("api starting", slog.String("address", listener.Addr().String()))
 
 	if err := serve(ctx, server, listener, logger); err != nil {

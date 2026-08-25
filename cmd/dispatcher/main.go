@@ -17,6 +17,7 @@ import (
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	dispatcherv1 "github.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1"
 	"github.com/shaibalmuhtadee/quarry/internal/store/postgres"
+	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
 	"google.golang.org/grpc"
 )
 
@@ -29,6 +30,8 @@ const (
 	defaultRetryBaseDelay    = domain.DefaultRetryBaseDelay
 	defaultRetryMaxDelay     = domain.DefaultRetryMaxDelay
 	shutdownTimeout          = 10 * time.Second
+	defaultMetricsAddress    = ":9464"
+	defaultServiceName       = "quarry-dispatcher"
 )
 
 type config struct {
@@ -40,6 +43,7 @@ type config struct {
 	workerLiveness    time.Duration
 	retryBaseDelay    time.Duration
 	retryMaxDelay     time.Duration
+	telemetry         telemetry.Config
 }
 
 func main() {
@@ -130,6 +134,14 @@ func loadConfig() (config, error) {
 	if _, err := domain.NewRetryPolicy(retryBaseDelay, retryMaxDelay, rand.Int64N); err != nil {
 		return config{}, fmt.Errorf("configure retry policy: %w", err)
 	}
+	telemetryConfig, err := telemetry.LoadConfig(
+		defaultServiceName,
+		"QUARRY_DISPATCHER_METRICS_ADDR",
+		defaultMetricsAddress,
+	)
+	if err != nil {
+		return config{}, err
+	}
 
 	return config{
 		databaseURL:       databaseURL,
@@ -140,10 +152,35 @@ func loadConfig() (config, error) {
 		workerLiveness:    workerLiveness,
 		retryBaseDelay:    retryBaseDelay,
 		retryMaxDelay:     retryMaxDelay,
+		telemetry:         telemetryConfig,
 	}, nil
 }
 
-func run(ctx context.Context, cfg config, logger *slog.Logger) error {
+func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
+	telemetryRuntime, err := telemetry.New(ctx, cfg.telemetry)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := telemetryRuntime.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("telemetry shutdown failed", slog.Any("error", err))
+		}
+	}()
+	logger = slog.New(telemetry.NewTraceHandler(logger.Handler()))
+
+	metricsServer, err := telemetry.ListenMetrics(cfg.telemetry.MetricsAddress, telemetryRuntime.MetricsHandler())
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		runErr = errors.Join(runErr, metricsServer.Shutdown(shutdownCtx))
+	}()
+	logger.Info("dispatcher metrics starting", slog.String("address", metricsServer.Address()))
+
 	pool, err := postgres.NewPool(ctx, cfg.databaseURL)
 	if err != nil {
 		return err

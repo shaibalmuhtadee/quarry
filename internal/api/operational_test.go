@@ -37,6 +37,26 @@ func TestHealthDoesNotQueryPostgres(t *testing.T) {
 	}
 }
 
+func TestMetricsRouteUsesConfiguredHandler(t *testing.T) {
+	handler := api.NewHandlerWithMetrics(
+		&fakeJobStore{},
+		readinessCheckerFunc(func(context.Context) error { return nil }),
+		discardLogger(),
+		http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Content-Type", "text/plain")
+			_, _ = writer.Write([]byte("quarry_test_metric 1\n"))
+		}),
+	)
+	request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || response.Body.String() != "quarry_test_metric 1\n" {
+		t.Fatalf("metrics response = (%d, %q)", response.Code, response.Body.String())
+	}
+}
+
 func TestReadinessReportsPostgresState(t *testing.T) {
 	tests := []struct {
 		name       string

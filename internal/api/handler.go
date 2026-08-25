@@ -30,6 +30,19 @@ type handler struct {
 }
 
 func NewHandler(store JobStore, readiness ReadinessChecker, logger *slog.Logger) http.Handler {
+	return newHandler(store, readiness, logger, nil)
+}
+
+func NewHandlerWithMetrics(
+	store JobStore,
+	readiness ReadinessChecker,
+	logger *slog.Logger,
+	metrics http.Handler,
+) http.Handler {
+	return newHandler(store, readiness, logger, metrics)
+}
+
+func newHandler(store JobStore, readiness ReadinessChecker, logger *slog.Logger, metrics http.Handler) http.Handler {
 	handler := &handler{
 		store:     store,
 		readiness: readiness,
@@ -41,6 +54,9 @@ func NewHandler(store JobStore, readiness ReadinessChecker, logger *slog.Logger)
 	mux.HandleFunc("GET /v1/jobs/{id}/attempts", handler.getJobAttempts)
 	mux.HandleFunc("GET /healthz", handler.health)
 	mux.HandleFunc("GET /readyz", handler.ready)
+	if metrics != nil {
+		mux.Handle("GET /metrics", metrics)
+	}
 
 	return logRequests(logger, mux)
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	dispatcherv1 "github.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1"
+	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -24,6 +25,10 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("QUARRY_WORKER_CONCURRENCY", "")
 	t.Setenv("QUARRY_HEARTBEAT_INTERVAL", "")
 	t.Setenv("QUARRY_WORKER_SHUTDOWN_TIMEOUT", "")
+	t.Setenv("QUARRY_WORKER_METRICS_ADDR", "")
+	t.Setenv("OTEL_SERVICE_NAME", "")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "")
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -34,6 +39,9 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 		cfg.heartbeatInterval != defaultHeartbeatInterval || cfg.shutdownTimeout != defaultShutdownTimeout {
 		t.Fatalf("default config = %#v", cfg)
 	}
+	if cfg.telemetry.ServiceName != defaultServiceName || cfg.telemetry.MetricsAddress != defaultMetricsAddress {
+		t.Fatalf("default telemetry config = %#v", cfg.telemetry)
+	}
 
 	t.Setenv("QUARRY_DISPATCHER_ADDR", "127.0.0.1:19090")
 	t.Setenv("QUARRY_WORKER_HOSTNAME", "worker-a")
@@ -41,6 +49,8 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("QUARRY_WORKER_CONCURRENCY", "7")
 	t.Setenv("QUARRY_HEARTBEAT_INTERVAL", "3s")
 	t.Setenv("QUARRY_WORKER_SHUTDOWN_TIMEOUT", "7s")
+	t.Setenv("QUARRY_WORKER_METRICS_ADDR", "127.0.0.1:19465")
+	t.Setenv("OTEL_SERVICE_NAME", "custom-worker")
 	cfg, err = loadConfig()
 	if err != nil {
 		t.Fatal(err)
@@ -49,6 +59,9 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 		cfg.version != "v2" || cfg.concurrency != 7 || cfg.heartbeatInterval != 3*time.Second ||
 		cfg.shutdownTimeout != 7*time.Second {
 		t.Fatalf("overridden config = %#v", cfg)
+	}
+	if cfg.telemetry.ServiceName != "custom-worker" || cfg.telemetry.MetricsAddress != "127.0.0.1:19465" {
+		t.Fatalf("overridden telemetry config = %#v", cfg.telemetry)
 	}
 }
 
@@ -88,6 +101,14 @@ func TestLoadConfigRejectsInvalidShutdownTimeout(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRejectsInvalidMetricsAddress(t *testing.T) {
+	t.Setenv("QUARRY_WORKER_HOSTNAME", "test-host")
+	t.Setenv("QUARRY_WORKER_METRICS_ADDR", "invalid address")
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("loadConfig accepted an invalid metrics address")
+	}
+}
+
 func TestRunRegistersFreshIdentityAndStopsOnCancellation(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -112,6 +133,10 @@ func TestRunRegistersFreshIdentityAndStopsOnCancellation(t *testing.T) {
 		concurrency:       2,
 		heartbeatInterval: 10 * time.Millisecond,
 		shutdownTimeout:   time.Second,
+		telemetry: telemetry.Config{
+			ServiceName:    defaultServiceName,
+			MetricsAddress: "127.0.0.1:0",
+		},
 	}
 	first := runUntilAcquisition(t, cfg, service.acquired)
 	second := runUntilAcquisition(t, cfg, service.acquired)

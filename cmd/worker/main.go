@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	dispatcherv1 "github.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1"
+	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
 	"github.com/shaibalmuhtadee/quarry/internal/worker"
 	"github.com/shaibalmuhtadee/quarry/internal/worker/handlers"
 	"google.golang.org/grpc"
@@ -30,6 +32,8 @@ const (
 	idleBackoffMax           = time.Second
 	reportBackoffMin         = 100 * time.Millisecond
 	reportBackoffMax         = 500 * time.Millisecond
+	defaultMetricsAddress    = ":0"
+	defaultServiceName       = "quarry-worker"
 )
 
 type config struct {
@@ -39,6 +43,7 @@ type config struct {
 	concurrency       uint32
 	heartbeatInterval time.Duration
 	shutdownTimeout   time.Duration
+	telemetry         telemetry.Config
 }
 
 func main() {
@@ -99,6 +104,14 @@ func loadConfig() (config, error) {
 		}
 		shutdownTimeout = parsed
 	}
+	telemetryConfig, err := telemetry.LoadConfig(
+		defaultServiceName,
+		"QUARRY_WORKER_METRICS_ADDR",
+		defaultMetricsAddress,
+	)
+	if err != nil {
+		return config{}, err
+	}
 
 	return config{
 		dispatcherAddress: dispatcherAddress,
@@ -107,10 +120,35 @@ func loadConfig() (config, error) {
 		concurrency:       concurrency,
 		heartbeatInterval: heartbeatInterval,
 		shutdownTimeout:   shutdownTimeout,
+		telemetry:         telemetryConfig,
 	}, nil
 }
 
-func run(ctx context.Context, cfg config, logger *slog.Logger) error {
+func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
+	telemetryRuntime, err := telemetry.New(ctx, cfg.telemetry)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
+		defer cancel()
+		if err := telemetryRuntime.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("telemetry shutdown failed", slog.Any("error", err))
+		}
+	}()
+	logger = slog.New(telemetry.NewTraceHandler(logger.Handler()))
+
+	metricsServer, err := telemetry.ListenMetrics(cfg.telemetry.MetricsAddress, telemetryRuntime.MetricsHandler())
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
+		defer cancel()
+		runErr = errors.Join(runErr, metricsServer.Shutdown(shutdownCtx))
+	}()
+	logger.Info("worker metrics starting", slog.String("address", metricsServer.Address()))
+
 	connection, err := grpc.NewClient(
 		cfg.dispatcherAddress,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
