@@ -6,14 +6,17 @@ import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1;dispatcherv1";
 
-// DispatcherService coordinates worker registration, job acquisition, and
-// successful attempt reporting.
+// DispatcherService coordinates worker registration, job acquisition, lease
+// heartbeats, and successful attempt reporting.
 service DispatcherService {
   // RegisterWorker records one worker process identity.
   rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
 
   // AcquireJobs claims jobs that the worker can execute.
   rpc AcquireJobs(AcquireJobsRequest) returns (AcquireJobsResponse);
+
+  // Heartbeat renews active attempt leases and reports stale attempts.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
   // ReportAttempt records the outcome of one acquired attempt.
   rpc ReportAttempt(ReportAttemptRequest) returns (ReportAttemptResponse);
@@ -45,6 +48,32 @@ message AcquiredJob {
   string job_type = 3;
   bytes payload_json = 4;
   int64 timeout_ms = 5;
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  repeated HeartbeatAttempt active_attempts = 2;
+}
+
+message HeartbeatAttempt {
+  string job_id = 1;
+  uint32 attempt_no = 2;
+}
+
+message HeartbeatResponse {
+  repeated HeartbeatAttemptResult attempts = 1;
+}
+
+message HeartbeatAttemptResult {
+  string job_id = 1;
+  uint32 attempt_no = 2;
+  HeartbeatAttemptState state = 3;
+}
+
+enum HeartbeatAttemptState {
+  HEARTBEAT_ATTEMPT_STATE_UNSPECIFIED = 0;
+  HEARTBEAT_ATTEMPT_STATE_VALID = 1;
+  HEARTBEAT_ATTEMPT_STATE_STALE = 2;
 }
 
 message ReportAttemptRequest {

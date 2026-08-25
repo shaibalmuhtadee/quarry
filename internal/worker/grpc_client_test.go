@@ -36,6 +36,14 @@ func (client *recordingRPCClient) AcquireJobs(
 	return &dispatcherv1.AcquireJobsResponse{Jobs: client.jobs}, nil
 }
 
+func (client *recordingRPCClient) Heartbeat(
+	context.Context,
+	*dispatcherv1.HeartbeatRequest,
+	...grpc.CallOption,
+) (*dispatcherv1.HeartbeatResponse, error) {
+	return &dispatcherv1.HeartbeatResponse{}, nil
+}
+
 func (client *recordingRPCClient) ReportAttempt(
 	_ context.Context,
 	request *dispatcherv1.ReportAttemptRequest,

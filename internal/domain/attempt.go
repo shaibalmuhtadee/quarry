@@ -36,12 +36,13 @@ type AttemptStatus string
 const (
 	AttemptStatusRunning   AttemptStatus = "running"
 	AttemptStatusSucceeded AttemptStatus = "succeeded"
+	AttemptStatusAbandoned AttemptStatus = "abandoned"
 )
 
 func ParseAttemptStatus(value string) (AttemptStatus, error) {
 	status := AttemptStatus(value)
 	switch status {
-	case AttemptStatusRunning, AttemptStatusSucceeded:
+	case AttemptStatusRunning, AttemptStatusSucceeded, AttemptStatusAbandoned:
 		return status, nil
 	default:
 		return "", fmt.Errorf("%w: %q", ErrInvalidAttemptStatus, value)

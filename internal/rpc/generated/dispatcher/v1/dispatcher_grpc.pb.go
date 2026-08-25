@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	DispatcherService_RegisterWorker_FullMethodName = "/quarry.dispatcher.v1.DispatcherService/RegisterWorker"
 	DispatcherService_AcquireJobs_FullMethodName    = "/quarry.dispatcher.v1.DispatcherService/AcquireJobs"
+	DispatcherService_Heartbeat_FullMethodName      = "/quarry.dispatcher.v1.DispatcherService/Heartbeat"
 	DispatcherService_ReportAttempt_FullMethodName  = "/quarry.dispatcher.v1.DispatcherService/ReportAttempt"
 )
 
@@ -28,13 +29,15 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// DispatcherService coordinates worker registration, job acquisition, and
-// successful attempt reporting.
+// DispatcherService coordinates worker registration, job acquisition, lease
+// heartbeats, and successful attempt reporting.
 type DispatcherServiceClient interface {
 	// RegisterWorker records one worker process identity.
 	RegisterWorker(ctx context.Context, in *RegisterWorkerRequest, opts ...grpc.CallOption) (*RegisterWorkerResponse, error)
 	// AcquireJobs claims jobs that the worker can execute.
 	AcquireJobs(ctx context.Context, in *AcquireJobsRequest, opts ...grpc.CallOption) (*AcquireJobsResponse, error)
+	// Heartbeat renews active attempt leases and reports stale attempts.
+	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
 	// ReportAttempt records the outcome of one acquired attempt.
 	ReportAttempt(ctx context.Context, in *ReportAttemptRequest, opts ...grpc.CallOption) (*ReportAttemptResponse, error)
 }
@@ -67,6 +70,16 @@ func (c *dispatcherServiceClient) AcquireJobs(ctx context.Context, in *AcquireJo
 	return out, nil
 }
 
+func (c *dispatcherServiceClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HeartbeatResponse)
+	err := c.cc.Invoke(ctx, DispatcherService_Heartbeat_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *dispatcherServiceClient) ReportAttempt(ctx context.Context, in *ReportAttemptRequest, opts ...grpc.CallOption) (*ReportAttemptResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReportAttemptResponse)
@@ -81,13 +94,15 @@ func (c *dispatcherServiceClient) ReportAttempt(ctx context.Context, in *ReportA
 // All implementations must embed UnimplementedDispatcherServiceServer
 // for forward compatibility.
 //
-// DispatcherService coordinates worker registration, job acquisition, and
-// successful attempt reporting.
+// DispatcherService coordinates worker registration, job acquisition, lease
+// heartbeats, and successful attempt reporting.
 type DispatcherServiceServer interface {
 	// RegisterWorker records one worker process identity.
 	RegisterWorker(context.Context, *RegisterWorkerRequest) (*RegisterWorkerResponse, error)
 	// AcquireJobs claims jobs that the worker can execute.
 	AcquireJobs(context.Context, *AcquireJobsRequest) (*AcquireJobsResponse, error)
+	// Heartbeat renews active attempt leases and reports stale attempts.
+	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
 	// ReportAttempt records the outcome of one acquired attempt.
 	ReportAttempt(context.Context, *ReportAttemptRequest) (*ReportAttemptResponse, error)
 	mustEmbedUnimplementedDispatcherServiceServer()
@@ -105,6 +120,9 @@ func (UnimplementedDispatcherServiceServer) RegisterWorker(context.Context, *Reg
 }
 func (UnimplementedDispatcherServiceServer) AcquireJobs(context.Context, *AcquireJobsRequest) (*AcquireJobsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method AcquireJobs not implemented")
+}
+func (UnimplementedDispatcherServiceServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Heartbeat not implemented")
 }
 func (UnimplementedDispatcherServiceServer) ReportAttempt(context.Context, *ReportAttemptRequest) (*ReportAttemptResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReportAttempt not implemented")
@@ -166,6 +184,24 @@ func _DispatcherService_AcquireJobs_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DispatcherService_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HeartbeatRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DispatcherServiceServer).Heartbeat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DispatcherService_Heartbeat_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DispatcherServiceServer).Heartbeat(ctx, req.(*HeartbeatRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _DispatcherService_ReportAttempt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReportAttemptRequest)
 	if err := dec(in); err != nil {
@@ -198,6 +234,10 @@ var DispatcherService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AcquireJobs",
 			Handler:    _DispatcherService_AcquireJobs_Handler,
+		},
+		{
+			MethodName: "Heartbeat",
+			Handler:    _DispatcherService_Heartbeat_Handler,
 		},
 		{
 			MethodName: "ReportAttempt",
