@@ -24,3 +24,15 @@ func IsValidTraceParent(value string) bool {
 	normalized, ok := TraceParentFromContext(extracted)
 	return ok && normalized == value
 }
+
+// ContextFromTraceParent continues a persisted remote trace parent. Invalid or
+// absent values leave the supplied context unchanged.
+func ContextFromTraceParent(ctx context.Context, value string) context.Context {
+	if !IsValidTraceParent(value) {
+		return ctx
+	}
+	return propagation.TraceContext{}.Extract(
+		ctx,
+		propagation.MapCarrier{"traceparent": value},
+	)
+}

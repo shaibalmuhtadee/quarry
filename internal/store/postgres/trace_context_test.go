@@ -11,8 +11,92 @@ import (
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	"github.com/shaibalmuhtadee/quarry/internal/store/postgres"
 	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
+
+func TestPersistenceSpansRemainOnTheAttemptTrace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	pool := newDispatcherTestPool(t, ctx)
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	tracer := provider.Tracer("test")
+
+	submissionCtx, submissionSpan := tracer.Start(ctx, "http.request")
+	wantTraceID := submissionSpan.SpanContext().TraceID()
+	jobStore := postgres.NewJobStoreWithTracer(pool, tracer)
+	job := submitTraceTestJob(t, submissionCtx, jobStore, "trace.connected", "")
+	submissionSpan.End()
+
+	retryPolicy, err := domain.NewRetryPolicy(time.Second, time.Minute, func(int64) int64 { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcherStore := postgres.NewDispatcherStoreWithTracer(pool, testLeaseDuration, retryPolicy, tracer)
+	workerID := registerTestWorker(t, ctx, dispatcherStore, 1)
+	jobs, err := dispatcherStore.AcquireJobs(ctx, workerID, 1, []domain.JobType{mustJobType(t, "trace.connected")})
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("acquire traced job: jobs=%d err=%v", len(jobs), err)
+	}
+	claimParent := telemetry.ContextFromTraceParent(ctx, jobs[0].TraceParent)
+	claimCtx, claimSpan := tracer.Start(claimParent, "dispatcher.claim")
+	workerCtx, workerSpan := tracer.Start(claimCtx, "worker.execute")
+	result, err := domain.ParseResult([]byte(`{"ok":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := domain.NewSucceededOutcome(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dispatcherStore.ReportAttemptTransition(workerCtx, workerID, job.ID, jobs[0].AttemptNumber, outcome); err != nil {
+		t.Fatal(err)
+	}
+	workerSpan.End()
+	claimSpan.End()
+
+	spans := map[string]sdktrace.ReadOnlySpan{}
+	for _, span := range recorder.Ended() {
+		spans[span.Name()] = span
+		if span.SpanContext().TraceID() != wantTraceID {
+			t.Fatalf("span %q trace ID = %s, want %s", span.Name(), span.SpanContext().TraceID(), wantTraceID)
+		}
+	}
+	insert := spans["db.insert_job"]
+	claim := spans["dispatcher.claim"]
+	workerExecution := spans["worker.execute"]
+	complete := spans["db.complete_attempt"]
+	if insert == nil || claim == nil || workerExecution == nil || complete == nil {
+		t.Fatalf("missing connected trace spans: %v", spans)
+	}
+	if claim.Parent().SpanID() != insert.SpanContext().SpanID() ||
+		workerExecution.Parent().SpanID() != claim.SpanContext().SpanID() ||
+		complete.Parent().SpanID() != workerExecution.SpanContext().SpanID() {
+		t.Fatal("persistence and attempt spans do not form one parent chain")
+	}
+	insertAttributes := traceSpanAttributes(insert)
+	if insertAttributes["job.id"] != job.ID.String() || insertAttributes["job.type"] != "trace.connected" {
+		t.Fatalf("insert span attributes = %v", insertAttributes)
+	}
+	completeAttributes := traceSpanAttributes(complete)
+	for key, want := range map[string]string{
+		"job.id": job.ID.String(), "job.attempt": "1", "worker.id": workerID.String(), "job.outcome": "succeeded",
+	} {
+		if completeAttributes[key] != want {
+			t.Fatalf("completion span attribute %s = %q, want %q: %v", key, completeAttributes[key], want, completeAttributes)
+		}
+	}
+}
+
+func traceSpanAttributes(span sdktrace.ReadOnlySpan) map[string]string {
+	attributes := map[string]string{}
+	for _, value := range span.Attributes() {
+		attributes[string(value.Key)] = value.Value.Emit()
+	}
+	return attributes
+}
 
 func TestJobTraceContextPersistsAndReachesAcquiredJob(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)

@@ -85,7 +85,7 @@ func TestWorkerTimeoutBoundaryUsesFirstCancellationCause(t *testing.T) {
 	})
 }
 
-func TestWorkerRecoversPanicLogsStackAndContinues(t *testing.T) {
+func TestWorkerRecoversPanicLogsSafeIdentifiersAndContinues(t *testing.T) {
 	t.Parallel()
 
 	panicJob := makeJobs(t, 1, "demo.panic")[0]
@@ -139,9 +139,12 @@ func TestWorkerRecoversPanicLogsStackAndContinues(t *testing.T) {
 		t.Fatalf("post-panic outcome = %q, want succeeded", successOutcome.Kind())
 	}
 	output := logs.String()
-	if !strings.Contains(output, "secret panic value") || !strings.Contains(output, "runtime/debug.Stack") ||
-		!strings.Contains(output, panicJob.ID.String()) || !strings.Contains(output, "demo.panic") {
-		t.Fatalf("panic log does not contain value, stack, and attempt identity: %s", output)
+	if strings.Contains(output, "secret panic value") || strings.Contains(output, "runtime/debug.Stack") {
+		t.Fatalf("panic log exposed handler-controlled data: %s", output)
+	}
+	if !strings.Contains(output, panicJob.ID.String()) || !strings.Contains(output, "demo.panic") ||
+		!strings.Contains(output, "handler_panicked") {
+		t.Fatalf("panic log does not contain safe attempt identity: %s", output)
 	}
 	failure, _ := panicOutcome.Failure()
 	if strings.Contains(failure.Code(), "secret") || strings.Contains(failure.Message(), "secret") {

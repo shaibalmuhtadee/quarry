@@ -173,7 +173,7 @@ WHERE id = sqlc.arg(job_id)
   AND lease_expires_at > sqlc.arg(transition_time)::timestamptz;
 
 -- name: LockExpiredJobs :many
-SELECT id, job_type, attempt_count, max_attempts, cancel_requested_at
+SELECT id, job_type, attempt_count, max_attempts, cancel_requested_at, traceparent
 FROM jobs
 WHERE status = 'running'
   AND lease_expires_at <= statement_timestamp()

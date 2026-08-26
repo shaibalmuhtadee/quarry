@@ -347,7 +347,7 @@ func (q *Queries) LockAttemptReport(ctx context.Context, arg LockAttemptReportPa
 }
 
 const lockExpiredJobs = `-- name: LockExpiredJobs :many
-SELECT id, job_type, attempt_count, max_attempts, cancel_requested_at
+SELECT id, job_type, attempt_count, max_attempts, cancel_requested_at, traceparent
 FROM jobs
 WHERE status = 'running'
   AND lease_expires_at <= statement_timestamp()
@@ -362,6 +362,7 @@ type LockExpiredJobsRow struct {
 	AttemptCount      int32
 	MaxAttempts       int32
 	CancelRequestedAt pgtype.Timestamptz
+	Traceparent       pgtype.Text
 }
 
 func (q *Queries) LockExpiredJobs(ctx context.Context, batchSize int32) ([]LockExpiredJobsRow, error) {
@@ -379,6 +380,7 @@ func (q *Queries) LockExpiredJobs(ctx context.Context, batchSize int32) ([]LockE
 			&i.AttemptCount,
 			&i.MaxAttempts,
 			&i.CancelRequestedAt,
+			&i.Traceparent,
 		); err != nil {
 			return nil, err
 		}

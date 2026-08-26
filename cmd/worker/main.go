@@ -152,6 +152,7 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
 	connection, err := grpc.NewClient(
 		cfg.dispatcherAddress,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithStatsHandler(telemetryRuntime.GRPCClientStatsHandler()),
 	)
 	if err != nil {
 		return fmt.Errorf("create dispatcher client: %w", err)
@@ -184,6 +185,7 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
 		ShutdownTimeout:   cfg.shutdownTimeout,
 		Logger:            logger,
 		Metrics:           telemetryRuntime.Metrics(),
+		Tracer:            telemetryRuntime.Tracer("quarry/worker"),
 	})
 	if err != nil {
 		return err

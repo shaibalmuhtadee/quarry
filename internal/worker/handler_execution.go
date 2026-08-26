@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"runtime/debug"
 
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
 )
@@ -17,11 +16,9 @@ const (
 )
 
 type handlerExecution struct {
-	result     domain.Result
-	err        error
-	panicked   bool
-	panicValue any
-	stack      []byte
+	result   domain.Result
+	err      error
+	panicked bool
 }
 
 func invokeHandler(ctx context.Context, handler Handler, payload domain.Payload) (execution handlerExecution) {
@@ -31,8 +28,7 @@ func invokeHandler(ctx context.Context, handler Handler, payload domain.Payload)
 			return
 		}
 		execution.panicked = true
-		execution.panicValue = recover()
-		execution.stack = debug.Stack()
+		_ = recover()
 	}()
 
 	execution.result, execution.err = handler(ctx, payload)

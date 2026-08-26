@@ -11,6 +11,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	postgresdb "github.com/shaibalmuhtadee/quarry/internal/store/postgres/generated"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -47,10 +49,13 @@ type AttemptReportTransition struct {
 }
 
 type RecoveryTransition struct {
+	JobID         domain.JobID
 	JobType       domain.JobType
+	AttemptNumber domain.AttemptNumber
 	AttemptStatus domain.AttemptStatus
 	JobStatus     domain.JobStatus
 	ErrorCode     string
+	TraceParent   string
 }
 
 type HeartbeatAttempt struct {
@@ -68,6 +73,7 @@ type DispatcherStore struct {
 	pool          *pgxpool.Pool
 	leaseDuration time.Duration
 	retryPolicy   domain.RetryPolicy
+	tracer        trace.Tracer
 }
 
 func NewDispatcherStore(
@@ -75,10 +81,20 @@ func NewDispatcherStore(
 	leaseDuration time.Duration,
 	retryPolicy domain.RetryPolicy,
 ) *DispatcherStore {
+	return NewDispatcherStoreWithTracer(pool, leaseDuration, retryPolicy, trace.NewNoopTracerProvider().Tracer("quarry/store/postgres"))
+}
+
+func NewDispatcherStoreWithTracer(
+	pool *pgxpool.Pool,
+	leaseDuration time.Duration,
+	retryPolicy domain.RetryPolicy,
+	tracer trace.Tracer,
+) *DispatcherStore {
 	return &DispatcherStore{
 		pool:          pool,
 		leaseDuration: leaseDuration,
 		retryPolicy:   retryPolicy,
+		tracer:        tracer,
 	}
 }
 
@@ -265,6 +281,10 @@ func (store *DispatcherStore) RecoverExpiredAttemptTransitions(
 	}
 	transitions := make([]RecoveryTransition, 0, len(expiredJobs))
 	for _, expired := range expiredJobs {
+		jobID, err := domain.ParseJobID(expired.ID.String())
+		if err != nil {
+			return nil, fmt.Errorf("parse expired job ID: %w", err)
+		}
 		jobType, err := domain.ParseJobType(expired.JobType)
 		if err != nil {
 			return nil, fmt.Errorf("parse expired job type: %w", err)
@@ -334,10 +354,13 @@ func (store *DispatcherStore) RecoverExpiredAttemptTransitions(
 			errorCode = "cancellation_requested"
 		}
 		transitions = append(transitions, RecoveryTransition{
+			JobID:         jobID,
 			JobType:       jobType,
+			AttemptNumber: attemptNumber,
 			AttemptStatus: attemptStatus,
 			JobStatus:     jobStatus,
 			ErrorCode:     errorCode,
+			TraceParent:   expired.Traceparent.String,
 		})
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -365,6 +388,14 @@ func (store *DispatcherStore) ReportAttemptTransition(
 	attemptNumber domain.AttemptNumber,
 	outcome domain.AttemptOutcome,
 ) (AttemptReportTransition, error) {
+	ctx, span := store.tracer.Start(ctx, "db.complete_attempt", trace.WithAttributes(
+		attribute.String("job.id", jobID.String()),
+		attribute.Int("job.attempt", int(attemptNumber.Int32())),
+		attribute.String("worker.id", workerID.String()),
+		attribute.String("job.outcome", string(outcome.Kind())),
+	))
+	defer span.End()
+
 	if outcome.IsZero() {
 		return AttemptReportTransition{}, domain.ErrInvalidAttemptOutcome
 	}

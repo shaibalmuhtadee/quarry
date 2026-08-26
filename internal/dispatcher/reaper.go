@@ -80,6 +80,27 @@ func (reaper *Reaper) Run(ctx context.Context) {
 						reaper.metrics.RetryScheduled(telemetry.RetryReasonLeaseExpired)
 					}
 				}
+				logCtx := telemetry.ContextFromTraceParent(ctx, transition.TraceParent)
+				reaper.logger.InfoContext(
+					logCtx,
+					"attempt lease recovered",
+					slog.String("job_id", transition.JobID.String()),
+					slog.String("job_type", transition.JobType.String()),
+					slog.Int("attempt_no", int(transition.AttemptNumber.Int32())),
+					slog.String("job_outcome", string(transition.AttemptStatus)),
+					slog.String("error_code", transition.ErrorCode),
+				)
+				if transition.JobStatus == domain.JobStatusRetryWait {
+					reaper.logger.InfoContext(
+						logCtx,
+						"retry scheduled",
+						slog.String("job_id", transition.JobID.String()),
+						slog.String("job_type", transition.JobType.String()),
+						slog.Int("attempt_no", int(transition.AttemptNumber.Int32())),
+						slog.String("job_outcome", string(transition.AttemptStatus)),
+						slog.String("error_code", transition.ErrorCode),
+					)
+				}
 			}
 			reaper.logger.Info("expired attempts recovered", slog.Int("jobs", len(transitions)))
 		}

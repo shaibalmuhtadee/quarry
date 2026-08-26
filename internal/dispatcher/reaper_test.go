@@ -1,10 +1,12 @@
 package dispatcher
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -86,20 +88,26 @@ func TestReaperRecordsCommittedRecoveryOutcomes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	attemptNumber, err := domain.NewAttemptNumber(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobIDs := []domain.JobID{domain.NewJobID(), domain.NewJobID(), domain.NewJobID()}
 	store := &recoveryStoreStub{
 		calls: make(chan recoveryCall, 1),
 		transitions: []postgres.RecoveryTransition{
-			{JobType: jobType, AttemptStatus: domain.AttemptStatusAbandoned, JobStatus: domain.JobStatusRetryWait, ErrorCode: "lease_expired"},
-			{JobType: jobType, AttemptStatus: domain.AttemptStatusAbandoned, JobStatus: domain.JobStatusDeadLettered, ErrorCode: "lease_expired"},
-			{JobType: jobType, AttemptStatus: domain.AttemptStatusCancelled, JobStatus: domain.JobStatusCancelled, ErrorCode: "cancellation_requested"},
+			{JobID: jobIDs[0], JobType: jobType, AttemptNumber: attemptNumber, AttemptStatus: domain.AttemptStatusAbandoned, JobStatus: domain.JobStatusRetryWait, ErrorCode: "lease_expired"},
+			{JobID: jobIDs[1], JobType: jobType, AttemptNumber: attemptNumber, AttemptStatus: domain.AttemptStatusAbandoned, JobStatus: domain.JobStatusDeadLettered, ErrorCode: "lease_expired"},
+			{JobID: jobIDs[2], JobType: jobType, AttemptNumber: attemptNumber, AttemptStatus: domain.AttemptStatusCancelled, JobStatus: domain.JobStatusCancelled, ErrorCode: "cancellation_requested"},
 		},
 	}
 	metrics := &recoveryMetricRecorder{}
+	var logs bytes.Buffer
 	reaper, err := NewReaperWithMetrics(store, ReaperConfig{
 		Interval:              time.Hour,
 		BatchSize:             3,
 		WorkerLivenessTimeout: time.Minute,
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics)
+	}, slog.New(slog.NewTextHandler(&logs, nil)), metrics)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,6 +136,12 @@ func TestReaperRecordsCommittedRecoveryOutcomes(t *testing.T) {
 	}
 	if len(metrics.retries) != 1 || metrics.retries[0] != telemetry.RetryReasonLeaseExpired {
 		t.Fatalf("retry reasons = %v", metrics.retries)
+	}
+	output := logs.String()
+	for _, value := range []string{jobIDs[0].String(), "attempt lease recovered", "retry scheduled", "lease_expired", "attempt_no=1"} {
+		if !strings.Contains(output, value) {
+			t.Fatalf("recovery log lacks %q: %s", value, output)
+		}
 	}
 }
 

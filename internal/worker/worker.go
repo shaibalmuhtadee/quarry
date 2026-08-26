@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
+	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -78,6 +81,7 @@ type Config struct {
 	ShutdownTimeout   time.Duration
 	Logger            *slog.Logger
 	Metrics           workerMetrics
+	Tracer            trace.Tracer
 }
 
 type workerMetrics interface {
@@ -98,6 +102,7 @@ type Worker struct {
 	shutdownTimeout   time.Duration
 	logger            *slog.Logger
 	metrics           workerMetrics
+	tracer            trace.Tracer
 }
 
 func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worker, error) {
@@ -135,6 +140,10 @@ func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worke
 	if logger == nil {
 		logger = slog.Default()
 	}
+	tracer := cfg.Tracer
+	if tracer == nil {
+		tracer = trace.NewNoopTracerProvider().Tracer("quarry/worker")
+	}
 
 	handlerCopy := make(map[string]Handler, len(handlers))
 	supportedTypes := make([]domain.JobType, 0, len(handlers))
@@ -166,6 +175,7 @@ func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worke
 		shutdownTimeout:   cfg.ShutdownTimeout,
 		logger:            logger,
 		metrics:           cfg.Metrics,
+		tracer:            tracer,
 	}, nil
 }
 
@@ -400,7 +410,8 @@ func (worker *Worker) Run(ctx context.Context) error {
 			if _, ok := worker.handlers[job.Type.String()]; !ok {
 				return fmt.Errorf("dispatcher returned unsupported job type %q", job.Type.String())
 			}
-			attempt, err := active.add(runCtx, job)
+			attemptParent := telemetry.ContextFromTraceParent(runCtx, job.TraceParent)
+			attempt, err := active.add(attemptParent, job)
 			if err != nil {
 				return err
 			}
@@ -436,27 +447,51 @@ func (worker *Worker) execute(
 				continue
 			}
 			job := attempt.job
+			executionCtx, executionSpan := worker.tracer.Start(attempt.handlerCtx, "worker.execute", trace.WithAttributes(
+				attribute.String("job.id", job.ID.String()),
+				attribute.String("job.type", job.Type.String()),
+				attribute.Int("job.attempt", int(job.AttemptNumber.Int32())),
+				attribute.String("worker.id", worker.registration.WorkerID.String()),
+			))
+			worker.logger.InfoContext(
+				executionCtx,
+				"attempt started",
+				slog.String("job_id", job.ID.String()),
+				slog.String("job_type", job.Type.String()),
+				slog.Int("attempt_no", int(job.AttemptNumber.Int32())),
+				slog.String("worker_id", worker.registration.WorkerID.String()),
+			)
 			handler := worker.handlers[job.Type.String()]
-			handlerCtx, cancelHandler := context.WithTimeoutCause(attempt.handlerCtx, job.Timeout, errExecutionTimedOut)
+			handlerCtx, cancelHandler := context.WithTimeoutCause(executionCtx, job.Timeout, errExecutionTimedOut)
+			handlerCtx, handlerSpan := worker.tracer.Start(handlerCtx, "handler", trace.WithAttributes(
+				attribute.String("job.id", job.ID.String()),
+				attribute.String("job.type", job.Type.String()),
+				attribute.Int("job.attempt", int(job.AttemptNumber.Int32())),
+				attribute.String("worker.id", worker.registration.WorkerID.String()),
+			))
 			executionStarted := time.Now()
 			execution := invokeHandler(handlerCtx, handler, job.Payload)
 			executionDuration := time.Since(executionStarted)
+			handlerSpan.End()
 			cancelHandler()
 			handlerCause := context.Cause(handlerCtx)
 			if execution.panicked {
-				worker.logger.Error(
+				worker.logger.ErrorContext(
+					executionCtx,
 					"handler panicked",
 					slog.String("job_id", job.ID.String()),
 					slog.Int("attempt_no", int(job.AttemptNumber.Int32())),
 					slog.String("job_type", job.Type.String()),
-					slog.Any("panic", execution.panicValue),
-					slog.String("stack", string(execution.stack)),
+					slog.String("worker_id", worker.registration.WorkerID.String()),
+					slog.String("error_code", "handler_panicked"),
 				)
 			}
 			if errors.Is(context.Cause(attempt.ctx), errLeaseStale) {
+				executionSpan.End()
 				continue
 			}
 			if ctx.Err() != nil {
+				executionSpan.End()
 				return
 			}
 
@@ -473,13 +508,17 @@ func (worker *Worker) execute(
 				outcome, err = classifyHandlerResult(execution.result, execution.err)
 			}
 			if err != nil {
+				executionSpan.End()
 				fail(fmt.Errorf("classify %s attempt %d: %w", job.ID, job.AttemptNumber.Int32(), err))
 				return
 			}
 			if worker.metrics != nil {
 				worker.metrics.JobExecutionCompleted(job.Type, outcome.Kind(), executionDuration)
 			}
-			if err := worker.reportUntilAcknowledged(attempt.ctx, job, outcome); err != nil {
+			executionSpan.SetAttributes(attribute.String("job.outcome", string(outcome.Kind())))
+			reportCtx := trace.ContextWithSpanContext(attempt.ctx, trace.SpanContextFromContext(executionCtx))
+			if err := worker.reportUntilAcknowledged(reportCtx, job, outcome); err != nil {
+				executionSpan.End()
 				if errors.Is(err, errAttemptLost) || errors.Is(context.Cause(attempt.ctx), errLeaseStale) {
 					if active.remove(attempt, err) {
 						notifyCapacityChanged()
@@ -491,6 +530,18 @@ func (worker *Worker) execute(
 				}
 				return
 			}
+			logAttributes := []any{
+				slog.String("job_id", job.ID.String()),
+				slog.String("job_type", job.Type.String()),
+				slog.Int("attempt_no", int(job.AttemptNumber.Int32())),
+				slog.String("worker_id", worker.registration.WorkerID.String()),
+				slog.String("job_outcome", string(outcome.Kind())),
+			}
+			if failure, ok := outcome.Failure(); ok {
+				logAttributes = append(logAttributes, slog.String("error_code", failure.Code()))
+			}
+			worker.logger.InfoContext(executionCtx, "attempt report acknowledged", logAttributes...)
+			executionSpan.End()
 			if active.remove(attempt, nil) {
 				notifyCapacityChanged()
 			}

@@ -1,11 +1,14 @@
 package dispatcher_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,10 +17,177 @@ import (
 	dispatcherv1 "github.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1"
 	"github.com/shaibalmuhtadee/quarry/internal/store/postgres"
 	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+func TestAcquireJobsContinuesEachPersistedTraceIndependently(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	tracer := provider.Tracer("test")
+	traceparents := make([]string, 2)
+	traceIDs := make([]trace.TraceID, 2)
+	for i := range traceparents {
+		parentCtx, parent := tracer.Start(context.Background(), "submission")
+		traceIDs[i] = parent.SpanContext().TraceID()
+		traceparents[i], _ = telemetry.TraceParentFromContext(parentCtx)
+		parent.End()
+	}
+
+	workerID := domain.NewWorkerID()
+	jobs := make([]postgres.AcquiredJob, 2)
+	for i := range jobs {
+		jobs[i] = postgres.AcquiredJob{
+			ID:            domain.NewJobID(),
+			AttemptNumber: mustAttemptNumber(t, 1),
+			Type:          mustJobType(t, "demo.trace"),
+			Payload:       mustPayload(t, `{"secret":"payload-value"}`),
+			Timeout:       time.Second,
+			TraceParent:   traceparents[i],
+		}
+	}
+	var logs bytes.Buffer
+	logger := slog.New(telemetry.NewTraceHandler(slog.NewTextHandler(&logs, nil)))
+	service := dispatcher.NewServiceWithTelemetry(
+		&fakeStore{acquireJobs: func(context.Context, domain.WorkerID, int32, []domain.JobType) ([]postgres.AcquiredJob, error) {
+			return jobs, nil
+		}},
+		nil,
+		tracer,
+		logger,
+	)
+	response, err := service.AcquireJobs(context.Background(), &dispatcherv1.AcquireJobsRequest{
+		WorkerId: workerID.String(), AvailableCapacity: 2, SupportedJobTypes: []string{"demo.trace"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.GetJobs()) != 2 {
+		t.Fatalf("acquired jobs = %d, want 2", len(response.GetJobs()))
+	}
+
+	claims := map[string]sdktrace.ReadOnlySpan{}
+	for _, span := range recorder.Ended() {
+		if span.Name() == "dispatcher.claim" {
+			claims[spanStringAttribute(t, span, "job.id")] = span
+		}
+	}
+	for i, job := range jobs {
+		claim := claims[job.ID.String()]
+		if claim == nil {
+			t.Fatalf("missing claim span for %s", job.ID)
+		}
+		if claim.SpanContext().TraceID() != traceIDs[i] {
+			t.Fatalf("claim %d trace ID = %s, want %s", i, claim.SpanContext().TraceID(), traceIDs[i])
+		}
+		if spanStringAttribute(t, claim, "job.type") != job.Type.String() ||
+			spanStringAttribute(t, claim, "worker.id") != workerID.String() ||
+			spanIntAttribute(t, claim, "job.attempt") != int64(job.AttemptNumber.Int32()) {
+			t.Fatalf("claim %d attributes = %v", i, claim.Attributes())
+		}
+		continued := telemetry.ContextFromTraceParent(context.Background(), response.GetJobs()[i].GetTraceparent())
+		if trace.SpanContextFromContext(continued).SpanID() != claim.SpanContext().SpanID() {
+			t.Fatalf("job %d did not carry its claim span", i)
+		}
+	}
+	if traceIDs[0] == traceIDs[1] {
+		t.Fatal("test parents unexpectedly share a trace")
+	}
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, jobs[0].ID.String()) || !strings.Contains(logOutput, workerID.String()) ||
+		!strings.Contains(logOutput, "trace_id=") {
+		t.Fatalf("claim log lacks trace and job identifiers: %s", logOutput)
+	}
+	if strings.Contains(logOutput, "payload-value") || strings.Contains(logOutput, traceparents[0]) {
+		t.Fatalf("claim log exposed payload or raw trace header: %s", logOutput)
+	}
+}
+
+func spanStringAttribute(t *testing.T, span sdktrace.ReadOnlySpan, key string) string {
+	t.Helper()
+	for _, value := range span.Attributes() {
+		if string(value.Key) == key {
+			return value.Value.AsString()
+		}
+	}
+	t.Fatalf("span %q lacks attribute %q", span.Name(), key)
+	return ""
+}
+
+func spanIntAttribute(t *testing.T, span sdktrace.ReadOnlySpan, key string) int64 {
+	t.Helper()
+	for _, value := range span.Attributes() {
+		if string(value.Key) == key {
+			return value.Value.AsInt64()
+		}
+	}
+	t.Fatalf("span %q lacks attribute %q", span.Name(), key)
+	return 0
+}
+
+func TestReportAttemptLogsSafeCommittedLifecycleIdentifiers(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	ctx, span := provider.Tracer("test").Start(context.Background(), "worker.execute")
+	defer span.End()
+	var logs bytes.Buffer
+	logger := slog.New(telemetry.NewTraceHandler(slog.NewTextHandler(&logs, nil)))
+	jobID := domain.NewJobID()
+	workerID := domain.NewWorkerID()
+	service := dispatcher.NewServiceWithTelemetry(
+		&fakeStore{reportAttempt: func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) (postgres.AttemptReportTransition, error) {
+			return postgres.AttemptReportTransition{
+				Applied: true, JobType: mustJobType(t, "demo.trace"),
+				AttemptStatus: domain.AttemptStatusRetryableFailed,
+				JobStatus:     domain.JobStatusRetryWait, ErrorCode: "dependency_timeout",
+			}, nil
+		}},
+		nil,
+		provider.Tracer("test"),
+		logger,
+	)
+	request := &dispatcherv1.ReportAttemptRequest{
+		WorkerId: workerID.String(), JobId: jobID.String(), AttemptNo: 1,
+		Outcome: &dispatcherv1.ReportAttemptRequest_RetryableFailure{RetryableFailure: &dispatcherv1.AttemptFailure{
+			ErrorCode: "dependency_timeout", ErrorMessage: "unsafe host and credential detail",
+		}},
+	}
+	_, err := service.ReportAttempt(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := logs.String()
+	for _, value := range []string{jobID.String(), workerID.String(), "demo.trace", "retryable_failure", "dependency_timeout", "trace_id=", "attempt completed", "retry scheduled"} {
+		if !strings.Contains(output, value) {
+			t.Fatalf("lifecycle log lacks %q: %s", value, output)
+		}
+	}
+	if strings.Contains(output, "unsafe host") {
+		t.Fatalf("lifecycle log exposed handler error: %s", output)
+	}
+
+	logs.Reset()
+	staleService := dispatcher.NewServiceWithTelemetry(
+		&fakeStore{reportAttempt: func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) (postgres.AttemptReportTransition, error) {
+			return postgres.AttemptReportTransition{}, postgres.ErrAttemptReportConflict
+		}},
+		nil,
+		provider.Tracer("test"),
+		logger,
+	)
+	if _, err := staleService.ReportAttempt(ctx, request); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("stale report error = %v", err)
+	}
+	output = logs.String()
+	if !strings.Contains(output, "stale attempt report") || !strings.Contains(output, jobID.String()) ||
+		!strings.Contains(output, workerID.String()) || strings.Contains(output, "unsafe host") {
+		t.Fatalf("stale report log is missing safe identifiers: %s", output)
+	}
+}
 
 type fakeStore struct {
 	registerWorker func(context.Context, postgres.WorkerRegistration) error
@@ -794,6 +964,15 @@ func mustPayload(t *testing.T, value string) domain.Payload {
 		t.Fatalf("parse payload: %v", err)
 	}
 	return payload
+}
+
+func mustAttemptNumber(t *testing.T, value int32) domain.AttemptNumber {
+	t.Helper()
+	number, err := domain.NewAttemptNumber(value)
+	if err != nil {
+		t.Fatalf("parse attempt number: %v", err)
+	}
+	return number
 }
 
 func assertStatusCode(t *testing.T, err error, want codes.Code) {

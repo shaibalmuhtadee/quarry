@@ -451,7 +451,7 @@ Persist the submission trace context and carry it through PostgreSQL, the dispat
 
 ## Slice 5: end-to-end tracing and lifecycle logs
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -518,11 +518,22 @@ Produce one connected trace from HTTP submission through persistence, claim, wor
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- Telemetry remains component-local: HTTP and gRPC instrumentation receive the process tracer provider explicitly instead of depending on OpenTelemetry global state.
+- A multi-job claim transaction can commit jobs from unrelated persisted traces. The dispatcher therefore starts each `dispatcher.claim` span only after commit from that job's stored parent, creates a child `db.claim_job` span to record the committed database handoff, and injects the claim span into the returned job. `db.claim_job` does not claim to measure the shared transaction because assigning that transaction to one job trace would produce false parentage.
+- The worker keeps `worker.execute` open through the acknowledged report. It copies that span context onto the uncancelled attempt context for reporting so a handler cancellation or deadline cannot prevent the durable outcome report while the report RPC remains in the attempt trace.
+- Lifecycle logs contain bounded identifiers, outcomes, and safe failure codes. Handler error messages, panic values and stacks, payloads, idempotency keys, and raw trace headers are omitted. Lease-recovery transitions now carry the existing job ID, attempt number, and persisted trace parent to the reaper for correlated logs; no schema change was required.
+- Official OpenTelemetry HTTP and gRPC instrumentation were added at the process boundaries. No architecture deviation was required, and Slice 6 infrastructure remains deferred.
 
 ### Validation evidence
 
-Not run.
+- In-memory span-recorder tests passed for inbound HTTP, both gRPC sides, persisted asynchronous parentage, mixed-trace claim batches, worker and handler parentage, report context, PostgreSQL completion, and required span attributes.
+- Lifecycle-log tests passed for submission, claim, attempt start and acknowledgement, committed completion, retry scheduling, stale reports, cancellation, panic handling, and lease recovery. The tests verify that handler-controlled errors, panic details, payload values, and raw trace headers are absent.
+- `go test -count=1 ./internal/telemetry ./internal/api ./internal/dispatcher ./internal/store/postgres/... ./internal/worker/... ./cmd/api ./cmd/dispatcher ./cmd/worker` passed on Windows, including real PostgreSQL tests.
+- `go vet ./internal/telemetry ./internal/api ./internal/dispatcher ./internal/store/postgres/... ./internal/worker/... ./cmd/api ./cmd/dispatcher ./cmd/worker` passed on Windows.
+- Native Windows race tests remain unavailable because the installed Go toolchain has no CGO compiler. `docker run --rm -v "${PWD}:/src" -w /src golang:1.27.0-bookworm go test -race -count=1 ./internal/telemetry ./internal/worker ./internal/dispatcher -run "Test(AcquireJobsContinuesEachPersistedTraceIndependently|ReportAttemptLogsSafeCommittedLifecycleIdentifiers|ReaperRecordsCommittedRecoveryOutcomes|HTTPAndGRPCInstrumentationPreserveContext|WorkerContinuesAcquiredTraceThroughHandlerAndReport|WorkerRecoversPanicLogsSafeIdentifiersAndContinues)$"` passed on Linux. A broader package-level race invocation was not usable because dispatcher integration tests attempted to start Testcontainers from inside that container; those real PostgreSQL tests passed in the Windows focused suite and full check.
+- `pwsh ./scripts/dev.ps1 check` passed after the final implementation and test changes. It passed package tests, builds, static and generated-code checks, migration checks, the API smoke path, multi-worker distributed execution, crash recovery, and the Milestone 4 semantics process test.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
 
 ## Slice 6: Prometheus, Grafana, Collector, and Jaeger
 

@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -521,6 +522,35 @@ func TestCancelJobReturnsStoredCancellationState(t *testing.T) {
 			assertJSONField(t, fields, "status", string(job.Status))
 			assertJSONField(t, fields, "cancel_requested_at", requestedAt.Format(time.RFC3339Nano))
 		})
+	}
+}
+
+func TestCancelJobLogsSafeLifecycleIdentifiers(t *testing.T) {
+	job := testJob(t)
+	job.Status = domain.JobStatusCancelled
+	store := &fakeJobStore{requestCancellation: func(context.Context, domain.JobID) (domain.Job, error) {
+		return job, nil
+	}}
+	var logs bytes.Buffer
+	handler := api.NewHandler(
+		store,
+		readinessCheckerFunc(func(context.Context) error { return nil }),
+		slog.New(slog.NewTextHandler(&logs, nil)),
+	)
+	request := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID.String()+"/cancel", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("response status = %d: %s", response.Code, response.Body.String())
+	}
+	output := logs.String()
+	for _, value := range []string{"job cancellation requested", job.ID.String(), job.Type.String(), "cancelled"} {
+		if !strings.Contains(output, value) {
+			t.Fatalf("cancellation log lacks %q: %s", value, output)
+		}
+	}
+	if strings.Contains(output, "omitted") {
+		t.Fatalf("cancellation log exposed payload: %s", output)
 	}
 }
 
