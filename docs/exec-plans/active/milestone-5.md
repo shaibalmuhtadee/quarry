@@ -537,7 +537,7 @@ Produce one connected trace from HTTP submission through persistence, claim, wor
 
 ## Slice 6: Prometheus, Grafana, Collector, and Jaeger
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -602,11 +602,25 @@ Run the local observability infrastructure and provision a useful Quarry Grafana
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- Compose pins Prometheus 3.12.0, Grafana 13.1.0, OpenTelemetry Collector Contrib 0.153.0, and Jaeger 2.20.0. Registry manifests and real container startup confirmed each image.
+- Prometheus uses static `host.docker.internal` targets for the host-run API on port 8080, dispatcher on port 9464, and one demonstration worker on port 9465. The Compose `host-gateway` mapping also supports Docker Engine on Linux.
+- The Collector accepts OTLP over HTTP and gRPC, exposes its health extension, batches traces, and exports OTLP over the private Compose network to Jaeger. Jaeger uses its built-in all-in-one configuration and transient in-memory storage.
+- Grafana provisions a read-only Prometheus datasource and the committed `quarry-overview` dashboard. Anonymous viewer access keeps the local development stack usable without stored credentials.
+- The dashboard contains 13 panels for every metric group required by this slice. PostgreSQL snapshot gauges use `max`; counters and histograms aggregate only bounded labels.
+- `observability-config-test` validates Compose, Prometheus, the Collector, and committed dashboard wiring. `observability-up` starts the four services and waits for their HTTP health endpoints. `observability-down` removes only the four observability containers and does not remove PostgreSQL data.
+- No application images, durable state, schema changes, or architecture deviations were added. The submitted-job demonstration and user-facing observability documentation remain deferred to Slice 7.
 
 ### Validation evidence
 
-Not run.
+- `pwsh ./scripts/dev.ps1 observability-config-test` passed. `docker compose config --quiet`, Prometheus `promtool check config`, Collector `validate`, and `go test -count=1 ./deploy/observability` all passed.
+- `pwsh ./scripts/dev.ps1 observability-up` started pinned Prometheus, Grafana, Collector, and Jaeger containers. Docker reported all four containers healthy, and the command reached each service health endpoint.
+- Grafana's HTTP API returned the provisioned `quarry-prometheus` datasource and the `quarry-overview` dashboard with 13 panels. A browser check confirmed that the dashboard rendered the queue gauges and readable three-panel metric rows.
+- Prometheus reported `quarry-api`, `quarry-dispatcher`, and `quarry-worker` healthy while the three real Go services ran on the committed host ports.
+- An OTLP/HTTP trace sent to the Collector appeared under the expected trace ID in Jaeger's HTTP API. This proved Collector-to-Jaeger trace ingestion without bypassing the Collector.
+- `observability-down` plus `db-down` removed the validation containers and Compose network. No validation service port remained open. The PostgreSQL data volume was preserved.
+- `pwsh ./scripts/dev.ps1 check` passed after the final dashboard change. It covered package tests, builds, static and generated-code checks, native observability configuration checks, migrations, API smoke behavior, distributed execution, crash recovery, and shutdown semantics.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
 
 ## Slice 7: observability demonstration and documentation
 

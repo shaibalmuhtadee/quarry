@@ -4,7 +4,8 @@ param(
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
         "generate", "generate-check", "format-check", "vet", "build",
-        "smoke-test", "distributed-test", "recovery-test", "semantics-test"
+        "smoke-test", "distributed-test", "recovery-test", "semantics-test",
+        "observability-config-test", "observability-up", "observability-down"
     )]
     [string]$Command = "check"
 )
@@ -1731,6 +1732,106 @@ function Test-Recovery {
     )
 }
 
+function Get-ConfiguredPort {
+    param(
+        [Parameter(Mandatory)]
+        [string]$EnvironmentVariable,
+
+        [Parameter(Mandatory)]
+        [int]$Default
+    )
+
+    $configured = [Environment]::GetEnvironmentVariable($EnvironmentVariable)
+    if ([string]::IsNullOrWhiteSpace($configured)) {
+        return $Default
+    }
+
+    $port = 0
+    if (-not [int]::TryParse($configured, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+        throw "$EnvironmentVariable must be a TCP port from 1 through 65535."
+    }
+    return $port
+}
+
+function Wait-ObservabilityEndpoint {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [string]$URL
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $response = Invoke-WebRequest -Uri $URL -TimeoutSec 2 -UseBasicParsing
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+                return
+            }
+        }
+        catch {
+            Start-Sleep -Milliseconds 500
+        }
+    }
+
+    throw "$Name did not become ready at $URL within 60 seconds."
+}
+
+function Test-ObservabilityConfiguration {
+    $prometheusConfig = (Resolve-Path -LiteralPath "deploy/observability/prometheus.yml").Path
+    $collectorConfig = (Resolve-Path -LiteralPath "deploy/observability/otel-collector.yaml").Path
+
+    Invoke-Docker -Arguments @("compose", "config", "--quiet")
+    Invoke-Docker -Arguments @(
+        "run", "--rm",
+        "--volume", "${prometheusConfig}:/etc/prometheus/prometheus.yml:ro",
+        "--entrypoint", "promtool",
+        "prom/prometheus:v3.12.0",
+        "check", "config", "/etc/prometheus/prometheus.yml"
+    )
+    Invoke-Docker -Arguments @(
+        "run", "--rm",
+        "--volume", "${collectorConfig}:/etc/otelcol-contrib/config.yaml:ro",
+        "ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.153.0",
+        "validate", "--config=/etc/otelcol-contrib/config.yaml"
+    )
+    Invoke-Go -Arguments @("test", "-count=1", "./deploy/observability")
+}
+
+function Start-ObservabilityInfrastructure {
+    Test-ObservabilityConfiguration
+    Invoke-Docker -Arguments @(
+        "compose", "up", "--detach", "--wait",
+        "prometheus", "jaeger", "otel-collector", "grafana"
+    )
+
+    $prometheusPort = Get-ConfiguredPort -EnvironmentVariable "QUARRY_PROMETHEUS_PORT" -Default 9091
+    $grafanaPort = Get-ConfiguredPort -EnvironmentVariable "QUARRY_GRAFANA_PORT" -Default 3000
+    $collectorHealthPort = Get-ConfiguredPort -EnvironmentVariable "QUARRY_OTEL_HEALTH_PORT" -Default 13133
+    $jaegerPort = Get-ConfiguredPort -EnvironmentVariable "QUARRY_JAEGER_PORT" -Default 16686
+
+    Wait-ObservabilityEndpoint -Name "Prometheus" -URL "http://127.0.0.1:$prometheusPort/-/ready"
+    Wait-ObservabilityEndpoint -Name "Grafana" -URL "http://127.0.0.1:$grafanaPort/api/health"
+    Wait-ObservabilityEndpoint -Name "OpenTelemetry Collector" -URL "http://127.0.0.1:$collectorHealthPort/"
+    Wait-ObservabilityEndpoint -Name "Jaeger" -URL "http://127.0.0.1:$jaegerPort/api/services"
+
+    Write-Host "Prometheus: http://127.0.0.1:$prometheusPort"
+    Write-Host "Grafana: http://127.0.0.1:$grafanaPort/d/quarry-overview/quarry"
+    Write-Host "Jaeger: http://127.0.0.1:$jaegerPort"
+}
+
+function Stop-ObservabilityInfrastructure {
+    Invoke-Docker -Arguments @(
+        "compose", "stop",
+        "prometheus", "jaeger", "otel-collector", "grafana"
+    )
+    Invoke-Docker -Arguments @(
+        "compose", "rm", "--force",
+        "prometheus", "jaeger", "otel-collector", "grafana"
+    )
+}
+
 function Test-ComposeSmoke {
     $binaryExtension = if ($IsWindows) { ".exe" } else { "" }
     $apiBinary = Join-Path `
@@ -1790,7 +1891,7 @@ try {
             Test-GoVet
             Test-GoPackages
             Test-GoBuild
-            Invoke-Docker -Arguments @("compose", "config", "--quiet")
+            Test-ObservabilityConfiguration
             Test-ComposeSmoke
             Test-DistributedProcesses
             Test-Recovery
@@ -1858,6 +1959,15 @@ try {
         }
         "semantics-test" {
             Test-Semantics
+        }
+        "observability-config-test" {
+            Test-ObservabilityConfiguration
+        }
+        "observability-up" {
+            Start-ObservabilityInfrastructure
+        }
+        "observability-down" {
+            Stop-ObservabilityInfrastructure
         }
     }
 }
