@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/shaibalmuhtadee/quarry/internal/dispatcher"
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	dispatcherv1 "github.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1"
@@ -186,6 +187,12 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
 		return err
 	}
 	defer pool.Close()
+	if err := registerQueueHealthCollector(
+		telemetryRuntime.Registry(),
+		postgresQueueSnapshotSource{store: postgres.NewQueueSnapshotStore(pool)},
+	); err != nil {
+		return fmt.Errorf("register queue-health metrics: %w", err)
+	}
 
 	listener, err := net.Listen("tcp", cfg.dispatcherAddress)
 	if err != nil {
@@ -223,6 +230,32 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
 	cancel()
 	<-reaperStopped
 	return err
+}
+
+func registerQueueHealthCollector(registerer prometheus.Registerer, source telemetry.QueueSnapshotSource) error {
+	return registerer.Register(telemetry.NewQueueHealthCollector(source))
+}
+
+type postgresQueueSnapshotSource struct {
+	store postgresQueueSnapshotReader
+}
+
+type postgresQueueSnapshotReader interface {
+	QueueSnapshot(context.Context) (postgres.QueueSnapshot, error)
+}
+
+func (source postgresQueueSnapshotSource) QueueSnapshot(ctx context.Context) (telemetry.QueueSnapshot, error) {
+	snapshot, err := source.store.QueueSnapshot(ctx)
+	if err != nil {
+		return telemetry.QueueSnapshot{}, err
+	}
+	return telemetry.QueueSnapshot{
+		Queued:            snapshot.Queued,
+		RetryWait:         snapshot.RetryWait,
+		OldestEligibleAge: snapshot.OldestEligibleAge,
+		ActiveJobs:        snapshot.ActiveJobs,
+		ActiveWorkers:     snapshot.ActiveWorkers,
+	}, nil
 }
 
 func serveDispatcher(

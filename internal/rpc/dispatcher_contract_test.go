@@ -41,6 +41,31 @@ func TestHeartbeatRequestPreservesAttemptIdentity(t *testing.T) {
 	}
 }
 
+func TestAcquiredJobPreservesTraceparent(t *testing.T) {
+	t.Parallel()
+
+	want := "00-0102030405060708090a0b0c0d0e0f10-0102030405060708-01"
+	job := &dispatcherv1.AcquiredJob{
+		JobId:       "00000000-0000-0000-0000-000000000001",
+		AttemptNo:   2,
+		JobType:     "demo.echo",
+		PayloadJson: []byte(`{}`),
+		TimeoutMs:   30000,
+		Traceparent: want,
+	}
+	encoded, err := proto.Marshal(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded dispatcherv1.AcquiredJob
+	if err := proto.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.GetTraceparent() != want {
+		t.Fatalf("traceparent = %q, want %q", decoded.GetTraceparent(), want)
+	}
+}
+
 func TestHeartbeatResponsePreservesExplicitLeaseStates(t *testing.T) {
 	t.Parallel()
 

@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	postgresdb "github.com/shaibalmuhtadee/quarry/internal/store/postgres/generated"
+	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
 )
 
 type JobStore struct {
@@ -30,6 +31,7 @@ func (store *JobStore) SubmitJob(ctx context.Context, submission domain.JobSubmi
 	if key, ok := submission.IdempotencyKey(); ok {
 		idempotencyKey = pgtype.Text{String: key.String(), Valid: true}
 	}
+	traceparentValue, hasTraceparent := telemetry.TraceParentFromContext(ctx)
 	row, err := store.queries.SubmitJob(ctx, postgresdb.SubmitJobParams{
 		ID:             submission.ID().UUID(),
 		JobType:        submission.Type().String(),
@@ -38,6 +40,10 @@ func (store *JobStore) SubmitJob(ctx context.Context, submission domain.JobSubmi
 		TimeoutMs:      submission.Timeout().Milliseconds(),
 		IdempotencyKey: idempotencyKey,
 		RequestHash:    requestHash,
+		Traceparent: pgtype.Text{
+			String: traceparentValue,
+			Valid:  hasTraceparent,
+		},
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		if !idempotent {

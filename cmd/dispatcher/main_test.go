@@ -9,7 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
+	"github.com/shaibalmuhtadee/quarry/internal/store/postgres"
+	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -224,4 +227,68 @@ func TestUnexpectedServeError(t *testing.T) {
 	if err := unexpectedServeError(want); !errors.Is(err, want) {
 		t.Fatalf("unexpectedServeError = %v, want wrapped listener error", err)
 	}
+}
+
+func TestRegisterQueueHealthCollector(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	if err := registerQueueHealthCollector(registry, telemetryQueueSnapshotStub{}); err != nil {
+		t.Fatalf("register queue-health collector: %v", err)
+	}
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, family := range families {
+		if family.GetName() == "quarry_queue_snapshot_up" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("registered collector did not expose quarry_queue_snapshot_up")
+	}
+	if err := registerQueueHealthCollector(registry, telemetryQueueSnapshotStub{}); err == nil {
+		t.Fatal("duplicate queue-health collector registration succeeded")
+	}
+}
+
+func TestPostgresQueueSnapshotSourceMapsStoreSnapshot(t *testing.T) {
+	want := postgres.QueueSnapshot{
+		Queued:            1,
+		RetryWait:         2,
+		OldestEligibleAge: 3 * time.Second,
+		ActiveJobs:        4,
+		ActiveWorkers:     5,
+	}
+	source := postgresQueueSnapshotSource{store: postgresQueueSnapshotStub{snapshot: want}}
+	got, err := source.QueueSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Queued != want.Queued || got.RetryWait != want.RetryWait ||
+		got.OldestEligibleAge != want.OldestEligibleAge || got.ActiveJobs != want.ActiveJobs ||
+		got.ActiveWorkers != want.ActiveWorkers {
+		t.Fatalf("mapped snapshot = %#v, want %#v", got, want)
+	}
+
+	wantErr := errors.New("snapshot failed")
+	source.store = postgresQueueSnapshotStub{err: wantErr}
+	if _, err := source.QueueSnapshot(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("queue snapshot error = %v, want %v", err, wantErr)
+	}
+}
+
+type telemetryQueueSnapshotStub struct{}
+
+func (telemetryQueueSnapshotStub) QueueSnapshot(context.Context) (telemetry.QueueSnapshot, error) {
+	return telemetry.QueueSnapshot{}, nil
+}
+
+type postgresQueueSnapshotStub struct {
+	snapshot postgres.QueueSnapshot
+	err      error
+}
+
+func (stub postgresQueueSnapshotStub) QueueSnapshot(context.Context) (postgres.QueueSnapshot, error) {
+	return stub.snapshot, stub.err
 }

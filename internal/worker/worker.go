@@ -41,6 +41,7 @@ type Job struct {
 	Type          domain.JobType
 	Payload       domain.Payload
 	Timeout       time.Duration
+	TraceParent   string
 }
 
 type HeartbeatAttempt struct {

@@ -147,6 +147,7 @@ func (service *Service) AcquireJobs(
 			JobType:     job.Type.String(),
 			PayloadJson: job.Payload.JSON(),
 			TimeoutMs:   job.Timeout.Milliseconds(),
+			Traceparent: job.TraceParent,
 		})
 	}
 

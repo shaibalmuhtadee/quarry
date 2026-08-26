@@ -89,6 +89,7 @@ WITH eligible AS (
         jobs.payload,
         jobs.attempt_count,
         jobs.timeout_ms,
+        jobs.traceparent,
         jobs.available_at,
         jobs.created_at
 ), attempts AS (
@@ -114,6 +115,7 @@ SELECT
     claimed.payload,
     claimed.attempt_count,
     claimed.timeout_ms,
+    claimed.traceparent,
     CAST(EXTRACT(EPOCH FROM (statement_timestamp() - claimed.available_at)) AS double precision)
         AS scheduling_delay_seconds
 FROM claimed
@@ -134,6 +136,7 @@ type ClaimJobsRow struct {
 	Payload                []byte
 	AttemptCount           int32
 	TimeoutMs              int64
+	Traceparent            pgtype.Text
 	SchedulingDelaySeconds float64
 }
 
@@ -157,6 +160,7 @@ func (q *Queries) ClaimJobs(ctx context.Context, arg ClaimJobsParams) ([]ClaimJo
 			&i.Payload,
 			&i.AttemptCount,
 			&i.TimeoutMs,
+			&i.Traceparent,
 			&i.SchedulingDelaySeconds,
 		); err != nil {
 			return nil, err

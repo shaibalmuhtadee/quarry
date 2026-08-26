@@ -280,7 +280,7 @@ Instrument submissions, claims, terminal attempts, retries, lease expiration, st
 
 ## Slice 3: PostgreSQL queue-health metrics
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -339,15 +339,28 @@ Expose authoritative queue depth, oldest eligible job age, running-job count, an
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- One SQL statement returns queued, retry-wait, running-job, active-worker, and oldest-eligible-age values from one PostgreSQL statement snapshot.
+- Queue depth includes all durable `queued` and `retry_wait` jobs. Oldest age includes only jobs whose `available_at` is not in the future and returns zero when none are eligible.
+- Active-worker count uses the durable worker state. The collector does not mark workers lost, so the existing reaper remains the owner of the active-to-lost transition.
+- A failed or timed-out snapshot emits `quarry_queue_snapshot_up` with value zero and omits the database gauges. The collector uses no cache and cannot report an old snapshot as current.
+- The dispatcher owns the adapter between PostgreSQL and the shared telemetry collector. This keeps the API and worker telemetry runtime independent of PostgreSQL types.
+- No schema migration or architecture deviation was required. Durable trace context, spans, dashboards, and observability infrastructure remain deferred to Slices 4 through 7.
 
 ### Validation evidence
 
-Not run.
+- `go test -count=1 ./internal/telemetry ./internal/store/postgres/... ./cmd/dispatcher` passed. The PostgreSQL tests covered empty values, exact queued and retry-wait depth, future and eligible retry ages, running jobs, active-to-lost worker state, and concurrent snapshots with no negative values.
+- Collector tests verified exact metric values and labels. A query failure emitted only `quarry_queue_snapshot_up 0` and did not panic or expose stale gauges.
+- `go vet ./internal/telemetry ./internal/store/postgres/... ./cmd/dispatcher` passed.
+- `pwsh ./scripts/dev.ps1 generate-check` passed.
+- `go list -deps ./cmd/worker` contained no `internal/store/postgres` dependency after the dispatcher adapter was added.
+- `pwsh ./scripts/dev.ps1 check` passed. It covered package tests, builds, static checks, generated-code checks, migrations, API smoke behavior, distributed execution, crash recovery, and shutdown semantics.
+- `git diff --check` passed.
+- Docker Desktop was initially stopped. After it started, the required real PostgreSQL validation passed without a code workaround.
+- GitHub-hosted CI was not run.
 
 ## Slice 4: durable trace-context contract
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -414,11 +427,27 @@ Persist the submission trace context and carry it through PostgreSQL, the dispat
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- The Slice 4 dependency list referred to a Slice 1 propagation helper, but Slice 1 had intentionally deferred propagation. Slice 4 added the small helper needed to serialize and validate canonical W3C `traceparent` values.
+- Migration 8 adds a nullable `jobs.traceparent` column and a PostgreSQL check constraint for canonical version-00 values with nonzero trace and parent identifiers. Existing rows remain null.
+- `JobStore.SubmitJob` derives `traceparent` from the OpenTelemetry span context. Missing or invalid contexts become SQL null.
+- Idempotent replay still uses `DO NOTHING`, so a later request cannot replace the first submission's trace context.
+- The atomic claim query returns `traceparent` with the claimed row. The dispatcher carries it through the existing `AcquiredJob` contract and Protocol Buffer field 6.
+- The worker client validates the acquired value. It clears invalid metadata without rejecting or changing the rest of the job.
+- The worker stores the value as opaque job metadata. HTTP and gRPC instrumentation, span creation, worker context extraction, and lifecycle trace logs remain deferred to Slice 5.
+- No architecture deviation was required.
 
 ### Validation evidence
 
-Not run.
+- Telemetry tests passed for canonical serialization, missing and invalid contexts, zero identifiers, and noncanonical input.
+- The real PostgreSQL test passed for valid, missing, and invalid submission contexts, first-writer idempotency, and atomic claim transport.
+- Protocol Buffer round-trip, dispatcher mapping, worker client mapping, and invalid acquired-context tests passed.
+- `go test -count=1 ./internal/store/postgres/... ./internal/dispatcher ./internal/worker ./internal/rpc` passed.
+- `pwsh ./scripts/dev.ps1 migration-test` passed migration apply, rollback, and reapplication through version 8. It also verified null backfill plus valid and invalid database values.
+- `pwsh ./scripts/dev.ps1 generate-check` passed for sqlc and Protocol Buffer output.
+- `go vet ./internal/telemetry ./internal/store/postgres/... ./internal/dispatcher ./internal/worker ./internal/rpc` passed.
+- `pwsh ./scripts/dev.ps1 check` passed. It covered package tests, builds, static checks, generated-code checks, migrations, API smoke behavior, distributed execution, crash recovery, and shutdown semantics.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
 
 ## Slice 5: end-to-end tracing and lifecycle logs
 

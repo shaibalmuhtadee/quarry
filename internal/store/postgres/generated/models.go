@@ -27,6 +27,7 @@ type Job struct {
 	IdempotencyKey    pgtype.Text
 	RequestHash       []byte
 	CancelRequestedAt pgtype.Timestamptz
+	Traceparent       pgtype.Text
 }
 
 type JobAttempt struct {

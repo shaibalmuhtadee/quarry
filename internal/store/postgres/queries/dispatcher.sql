@@ -82,6 +82,7 @@ WITH eligible AS (
         jobs.payload,
         jobs.attempt_count,
         jobs.timeout_ms,
+        jobs.traceparent,
         jobs.available_at,
         jobs.created_at
 ), attempts AS (
@@ -107,6 +108,7 @@ SELECT
     claimed.payload,
     claimed.attempt_count,
     claimed.timeout_ms,
+    claimed.traceparent,
     CAST(EXTRACT(EPOCH FROM (statement_timestamp() - claimed.available_at)) AS double precision)
         AS scheduling_delay_seconds
 FROM claimed

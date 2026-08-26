@@ -35,6 +35,7 @@ type AcquiredJob struct {
 	Payload         domain.Payload
 	Timeout         time.Duration
 	SchedulingDelay time.Duration
+	TraceParent     string
 }
 
 type AttemptReportTransition struct {
@@ -590,6 +591,10 @@ func mapAcquiredJob(row postgresdb.ClaimJobsRow) (AcquiredJob, error) {
 		return AcquiredJob{}, err
 	}
 
+	traceParent := ""
+	if row.Traceparent.Valid {
+		traceParent = row.Traceparent.String
+	}
 	return AcquiredJob{
 		ID:              id,
 		AttemptNumber:   attemptNumber,
@@ -597,5 +602,6 @@ func mapAcquiredJob(row postgresdb.ClaimJobsRow) (AcquiredJob, error) {
 		Payload:         payload,
 		Timeout:         time.Duration(row.TimeoutMs) * time.Millisecond,
 		SchedulingDelay: time.Duration(row.SchedulingDelaySeconds * float64(time.Second)),
+		TraceParent:     traceParent,
 	}, nil
 }

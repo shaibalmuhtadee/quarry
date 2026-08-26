@@ -9,6 +9,7 @@ import (
 
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	dispatcherv1 "github.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1"
+	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -214,12 +215,17 @@ func parseAcquiredJob(acquired *dispatcherv1.AcquiredJob) (Job, error) {
 	if acquired.GetTimeoutMs() <= 0 || acquired.GetTimeoutMs() > math.MaxInt64/int64(time.Millisecond) {
 		return Job{}, domain.ErrInvalidTimeout
 	}
+	traceParent := acquired.GetTraceparent()
+	if !telemetry.IsValidTraceParent(traceParent) {
+		traceParent = ""
+	}
 	return Job{
 		ID:            jobID,
 		AttemptNumber: attemptNumber,
 		Type:          jobType,
 		Payload:       payload,
 		Timeout:       time.Duration(acquired.GetTimeoutMs()) * time.Millisecond,
+		TraceParent:   traceParent,
 	}, nil
 }
 

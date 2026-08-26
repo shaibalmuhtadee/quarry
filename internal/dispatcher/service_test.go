@@ -199,6 +199,7 @@ func TestAcquireJobsParsesRequestAndMapsJobs(t *testing.T) {
 	}
 	jobType := mustJobType(t, "demo.echo")
 	payload := mustPayload(t, `{"message":"hello"}`)
+	traceparent := "00-0102030405060708090a0b0c0d0e0f10-0102030405060708-01"
 	var capturedWorkerID domain.WorkerID
 	var capturedCapacity int32
 	var capturedTypes []domain.JobType
@@ -219,6 +220,7 @@ func TestAcquireJobsParsesRequestAndMapsJobs(t *testing.T) {
 					Type:          jobType,
 					Payload:       payload,
 					Timeout:       30 * time.Second,
+					TraceParent:   traceparent,
 				},
 			}, nil
 		},
@@ -243,7 +245,8 @@ func TestAcquireJobsParsesRequestAndMapsJobs(t *testing.T) {
 	}
 	job := response.GetJobs()[0]
 	if job.GetJobId() != jobID.String() || job.GetAttemptNo() != 2 || job.GetJobType() != "demo.echo" ||
-		string(job.GetPayloadJson()) != `{"message":"hello"}` || job.GetTimeoutMs() != 30000 {
+		string(job.GetPayloadJson()) != `{"message":"hello"}` || job.GetTimeoutMs() != 30000 ||
+		job.GetTraceparent() != traceparent {
 		t.Fatalf("acquired response job = %#v", job)
 	}
 }
