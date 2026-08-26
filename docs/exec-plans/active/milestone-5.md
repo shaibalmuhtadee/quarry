@@ -198,7 +198,7 @@ Create the shared telemetry runtime, configuration, context-aware logging suppor
 
 ## Slice 2: committed event metrics
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -260,11 +260,23 @@ Instrument submissions, claims, terminal attempts, retries, lease expiration, st
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- PostgreSQL returns the scheduling delay from `statement_timestamp() - available_at` as part of the committed claim query. This keeps the measurement on the same database clock that controls eligibility.
+- Attempt-report and lease-recovery store methods return typed transition facts after commit. Exact repeated reports return `Applied: false`, so state and metrics remain idempotent.
+- Handler duration is observed once per completed invocation before report retries. Worker poll errors use lowercase canonical gRPC status codes.
+- Lease-expiration outcomes use the final durable job status. A retry is counted only for `retry_wait`, with `lease_expired` as the reason.
+- The expected file set expanded to the dispatcher SQL query and generated sqlc output because committed scheduling delay and job type must come from the durable transition. No architecture deviation was required.
+- PostgreSQL queue-health gauges, trace persistence and spans, dashboards, and observability infrastructure remain deferred to Slices 3 through 7.
 
 ### Validation evidence
 
-Not run.
+- Exact metric-family and label tests, new versus deduplicated submission tests, idempotent repeated-report tests, all terminal outcome tests, lease-expiry outcome tests, stale-report tests, handler-duration tests, poll-error tests, and empty/non-empty claim-size tests passed in their owning packages.
+- `pwsh ./scripts/dev.ps1 generate-check` passed after regenerating the sqlc query output.
+- `go test -count=1 ./internal/telemetry ./internal/api ./internal/dispatcher ./internal/store/postgres/... ./internal/worker/...` passed on Windows, including real PostgreSQL transition and scheduling-delay tests.
+- `go vet ./internal/telemetry ./internal/api ./internal/dispatcher ./internal/store/postgres/... ./internal/worker/...` passed on Windows.
+- Native Windows race tests remain unavailable because the installed toolchain has no CGO compiler. `docker run --rm -v "${PWD}:/src" -w /src golang:1.27.0-bookworm go test -race -count=1 ./internal/telemetry ./internal/worker/...` passed on Linux. The focused dispatcher service and reaper race command also passed; package-wide dispatcher race execution was not used because its Testcontainers integration tests cannot start sibling containers from inside that container.
+- `pwsh ./scripts/dev.ps1 check` passed. It covered package tests, builds, static checks, generated-code checks, migrations, API smoke behavior, distributed execution, crash recovery, and shutdown semantics.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
 
 ## Slice 3: PostgreSQL queue-health metrics
 

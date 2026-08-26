@@ -24,28 +24,41 @@ type JobStore interface {
 	ListJobAttempts(context.Context, domain.JobID) ([]domain.Attempt, error)
 }
 
+type submissionMetrics interface {
+	JobSubmitted()
+}
+
 type handler struct {
 	store     JobStore
 	readiness ReadinessChecker
+	metrics   submissionMetrics
 }
 
 func NewHandler(store JobStore, readiness ReadinessChecker, logger *slog.Logger) http.Handler {
-	return newHandler(store, readiness, logger, nil)
+	return newHandler(store, readiness, logger, nil, nil)
 }
 
 func NewHandlerWithMetrics(
 	store JobStore,
 	readiness ReadinessChecker,
 	logger *slog.Logger,
-	metrics http.Handler,
+	metricsHandler http.Handler,
+	eventMetrics submissionMetrics,
 ) http.Handler {
-	return newHandler(store, readiness, logger, metrics)
+	return newHandler(store, readiness, logger, metricsHandler, eventMetrics)
 }
 
-func newHandler(store JobStore, readiness ReadinessChecker, logger *slog.Logger, metrics http.Handler) http.Handler {
+func newHandler(
+	store JobStore,
+	readiness ReadinessChecker,
+	logger *slog.Logger,
+	metricsHandler http.Handler,
+	metrics submissionMetrics,
+) http.Handler {
 	handler := &handler{
 		store:     store,
 		readiness: readiness,
+		metrics:   metrics,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/jobs", handler.createJob)
@@ -54,8 +67,8 @@ func newHandler(store JobStore, readiness ReadinessChecker, logger *slog.Logger,
 	mux.HandleFunc("GET /v1/jobs/{id}/attempts", handler.getJobAttempts)
 	mux.HandleFunc("GET /healthz", handler.health)
 	mux.HandleFunc("GET /readyz", handler.ready)
-	if metrics != nil {
-		mux.Handle("GET /metrics", metrics)
+	if metricsHandler != nil {
+		mux.Handle("GET /metrics", metricsHandler)
 	}
 
 	return logRequests(logger, mux)
@@ -190,6 +203,9 @@ func (handler *handler) createJob(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 	job := result.Job
+	if !result.Deduplicated && handler.metrics != nil {
+		handler.metrics.JobSubmitted()
+	}
 	setRequestJobID(request, job.ID.String())
 
 	writer.Header().Set("Location", "/v1/jobs/"+job.ID.String())

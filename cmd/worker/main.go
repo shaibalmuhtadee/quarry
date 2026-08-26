@@ -183,6 +183,7 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
 		HeartbeatInterval: cfg.heartbeatInterval,
 		ShutdownTimeout:   cfg.shutdownTimeout,
 		Logger:            logger,
+		Metrics:           telemetryRuntime.Metrics(),
 	})
 	if err != nil {
 		return err

@@ -15,6 +15,7 @@ import (
 
 type Runtime struct {
 	registry       *prometheus.Registry
+	metrics        *Metrics
 	tracerProvider *sdktrace.TracerProvider
 }
 
@@ -42,9 +43,15 @@ func newRuntime(cfg Config, exporter sdktrace.SpanExporter) (*Runtime, error) {
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	metrics, err := NewMetrics(registry)
+	if err != nil {
+		_ = exporter.Shutdown(context.Background())
+		return nil, fmt.Errorf("register telemetry metrics: %w", err)
+	}
 
 	return &Runtime{
 		registry: registry,
+		metrics:  metrics,
 		tracerProvider: sdktrace.NewTracerProvider(
 			sdktrace.WithBatcher(exporter),
 			sdktrace.WithResource(processResource),
@@ -58,6 +65,10 @@ func (runtime *Runtime) Registry() *prometheus.Registry {
 
 func (runtime *Runtime) MetricsHandler() http.Handler {
 	return promhttp.HandlerFor(runtime.registry, promhttp.HandlerOpts{})
+}
+
+func (runtime *Runtime) Metrics() *Metrics {
+	return runtime.metrics
 }
 
 func (runtime *Runtime) TracerProvider() *sdktrace.TracerProvider {

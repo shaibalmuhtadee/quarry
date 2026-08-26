@@ -29,11 +29,27 @@ type WorkerRegistration struct {
 }
 
 type AcquiredJob struct {
-	ID            domain.JobID
-	AttemptNumber domain.AttemptNumber
-	Type          domain.JobType
-	Payload       domain.Payload
-	Timeout       time.Duration
+	ID              domain.JobID
+	AttemptNumber   domain.AttemptNumber
+	Type            domain.JobType
+	Payload         domain.Payload
+	Timeout         time.Duration
+	SchedulingDelay time.Duration
+}
+
+type AttemptReportTransition struct {
+	Applied       bool
+	JobType       domain.JobType
+	AttemptStatus domain.AttemptStatus
+	JobStatus     domain.JobStatus
+	ErrorCode     string
+}
+
+type RecoveryTransition struct {
+	JobType       domain.JobType
+	AttemptStatus domain.AttemptStatus
+	JobStatus     domain.JobStatus
+	ErrorCode     string
 }
 
 type HeartbeatAttempt struct {
@@ -218,29 +234,43 @@ func (store *DispatcherStore) RecoverExpiredAttempts(
 	batchSize int32,
 	workerLivenessTimeout time.Duration,
 ) (int64, error) {
+	transitions, err := store.RecoverExpiredAttemptTransitions(ctx, batchSize, workerLivenessTimeout)
+	return int64(len(transitions)), err
+}
+
+func (store *DispatcherStore) RecoverExpiredAttemptTransitions(
+	ctx context.Context,
+	batchSize int32,
+	workerLivenessTimeout time.Duration,
+) ([]RecoveryTransition, error) {
 	if batchSize <= 0 || workerLivenessTimeout <= 0 || workerLivenessTimeout.Milliseconds() <= 0 {
-		return 0, ErrInvalidRecoveryConfig
+		return nil, ErrInvalidRecoveryConfig
 	}
 
 	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return 0, fmt.Errorf("begin expired attempt recovery: %w", err)
+		return nil, fmt.Errorf("begin expired attempt recovery: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	queries := postgresdb.New(tx)
 	if _, err := queries.MarkLostWorkers(ctx, workerLivenessTimeout.Milliseconds()); err != nil {
-		return 0, fmt.Errorf("mark lost workers: %w", err)
+		return nil, fmt.Errorf("mark lost workers: %w", err)
 	}
 
 	expiredJobs, err := queries.LockExpiredJobs(ctx, batchSize)
 	if err != nil {
-		return 0, fmt.Errorf("lock expired jobs: %w", err)
+		return nil, fmt.Errorf("lock expired jobs: %w", err)
 	}
+	transitions := make([]RecoveryTransition, 0, len(expiredJobs))
 	for _, expired := range expiredJobs {
+		jobType, err := domain.ParseJobType(expired.JobType)
+		if err != nil {
+			return nil, fmt.Errorf("parse expired job type: %w", err)
+		}
 		attemptNumber, err := domain.NewAttemptNumber(expired.AttemptCount)
 		if err != nil {
-			return 0, fmt.Errorf("parse expired attempt number: %w", err)
+			return nil, fmt.Errorf("parse expired attempt number: %w", err)
 		}
 		jobStatus := domain.JobStatusRetryWait
 		attemptStatus := domain.AttemptStatusAbandoned
@@ -253,15 +283,15 @@ func (store *DispatcherStore) RecoverExpiredAttempts(
 		} else {
 			retryDelay, err = store.retryPolicy.Delay(attemptNumber)
 			if err != nil {
-				return 0, fmt.Errorf("calculate expired attempt retry delay: %w", err)
+				return nil, fmt.Errorf("calculate expired attempt retry delay: %w", err)
 			}
 		}
 		transitionTime, err := queries.GetTransitionTime(ctx)
 		if err != nil {
-			return 0, fmt.Errorf("read expired attempt transition time: %w", err)
+			return nil, fmt.Errorf("read expired attempt transition time: %w", err)
 		}
 		if !transitionTime.Valid {
-			return 0, errors.New("expired attempt transition time is null")
+			return nil, errors.New("expired attempt transition time is null")
 		}
 
 		var attemptRows int64
@@ -279,10 +309,10 @@ func (store *DispatcherStore) RecoverExpiredAttempts(
 			})
 		}
 		if err != nil {
-			return 0, fmt.Errorf("abandon expired attempt: %w", err)
+			return nil, fmt.Errorf("abandon expired attempt: %w", err)
 		}
 		if attemptRows != 1 {
-			return 0, errors.New("abandon expired attempt updated an unexpected number of rows")
+			return nil, errors.New("abandon expired attempt updated an unexpected number of rows")
 		}
 
 		jobRows, err := queries.RecoverExpiredJob(ctx, postgresdb.RecoverExpiredJobParams{
@@ -293,17 +323,27 @@ func (store *DispatcherStore) RecoverExpiredAttempts(
 			AttemptNo:      expired.AttemptCount,
 		})
 		if err != nil {
-			return 0, fmt.Errorf("recover expired job: %w", err)
+			return nil, fmt.Errorf("recover expired job: %w", err)
 		}
 		if jobRows != 1 {
-			return 0, errors.New("recover expired job updated an unexpected number of rows")
+			return nil, errors.New("recover expired job updated an unexpected number of rows")
 		}
+		errorCode := "lease_expired"
+		if attemptStatus == domain.AttemptStatusCancelled {
+			errorCode = "cancellation_requested"
+		}
+		transitions = append(transitions, RecoveryTransition{
+			JobType:       jobType,
+			AttemptStatus: attemptStatus,
+			JobStatus:     jobStatus,
+			ErrorCode:     errorCode,
+		})
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("commit expired attempt recovery: %w", err)
+		return nil, fmt.Errorf("commit expired attempt recovery: %w", err)
 	}
 
-	return int64(len(expiredJobs)), nil
+	return transitions, nil
 }
 
 func (store *DispatcherStore) ReportAttempt(
@@ -313,18 +353,29 @@ func (store *DispatcherStore) ReportAttempt(
 	attemptNumber domain.AttemptNumber,
 	outcome domain.AttemptOutcome,
 ) error {
+	_, err := store.ReportAttemptTransition(ctx, workerID, jobID, attemptNumber, outcome)
+	return err
+}
+
+func (store *DispatcherStore) ReportAttemptTransition(
+	ctx context.Context,
+	workerID domain.WorkerID,
+	jobID domain.JobID,
+	attemptNumber domain.AttemptNumber,
+	outcome domain.AttemptOutcome,
+) (AttemptReportTransition, error) {
 	if outcome.IsZero() {
-		return domain.ErrInvalidAttemptOutcome
+		return AttemptReportTransition{}, domain.ErrInvalidAttemptOutcome
 	}
 
 	attemptStatus, jobStatus, resultJSON, failure, err := reportTransition(outcome)
 	if err != nil {
-		return err
+		return AttemptReportTransition{}, err
 	}
 
 	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("begin attempt report: %w", err)
+		return AttemptReportTransition{}, fmt.Errorf("begin attempt report: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -335,18 +386,22 @@ func (store *DispatcherStore) ReportAttempt(
 		JobID:      jobID.UUID(),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrAttemptReportConflict
+		return AttemptReportTransition{}, ErrAttemptReportConflict
 	}
 	if err != nil {
-		return fmt.Errorf("lock attempt report: %w", err)
+		return AttemptReportTransition{}, fmt.Errorf("lock attempt report: %w", err)
 	}
 	if report.AttemptCount != attemptNumber.Int32() || report.WorkerID != workerID.UUID() {
-		return ErrAttemptReportConflict
+		return AttemptReportTransition{}, ErrAttemptReportConflict
+	}
+	jobType, err := domain.ParseJobType(report.JobType)
+	if err != nil {
+		return AttemptReportTransition{}, fmt.Errorf("parse reported job type: %w", err)
 	}
 	if report.CancelRequestedAt.Valid && outcome.Kind() != domain.AttemptOutcomeKindSucceeded {
 		attemptStatus, jobStatus, resultJSON, failure, err = cancellationRequestedTransition()
 		if err != nil {
-			return err
+			return AttemptReportTransition{}, err
 		}
 	}
 	if jobStatus == domain.JobStatusRetryWait && report.AttemptCount >= report.MaxAttempts {
@@ -358,32 +413,32 @@ func (store *DispatcherStore) ReportAttempt(
 			report.AttemptStatus != string(attemptStatus) ||
 			!storedFailureMatches(report.ErrorCode, report.ErrorMessage, failure) ||
 			(attemptStatus == domain.AttemptStatusSucceeded && !report.ResultMatches) {
-			return ErrAttemptReportConflict
+			return AttemptReportTransition{}, ErrAttemptReportConflict
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit repeated attempt report: %w", err)
+			return AttemptReportTransition{}, fmt.Errorf("commit repeated attempt report: %w", err)
 		}
-		return nil
+		return newAttemptReportTransition(false, jobType, attemptStatus, jobStatus, failure), nil
 	}
 	if report.JobStatus != string(domain.JobStatusRunning) || !report.LeaseExpiresAt.Valid {
-		return ErrAttemptReportConflict
+		return AttemptReportTransition{}, ErrAttemptReportConflict
 	}
 	transitionTime, err := queries.GetTransitionTime(ctx)
 	if err != nil {
-		return fmt.Errorf("read attempt transition time: %w", err)
+		return AttemptReportTransition{}, fmt.Errorf("read attempt transition time: %w", err)
 	}
 	if !transitionTime.Valid {
-		return errors.New("attempt transition time is null")
+		return AttemptReportTransition{}, errors.New("attempt transition time is null")
 	}
 	if !report.LeaseExpiresAt.Time.After(transitionTime.Time) {
-		return ErrAttemptReportConflict
+		return AttemptReportTransition{}, ErrAttemptReportConflict
 	}
 
 	var retryDelay time.Duration
 	if jobStatus == domain.JobStatusRetryWait {
 		retryDelay, err = store.retryPolicy.Delay(attemptNumber)
 		if err != nil {
-			return fmt.Errorf("calculate attempt retry delay: %w", err)
+			return AttemptReportTransition{}, fmt.Errorf("calculate attempt retry delay: %w", err)
 		}
 	}
 	attemptRows, err := queries.FinishAttempt(ctx, postgresdb.FinishAttemptParams{
@@ -396,10 +451,10 @@ func (store *DispatcherStore) ReportAttempt(
 		WorkerID:       workerID.UUID(),
 	})
 	if err != nil {
-		return fmt.Errorf("finish attempt: %w", err)
+		return AttemptReportTransition{}, fmt.Errorf("finish attempt: %w", err)
 	}
 	if attemptRows != 1 {
-		return errors.New("finish attempt updated an unexpected number of rows")
+		return AttemptReportTransition{}, errors.New("finish attempt updated an unexpected number of rows")
 	}
 
 	jobRows, err := queries.FinishJob(ctx, postgresdb.FinishJobParams{
@@ -415,17 +470,37 @@ func (store *DispatcherStore) ReportAttempt(
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("finish job: %w", err)
+		return AttemptReportTransition{}, fmt.Errorf("finish job: %w", err)
 	}
 	if jobRows != 1 {
-		return errors.New("finish job updated an unexpected number of rows")
+		return AttemptReportTransition{}, errors.New("finish job updated an unexpected number of rows")
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit attempt report: %w", err)
+		return AttemptReportTransition{}, fmt.Errorf("commit attempt report: %w", err)
 	}
 
-	return nil
+	return newAttemptReportTransition(true, jobType, attemptStatus, jobStatus, failure), nil
+}
+
+func newAttemptReportTransition(
+	applied bool,
+	jobType domain.JobType,
+	attemptStatus domain.AttemptStatus,
+	jobStatus domain.JobStatus,
+	failure *domain.AttemptFailure,
+) AttemptReportTransition {
+	errorCode := ""
+	if failure != nil {
+		errorCode = failure.Code()
+	}
+	return AttemptReportTransition{
+		Applied:       applied,
+		JobType:       jobType,
+		AttemptStatus: attemptStatus,
+		JobStatus:     jobStatus,
+		ErrorCode:     errorCode,
+	}
 }
 
 func cancellationRequestedTransition() (
@@ -516,10 +591,11 @@ func mapAcquiredJob(row postgresdb.ClaimJobsRow) (AcquiredJob, error) {
 	}
 
 	return AcquiredJob{
-		ID:            id,
-		AttemptNumber: attemptNumber,
-		Type:          jobType,
-		Payload:       payload,
-		Timeout:       time.Duration(row.TimeoutMs) * time.Millisecond,
+		ID:              id,
+		AttemptNumber:   attemptNumber,
+		Type:            jobType,
+		Payload:         payload,
+		Timeout:         time.Duration(row.TimeoutMs) * time.Millisecond,
+		SchedulingDelay: time.Duration(row.SchedulingDelaySeconds * float64(time.Second)),
 	}, nil
 }

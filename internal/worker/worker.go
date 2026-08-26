@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -75,6 +76,12 @@ type Config struct {
 	HeartbeatInterval time.Duration
 	ShutdownTimeout   time.Duration
 	Logger            *slog.Logger
+	Metrics           workerMetrics
+}
+
+type workerMetrics interface {
+	JobExecutionCompleted(domain.JobType, domain.AttemptOutcomeKind, time.Duration)
+	WorkerPollError(string)
 }
 
 type Worker struct {
@@ -89,6 +96,7 @@ type Worker struct {
 	heartbeatInterval time.Duration
 	shutdownTimeout   time.Duration
 	logger            *slog.Logger
+	metrics           workerMetrics
 }
 
 func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worker, error) {
@@ -156,6 +164,7 @@ func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worke
 		heartbeatInterval: cfg.HeartbeatInterval,
 		shutdownTimeout:   cfg.ShutdownTimeout,
 		logger:            logger,
+		metrics:           cfg.Metrics,
 	}, nil
 }
 
@@ -356,6 +365,9 @@ func (worker *Worker) Run(ctx context.Context) error {
 			worker.supportedTypes,
 		)
 		if err != nil {
+			if worker.metrics != nil {
+				worker.metrics.WorkerPollError(strings.ToLower(status.Code(err).String()))
+			}
 			if ctx.Err() != nil {
 				if runtimeErr := receiveRuntimeError(runtimeErrors); runtimeErr != nil {
 					return runtimeErr
@@ -425,7 +437,9 @@ func (worker *Worker) execute(
 			job := attempt.job
 			handler := worker.handlers[job.Type.String()]
 			handlerCtx, cancelHandler := context.WithTimeoutCause(attempt.handlerCtx, job.Timeout, errExecutionTimedOut)
+			executionStarted := time.Now()
 			execution := invokeHandler(handlerCtx, handler, job.Payload)
+			executionDuration := time.Since(executionStarted)
 			cancelHandler()
 			handlerCause := context.Cause(handlerCtx)
 			if execution.panicked {
@@ -460,6 +474,9 @@ func (worker *Worker) execute(
 			if err != nil {
 				fail(fmt.Errorf("classify %s attempt %d: %w", job.ID, job.AttemptNumber.Int32(), err))
 				return
+			}
+			if worker.metrics != nil {
+				worker.metrics.JobExecutionCompleted(job.Type, outcome.Kind(), executionDuration)
 			}
 			if err := worker.reportUntilAcknowledged(attempt.ctx, job, outcome); err != nil {
 				if errors.Is(err, errAttemptLost) || errors.Is(context.Cause(attempt.ctx), errLeaseStale) {

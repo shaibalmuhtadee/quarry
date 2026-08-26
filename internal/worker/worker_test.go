@@ -23,6 +23,36 @@ type fakeDispatcher struct {
 	report    func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error
 }
 
+type executionMetric struct {
+	jobType  domain.JobType
+	outcome  domain.AttemptOutcomeKind
+	duration time.Duration
+}
+
+type workerMetricRecorder struct {
+	executions chan executionMetric
+	pollErrors chan string
+}
+
+func newWorkerMetricRecorder(capacity int) *workerMetricRecorder {
+	return &workerMetricRecorder{
+		executions: make(chan executionMetric, capacity),
+		pollErrors: make(chan string, capacity),
+	}
+}
+
+func (metrics *workerMetricRecorder) JobExecutionCompleted(
+	jobType domain.JobType,
+	outcome domain.AttemptOutcomeKind,
+	duration time.Duration,
+) {
+	metrics.executions <- executionMetric{jobType: jobType, outcome: outcome, duration: duration}
+}
+
+func (metrics *workerMetricRecorder) WorkerPollError(code string) {
+	metrics.pollErrors <- code
+}
+
 func (dispatcher *fakeDispatcher) Heartbeat(
 	ctx context.Context,
 	workerID domain.WorkerID,
@@ -197,7 +227,6 @@ func TestWorkerHoldsSlotUntilSuccessReportIsAcknowledged(t *testing.T) {
 			return mustResult(t, `{"ok":true}`), nil
 		},
 	})
-
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runWorker(runtime, ctx)
 	awaitSignal(t, firstReport)
@@ -288,6 +317,47 @@ func TestWorkerRetriesTransientReportWithSameIdentity(t *testing.T) {
 	}
 }
 
+func TestWorkerRecordsCanonicalPollErrorCode(t *testing.T) {
+	t.Parallel()
+
+	secondPoll := make(chan struct{})
+	var calls atomic.Int32
+	var secondPollOnce sync.Once
+	dispatcher := &fakeDispatcher{}
+	dispatcher.acquire = func(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error) {
+		if calls.Add(1) == 1 {
+			return nil, status.Error(codes.Unavailable, "temporary")
+		}
+		secondPollOnce.Do(func() { close(secondPoll) })
+		return nil, nil
+	}
+	dispatcher.report = func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error {
+		return nil
+	}
+	runtime := newTestWorker(t, dispatcher, 1, map[string]Handler{
+		"demo.test": func(context.Context, domain.Payload) (domain.Result, error) {
+			return mustResult(t, `{}`), nil
+		},
+	})
+	metrics := newWorkerMetricRecorder(1)
+	runtime.metrics = metrics
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runWorker(runtime, ctx)
+	awaitSignal(t, secondPoll)
+	cancel()
+	if err := awaitRun(t, done); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-metrics.pollErrors:
+		if code != "unavailable" {
+			t.Fatalf("poll error code = %q", code)
+		}
+	default:
+		t.Fatal("worker did not record a poll error")
+	}
+}
+
 func TestWorkerReportsHandlerFailuresAndContinues(t *testing.T) {
 	t.Parallel()
 
@@ -359,6 +429,8 @@ func TestWorkerReportsHandlerFailuresAndContinues(t *testing.T) {
 			return mustResult(t, `{"ok":true}`), nil
 		},
 	})
+	metrics := newWorkerMetricRecorder(len(jobs))
+	runtime.metrics = metrics
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runWorker(runtime, ctx)
@@ -368,6 +440,19 @@ func TestWorkerReportsHandlerFailuresAndContinues(t *testing.T) {
 	cancel()
 	if err := awaitRun(t, done); err != nil {
 		t.Fatalf("worker stopped after handler failure: %v", err)
+	}
+	metricOutcomes := make(map[domain.AttemptOutcomeKind]int)
+	for range jobs {
+		metric := <-metrics.executions
+		if metric.duration < 0 {
+			t.Fatalf("execution duration = %s", metric.duration)
+		}
+		metricOutcomes[metric.outcome]++
+	}
+	if metricOutcomes[domain.AttemptOutcomeKindRetryableFailure] != 1 ||
+		metricOutcomes[domain.AttemptOutcomeKindPermanentFailure] != 2 ||
+		metricOutcomes[domain.AttemptOutcomeKindSucceeded] != 1 {
+		t.Fatalf("execution metric outcomes = %v", metricOutcomes)
 	}
 
 	reportMu.Lock()
@@ -612,6 +697,8 @@ func TestWorkerCancelsOnlyMatchingHandlerAndRetriesCancelledReport(t *testing.T)
 	}
 
 	runtime := newTestWorker(t, dispatcher, 2, handlers)
+	metrics := newWorkerMetricRecorder(2)
+	runtime.metrics = metrics
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runWorker(runtime, ctx)
 	awaitSignal(t, cancelHandlerStarted)
@@ -635,6 +722,13 @@ func TestWorkerCancelsOnlyMatchingHandlerAndRetriesCancelledReport(t *testing.T)
 	}
 	if reportCalls.Load() < 2 {
 		t.Fatalf("cancelled report calls = %d, want at least 2", reportCalls.Load())
+	}
+	outcomes := map[domain.AttemptOutcomeKind]int{}
+	for range 2 {
+		outcomes[(<-metrics.executions).outcome]++
+	}
+	if outcomes[domain.AttemptOutcomeKindCancelled] != 1 || outcomes[domain.AttemptOutcomeKindSucceeded] != 1 {
+		t.Fatalf("execution metric outcomes = %v", outcomes)
 	}
 }
 

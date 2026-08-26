@@ -217,6 +217,27 @@ func TestDispatcherStoreClaimsEligibleSupportedJobsInOrder(t *testing.T) {
 	}
 }
 
+func TestDispatcherStoreReturnsPostgresSchedulingDelay(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := newDispatcherTestPool(t, ctx)
+	store := newDispatcherTestStore(t, pool, testLeaseDuration)
+	jobStore := postgres.NewJobStore(pool)
+	worker := registerTestWorker(t, ctx, store, 1)
+	job := createTestJob(t, ctx, jobStore, "delay.test", `{}`)
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at = statement_timestamp() - interval '2 seconds' WHERE id = $1`, job.ID.UUID()); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := store.AcquireJobs(ctx, worker, 1, []domain.JobType{mustJobType(t, "delay.test")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].SchedulingDelay < 2*time.Second || jobs[0].SchedulingDelay > 3*time.Second {
+		t.Fatalf("scheduling delay = %v", jobs)
+	}
+}
+
 func TestDispatcherStoreEnforcesConcurrencyAcrossConcurrentAcquisitions(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
@@ -572,11 +593,21 @@ func TestDispatcherStoreSchedulesRetryableFailureWithExactDelay(t *testing.T) {
 	attempt := acquireOneTestJob(t, ctx, store, worker, "failure.retryable")
 	outcome := mustFailureOutcome(t, domain.NewRetryableFailureOutcome)
 
-	if err := store.ReportAttempt(ctx, worker, job.ID, attempt.AttemptNumber, outcome); err != nil {
+	transition, err := store.ReportAttemptTransition(ctx, worker, job.ID, attempt.AttemptNumber, outcome)
+	if err != nil {
 		t.Fatalf("report retryable failure: %v", err)
 	}
-	if err := store.ReportAttempt(ctx, worker, job.ID, attempt.AttemptNumber, outcome); err != nil {
+	if !transition.Applied || transition.JobType.String() != "failure.retryable" ||
+		transition.AttemptStatus != domain.AttemptStatusRetryableFailed ||
+		transition.JobStatus != domain.JobStatusRetryWait || transition.ErrorCode != "dependency_timeout" {
+		t.Fatalf("report transition = %#v", transition)
+	}
+	repeated, err := store.ReportAttemptTransition(ctx, worker, job.ID, attempt.AttemptNumber, outcome)
+	if err != nil {
 		t.Fatalf("repeat retryable failure: %v", err)
+	}
+	if repeated.Applied {
+		t.Fatalf("repeated report transition = %#v, want Applied false", repeated)
 	}
 	changed := mustFailureOutcome(t, domain.NewPermanentFailureOutcome)
 	if err := store.ReportAttempt(ctx, worker, job.ID, attempt.AttemptNumber, changed); !errors.Is(err, postgres.ErrAttemptReportConflict) {

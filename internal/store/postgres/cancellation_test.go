@@ -167,9 +167,13 @@ func TestDispatcherStoreRecoversCancellationRequestedExpiredAttempt(t *testing.T
 		t.Fatalf("expire cancelled attempt lease: %v", err)
 	}
 
-	recovered, err := dispatcherStore.RecoverExpiredAttempts(ctx, 1, time.Hour)
-	if err != nil || recovered != 1 {
-		t.Fatalf("recover cancelled attempt = (%d, %v), want (1, nil)", recovered, err)
+	transitions, err := dispatcherStore.RecoverExpiredAttemptTransitions(ctx, 1, time.Hour)
+	if err != nil || len(transitions) != 1 {
+		t.Fatalf("recover cancelled attempt = (%d, %v), want (1, nil)", len(transitions), err)
+	}
+	if transitions[0].AttemptStatus != domain.AttemptStatusCancelled ||
+		transitions[0].JobStatus != domain.JobStatusCancelled || transitions[0].ErrorCode != "cancellation_requested" {
+		t.Fatalf("cancelled recovery transition = %#v", transitions[0])
 	}
 	stored, err := jobStore.GetJob(ctx, job.ID)
 	if err != nil {

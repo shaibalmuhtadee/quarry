@@ -46,6 +46,7 @@ func TestMetricsRouteUsesConfiguredHandler(t *testing.T) {
 			writer.Header().Set("Content-Type", "text/plain")
 			_, _ = writer.Write([]byte("quarry_test_metric 1\n"))
 		}),
+		nil,
 	)
 	request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	response := httptest.NewRecorder()

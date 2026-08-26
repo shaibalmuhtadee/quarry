@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	dispatcherv1 "github.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1"
 	"github.com/shaibalmuhtadee/quarry/internal/store/postgres"
+	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -18,16 +20,35 @@ type store interface {
 	RegisterWorker(context.Context, postgres.WorkerRegistration) error
 	AcquireJobs(context.Context, domain.WorkerID, int32, []domain.JobType) ([]postgres.AcquiredJob, error)
 	Heartbeat(context.Context, domain.WorkerID, []postgres.HeartbeatAttempt) ([]postgres.HeartbeatResult, error)
-	ReportAttempt(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error
+	ReportAttemptTransition(
+		context.Context,
+		domain.WorkerID,
+		domain.JobID,
+		domain.AttemptNumber,
+		domain.AttemptOutcome,
+	) (postgres.AttemptReportTransition, error)
+}
+
+type serviceMetrics interface {
+	AttemptCompleted(domain.JobType, domain.AttemptStatus, string)
+	DispatchClaim(int)
+	JobSchedulingDelay(domain.JobType, time.Duration)
+	RetryScheduled(telemetry.RetryReason)
+	StaleReport()
 }
 
 type Service struct {
 	dispatcherv1.UnimplementedDispatcherServiceServer
-	store store
+	store   store
+	metrics serviceMetrics
 }
 
 func NewService(store store) *Service {
 	return &Service{store: store}
+}
+
+func NewServiceWithMetrics(store store, metrics serviceMetrics) *Service {
+	return &Service{store: store, metrics: metrics}
 }
 
 func (service *Service) RegisterWorker(
@@ -70,7 +91,6 @@ func (service *Service) RegisterWorker(
 	if err != nil {
 		return nil, internalError(err)
 	}
-
 	return &dispatcherv1.RegisterWorkerResponse{}, nil
 }
 
@@ -109,6 +129,12 @@ func (service *Service) AcquireJobs(
 	}
 	if err != nil {
 		return nil, internalError(err)
+	}
+	if service.metrics != nil {
+		service.metrics.DispatchClaim(len(jobs))
+		for _, job := range jobs {
+			service.metrics.JobSchedulingDelay(job.Type, job.SchedulingDelay)
+		}
 	}
 
 	response := &dispatcherv1.AcquireJobsResponse{
@@ -215,15 +241,39 @@ func (service *Service) ReportAttempt(
 		return nil, invalidArgument(err.Error())
 	}
 
-	err = service.store.ReportAttempt(ctx, workerID, jobID, attemptNumber, outcome)
+	transition, err := service.store.ReportAttemptTransition(ctx, workerID, jobID, attemptNumber, outcome)
 	if errors.Is(err, postgres.ErrAttemptReportConflict) {
+		if service.metrics != nil {
+			service.metrics.StaleReport()
+		}
 		return nil, status.Error(codes.FailedPrecondition, "attempt report does not match the current stored attempt")
 	}
 	if err != nil {
 		return nil, internalError(err)
 	}
+	if service.metrics != nil && transition.Applied {
+		service.metrics.AttemptCompleted(transition.JobType, transition.AttemptStatus, transition.ErrorCode)
+		if transition.JobStatus == domain.JobStatusRetryWait {
+			if reason, ok := retryReason(transition.AttemptStatus); ok {
+				service.metrics.RetryScheduled(reason)
+			}
+		}
+	}
 
 	return &dispatcherv1.ReportAttemptResponse{}, nil
+}
+
+func retryReason(status domain.AttemptStatus) (telemetry.RetryReason, bool) {
+	switch status {
+	case domain.AttemptStatusRetryableFailed:
+		return telemetry.RetryReasonRetryableFailure, true
+	case domain.AttemptStatusTimedOut:
+		return telemetry.RetryReasonTimedOut, true
+	case domain.AttemptStatusPanicked:
+		return telemetry.RetryReasonPanicked, true
+	default:
+		return "", false
+	}
 }
 
 func parseAttemptOutcome(request *dispatcherv1.ReportAttemptRequest) (domain.AttemptOutcome, error) {

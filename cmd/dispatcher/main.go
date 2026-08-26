@@ -196,11 +196,11 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
 		return fmt.Errorf("configure retry policy: %w", err)
 	}
 	store := postgres.NewDispatcherStore(pool, cfg.leaseDuration, retryPolicy)
-	reaper, err := dispatcher.NewReaper(store, dispatcher.ReaperConfig{
+	reaper, err := dispatcher.NewReaperWithMetrics(store, dispatcher.ReaperConfig{
 		Interval:              cfg.reaperInterval,
 		BatchSize:             cfg.reaperBatchSize,
 		WorkerLivenessTimeout: cfg.workerLiveness,
-	}, logger)
+	}, logger, telemetryRuntime.Metrics())
 	if err != nil {
 		return fmt.Errorf("configure lease reaper: %w", err)
 	}
@@ -208,7 +208,7 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
 	server := grpc.NewServer()
 	dispatcherv1.RegisterDispatcherServiceServer(
 		server,
-		dispatcher.NewService(store),
+		dispatcher.NewServiceWithMetrics(store, telemetryRuntime.Metrics()),
 	)
 	logger.Info("dispatcher starting", slog.String("address", listener.Addr().String()))
 

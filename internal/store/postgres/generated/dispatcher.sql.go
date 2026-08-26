@@ -113,7 +113,9 @@ SELECT
     claimed.job_type,
     claimed.payload,
     claimed.attempt_count,
-    claimed.timeout_ms
+    claimed.timeout_ms,
+    CAST(EXTRACT(EPOCH FROM (statement_timestamp() - claimed.available_at)) AS double precision)
+        AS scheduling_delay_seconds
 FROM claimed
 JOIN attempts ON attempts.job_id = claimed.id
 ORDER BY claimed.available_at, claimed.created_at
@@ -127,11 +129,12 @@ type ClaimJobsParams struct {
 }
 
 type ClaimJobsRow struct {
-	ID           uuid.UUID
-	JobType      string
-	Payload      []byte
-	AttemptCount int32
-	TimeoutMs    int64
+	ID                     uuid.UUID
+	JobType                string
+	Payload                []byte
+	AttemptCount           int32
+	TimeoutMs              int64
+	SchedulingDelaySeconds float64
 }
 
 func (q *Queries) ClaimJobs(ctx context.Context, arg ClaimJobsParams) ([]ClaimJobsRow, error) {
@@ -154,6 +157,7 @@ func (q *Queries) ClaimJobs(ctx context.Context, arg ClaimJobsParams) ([]ClaimJo
 			&i.Payload,
 			&i.AttemptCount,
 			&i.TimeoutMs,
+			&i.SchedulingDelaySeconds,
 		); err != nil {
 			return nil, err
 		}
@@ -281,6 +285,7 @@ func (q *Queries) GetTransitionTime(ctx context.Context) (pgtype.Timestamptz, er
 const lockAttemptReport = `-- name: LockAttemptReport :one
 SELECT
     jobs.status AS job_status,
+    jobs.job_type,
     jobs.attempt_count,
     jobs.max_attempts,
     CAST(jobs.result IS NOT DISTINCT FROM $1::jsonb AS boolean) AS result_matches,
@@ -306,6 +311,7 @@ type LockAttemptReportParams struct {
 
 type LockAttemptReportRow struct {
 	JobStatus         string
+	JobType           string
 	AttemptCount      int32
 	MaxAttempts       int32
 	ResultMatches     bool
@@ -322,6 +328,7 @@ func (q *Queries) LockAttemptReport(ctx context.Context, arg LockAttemptReportPa
 	var i LockAttemptReportRow
 	err := row.Scan(
 		&i.JobStatus,
+		&i.JobType,
 		&i.AttemptCount,
 		&i.MaxAttempts,
 		&i.ResultMatches,
@@ -336,7 +343,7 @@ func (q *Queries) LockAttemptReport(ctx context.Context, arg LockAttemptReportPa
 }
 
 const lockExpiredJobs = `-- name: LockExpiredJobs :many
-SELECT id, attempt_count, max_attempts, cancel_requested_at
+SELECT id, job_type, attempt_count, max_attempts, cancel_requested_at
 FROM jobs
 WHERE status = 'running'
   AND lease_expires_at <= statement_timestamp()
@@ -347,6 +354,7 @@ LIMIT $1
 
 type LockExpiredJobsRow struct {
 	ID                uuid.UUID
+	JobType           string
 	AttemptCount      int32
 	MaxAttempts       int32
 	CancelRequestedAt pgtype.Timestamptz
@@ -363,6 +371,7 @@ func (q *Queries) LockExpiredJobs(ctx context.Context, batchSize int32) ([]LockE
 		var i LockExpiredJobsRow
 		if err := rows.Scan(
 			&i.ID,
+			&i.JobType,
 			&i.AttemptCount,
 			&i.MaxAttempts,
 			&i.CancelRequestedAt,

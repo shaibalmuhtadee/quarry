@@ -30,12 +30,14 @@ func TestDispatcherStoreRecoversExpiredAttemptAndFencesStaleSuccess(t *testing.T
 		t.Fatalf("expire worker heartbeat: %v", err)
 	}
 
-	recovered, err := store.RecoverExpiredAttempts(ctx, 10, 20*time.Second)
+	transitions, err := store.RecoverExpiredAttemptTransitions(ctx, 10, 20*time.Second)
 	if err != nil {
 		t.Fatalf("recover expired attempt: %v", err)
 	}
-	if recovered != 1 {
-		t.Fatalf("recovered jobs = %d, want 1", recovered)
+	if len(transitions) != 1 || transitions[0].JobType.String() != "recovery.retry" ||
+		transitions[0].AttemptStatus != domain.AttemptStatusAbandoned ||
+		transitions[0].JobStatus != domain.JobStatusRetryWait || transitions[0].ErrorCode != "lease_expired" {
+		t.Fatalf("recovery transitions = %#v", transitions)
 	}
 	if repeated, err := store.RecoverExpiredAttempts(ctx, 10, 20*time.Second); err != nil || repeated != 0 {
 		t.Fatalf("repeated recovery = (%d, %v), want (0, nil)", repeated, err)
@@ -156,9 +158,13 @@ func TestDispatcherStoreDeadLettersExpiredFinalAttempt(t *testing.T) {
 		t.Fatalf("expire final attempt: %v", err)
 	}
 
-	recovered, err := store.RecoverExpiredAttempts(ctx, 1, time.Hour)
-	if err != nil || recovered != 1 {
-		t.Fatalf("recover final attempt = (%d, %v), want (1, nil)", recovered, err)
+	transitions, err := store.RecoverExpiredAttemptTransitions(ctx, 1, time.Hour)
+	if err != nil || len(transitions) != 1 {
+		t.Fatalf("recover final attempt = (%d, %v), want (1, nil)", len(transitions), err)
+	}
+	if transitions[0].AttemptStatus != domain.AttemptStatusAbandoned ||
+		transitions[0].JobStatus != domain.JobStatusDeadLettered || transitions[0].ErrorCode != "lease_expired" {
+		t.Fatalf("final recovery transition = %#v", transitions[0])
 	}
 	stored, err := jobStore.GetJob(ctx, job.ID)
 	if err != nil {

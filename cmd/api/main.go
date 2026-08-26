@@ -98,7 +98,13 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
 	}
 	server := newHTTPServer(
 		cfg.httpAddress,
-		api.NewHandlerWithMetrics(postgres.NewJobStore(pool), pool, logger, telemetryRuntime.MetricsHandler()),
+		api.NewHandlerWithMetrics(
+			postgres.NewJobStore(pool),
+			pool,
+			logger,
+			telemetryRuntime.MetricsHandler(),
+			telemetryRuntime.Metrics(),
+		),
 	)
 	logger.Info("api starting", slog.String("address", listener.Addr().String()))
 
