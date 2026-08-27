@@ -76,6 +76,7 @@ func TestMigrationsApplyRollbackAndReapply(t *testing.T) {
 	applyMigrations(t, ctx, db, migrationDirectory)
 	verifyIdempotencyMigrationExistingJob(t, ctx, db)
 	verifyCancellationMigrationExistingJob(t, ctx, db)
+	verifyTraceparentMigrationExistingJob(t, ctx, db)
 	verifySchema(t, ctx, db)
 
 	if err := goose.DownToContext(ctx, db, migrationDirectory, 0); err != nil {
@@ -105,7 +106,23 @@ func applyMigrations(t *testing.T, ctx context.Context, db *sql.DB, directory st
 	if err := goose.UpContext(ctx, db, directory); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
-	verifyVersion(t, ctx, db, 7)
+	verifyVersion(t, ctx, db, 8)
+}
+
+func verifyTraceparentMigrationExistingJob(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+
+	var traceparentIsNull bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT traceparent IS NULL
+		FROM jobs
+		WHERE id = '00000000-0000-0000-0000-000000000021'
+	`).Scan(&traceparentIsNull); err != nil {
+		t.Fatalf("read existing job after traceparent migration: %v", err)
+	}
+	if !traceparentIsNull {
+		t.Fatal("existing job traceparent is not null")
+	}
 }
 
 func verifyCancellationMigrationExistingJob(t *testing.T, ctx context.Context, db *sql.DB) {
@@ -259,8 +276,11 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 		t.Fatalf("insert valid worker: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, `
-		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
-		VALUES ($1, 'test', '{}', 'queued', 3, 30000)
+		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms, traceparent)
+		VALUES (
+			$1, 'test', '{}', 'queued', 3, 30000,
+			'00-0102030405060708090a0b0c0d0e0f10-0102030405060708-01'
+		)
 	`, jobID); err != nil {
 		t.Fatalf("insert valid job: %v", err)
 	}
@@ -317,6 +337,13 @@ func verifySchema(t *testing.T, ctx context.Context, db *sql.DB) {
 	expectConstraintError(t, ctx, db, "23514", `
 		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)
 		VALUES ('00000000-0000-0000-0000-000000000003', '', '{}', 'queued', 3, 30000)
+	`)
+	expectConstraintError(t, ctx, db, "23514", `
+		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms, traceparent)
+		VALUES (
+			'00000000-0000-0000-0000-000000000036', 'trace.invalid', '{}', 'queued', 3, 30000,
+			'not-a-traceparent'
+		)
 	`)
 	expectConstraintError(t, ctx, db, "23502", `
 		INSERT INTO jobs (id, job_type, payload, status, max_attempts, timeout_ms)

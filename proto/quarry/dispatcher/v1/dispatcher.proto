@@ -49,6 +49,7 @@ message AcquiredJob {
   string job_type = 3;
   bytes payload_json = 4;
   int64 timeout_ms = 5;
+  string traceparent = 6;
 }
 
 message HeartbeatRequest {

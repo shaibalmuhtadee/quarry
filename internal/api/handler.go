@@ -24,15 +24,43 @@ type JobStore interface {
 	ListJobAttempts(context.Context, domain.JobID) ([]domain.Attempt, error)
 }
 
+type submissionMetrics interface {
+	JobSubmitted()
+}
+
 type handler struct {
 	store     JobStore
 	readiness ReadinessChecker
+	metrics   submissionMetrics
+	logger    *slog.Logger
 }
 
 func NewHandler(store JobStore, readiness ReadinessChecker, logger *slog.Logger) http.Handler {
+	return newHandler(store, readiness, logger, nil, nil)
+}
+
+func NewHandlerWithMetrics(
+	store JobStore,
+	readiness ReadinessChecker,
+	logger *slog.Logger,
+	metricsHandler http.Handler,
+	eventMetrics submissionMetrics,
+) http.Handler {
+	return newHandler(store, readiness, logger, metricsHandler, eventMetrics)
+}
+
+func newHandler(
+	store JobStore,
+	readiness ReadinessChecker,
+	logger *slog.Logger,
+	metricsHandler http.Handler,
+	metrics submissionMetrics,
+) http.Handler {
 	handler := &handler{
 		store:     store,
 		readiness: readiness,
+		metrics:   metrics,
+		logger:    logger,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/jobs", handler.createJob)
@@ -41,6 +69,9 @@ func NewHandler(store JobStore, readiness ReadinessChecker, logger *slog.Logger)
 	mux.HandleFunc("GET /v1/jobs/{id}/attempts", handler.getJobAttempts)
 	mux.HandleFunc("GET /healthz", handler.health)
 	mux.HandleFunc("GET /readyz", handler.ready)
+	if metricsHandler != nil {
+		mux.Handle("GET /metrics", metricsHandler)
+	}
 
 	return logRequests(logger, mux)
 }
@@ -174,7 +205,17 @@ func (handler *handler) createJob(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 	job := result.Job
+	if !result.Deduplicated && handler.metrics != nil {
+		handler.metrics.JobSubmitted()
+	}
 	setRequestJobID(request, job.ID.String())
+	handler.logger.InfoContext(
+		request.Context(),
+		"job submitted",
+		slog.String("job_id", job.ID.String()),
+		slog.String("job_type", job.Type.String()),
+		slog.Bool("deduplicated", result.Deduplicated),
+	)
 
 	writer.Header().Set("Location", "/v1/jobs/"+job.ID.String())
 	status := http.StatusCreated
@@ -226,7 +267,6 @@ func (handler *handler) getJob(writer http.ResponseWriter, request *http.Request
 		writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
 		return
 	}
-
 	writeJobResponse(writer, http.StatusOK, job)
 }
 
@@ -251,6 +291,13 @@ func (handler *handler) cancelJob(writer http.ResponseWriter, request *http.Requ
 		writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
 		return
 	}
+	handler.logger.InfoContext(
+		request.Context(),
+		"job cancellation requested",
+		slog.String("job_id", job.ID.String()),
+		slog.String("job_type", job.Type.String()),
+		slog.String("job_status", string(job.Status)),
+	)
 
 	writeJobResponse(writer, http.StatusOK, job)
 }

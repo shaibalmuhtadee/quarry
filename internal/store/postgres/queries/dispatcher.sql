@@ -82,6 +82,7 @@ WITH eligible AS (
         jobs.payload,
         jobs.attempt_count,
         jobs.timeout_ms,
+        jobs.traceparent,
         jobs.available_at,
         jobs.created_at
 ), attempts AS (
@@ -106,7 +107,10 @@ SELECT
     claimed.job_type,
     claimed.payload,
     claimed.attempt_count,
-    claimed.timeout_ms
+    claimed.timeout_ms,
+    claimed.traceparent,
+    CAST(EXTRACT(EPOCH FROM (statement_timestamp() - claimed.available_at)) AS double precision)
+        AS scheduling_delay_seconds
 FROM claimed
 JOIN attempts ON attempts.job_id = claimed.id
 ORDER BY claimed.available_at, claimed.created_at;
@@ -114,6 +118,7 @@ ORDER BY claimed.available_at, claimed.created_at;
 -- name: LockAttemptReport :one
 SELECT
     jobs.status AS job_status,
+    jobs.job_type,
     jobs.attempt_count,
     jobs.max_attempts,
     CAST(jobs.result IS NOT DISTINCT FROM sqlc.narg(result_json)::jsonb AS boolean) AS result_matches,
@@ -168,7 +173,7 @@ WHERE id = sqlc.arg(job_id)
   AND lease_expires_at > sqlc.arg(transition_time)::timestamptz;
 
 -- name: LockExpiredJobs :many
-SELECT id, attempt_count, max_attempts, cancel_requested_at
+SELECT id, job_type, attempt_count, max_attempts, cancel_requested_at, traceparent
 FROM jobs
 WHERE status = 'running'
   AND lease_expires_at <= statement_timestamp()

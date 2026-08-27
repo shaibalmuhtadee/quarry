@@ -270,7 +270,8 @@ INSERT INTO jobs (
     max_attempts,
     timeout_ms,
     idempotency_key,
-    request_hash
+    request_hash,
+    traceparent
 )
 VALUES (
     $1,
@@ -280,7 +281,8 @@ VALUES (
     $4,
     $5,
     $6,
-    $7
+    $7,
+    $8
 )
 ON CONFLICT (job_type, idempotency_key) WHERE idempotency_key IS NOT NULL
 DO NOTHING
@@ -307,6 +309,7 @@ type SubmitJobParams struct {
 	TimeoutMs      int64
 	IdempotencyKey pgtype.Text
 	RequestHash    []byte
+	Traceparent    pgtype.Text
 }
 
 type SubmitJobRow struct {
@@ -333,6 +336,7 @@ func (q *Queries) SubmitJob(ctx context.Context, arg SubmitJobParams) (SubmitJob
 		arg.TimeoutMs,
 		arg.IdempotencyKey,
 		arg.RequestHash,
+		arg.Traceparent,
 	)
 	var i SubmitJobRow
 	err := row.Scan(

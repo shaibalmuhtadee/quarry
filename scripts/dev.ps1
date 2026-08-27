@@ -4,7 +4,8 @@ param(
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
         "generate", "generate-check", "format-check", "vet", "build",
-        "smoke-test", "distributed-test", "recovery-test", "semantics-test"
+        "smoke-test", "distributed-test", "recovery-test", "semantics-test",
+        "observability-config-test", "observability-test", "observability-up", "observability-down"
     )]
     [string]$Command = "check"
 )
@@ -1731,6 +1732,742 @@ function Test-Recovery {
     )
 }
 
+function Get-ConfiguredPort {
+    param(
+        [Parameter(Mandatory)]
+        [string]$EnvironmentVariable,
+
+        [Parameter(Mandatory)]
+        [int]$Default
+    )
+
+    $configured = [Environment]::GetEnvironmentVariable($EnvironmentVariable)
+    if ([string]::IsNullOrWhiteSpace($configured)) {
+        return $Default
+    }
+
+    $port = 0
+    if (-not [int]::TryParse($configured, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+        throw "$EnvironmentVariable must be a TCP port from 1 through 65535."
+    }
+    return $port
+}
+
+function Wait-ObservabilityEndpoint {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [string]$URL
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $response = Invoke-WebRequest -Uri $URL -TimeoutSec 2 -UseBasicParsing
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+                return
+            }
+        }
+        catch {
+            Start-Sleep -Milliseconds 500
+        }
+    }
+
+    throw "$Name did not become ready at $URL within 60 seconds."
+}
+
+function Test-ObservabilityConfiguration {
+    $prometheusConfig = (Resolve-Path -LiteralPath "deploy/observability/prometheus.yml").Path
+    $collectorConfig = (Resolve-Path -LiteralPath "deploy/observability/otel-collector.yaml").Path
+
+    Invoke-Docker -Arguments @("compose", "config", "--quiet")
+    Invoke-Docker -Arguments @(
+        "run", "--rm",
+        "--volume", "${prometheusConfig}:/etc/prometheus/prometheus.yml:ro",
+        "--entrypoint", "promtool",
+        "prom/prometheus:v3.12.0",
+        "check", "config", "/etc/prometheus/prometheus.yml"
+    )
+    Invoke-Docker -Arguments @(
+        "run", "--rm",
+        "--volume", "${collectorConfig}:/etc/otelcol-contrib/config.yaml:ro",
+        "ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.153.0",
+        "validate", "--config=/etc/otelcol-contrib/config.yaml"
+    )
+    Invoke-Go -Arguments @("test", "-count=1", "./deploy/observability")
+}
+
+function Start-ObservabilityInfrastructure {
+    Test-ObservabilityConfiguration
+    Invoke-Docker -Arguments @(
+        "compose", "up", "--detach", "--wait",
+        "prometheus", "jaeger", "otel-collector", "grafana"
+    )
+
+    $prometheusPort = Get-ConfiguredPort -EnvironmentVariable "QUARRY_PROMETHEUS_PORT" -Default 9091
+    $grafanaPort = Get-ConfiguredPort -EnvironmentVariable "QUARRY_GRAFANA_PORT" -Default 3000
+    $collectorHealthPort = Get-ConfiguredPort -EnvironmentVariable "QUARRY_OTEL_HEALTH_PORT" -Default 13133
+    $jaegerPort = Get-ConfiguredPort -EnvironmentVariable "QUARRY_JAEGER_PORT" -Default 16686
+
+    Wait-ObservabilityEndpoint -Name "Prometheus" -URL "http://127.0.0.1:$prometheusPort/-/ready"
+    Wait-ObservabilityEndpoint -Name "Grafana" -URL "http://127.0.0.1:$grafanaPort/api/health"
+    Wait-ObservabilityEndpoint -Name "OpenTelemetry Collector" -URL "http://127.0.0.1:$collectorHealthPort/"
+    Wait-ObservabilityEndpoint -Name "Jaeger" -URL "http://127.0.0.1:$jaegerPort/api/services"
+
+    Write-Host "Prometheus: http://127.0.0.1:$prometheusPort"
+    Write-Host "Grafana: http://127.0.0.1:$grafanaPort/d/quarry-overview/quarry"
+    Write-Host "Jaeger: http://127.0.0.1:$jaegerPort"
+}
+
+function Stop-ObservabilityInfrastructure {
+    Invoke-Docker -Arguments @(
+        "compose", "stop",
+        "prometheus", "jaeger", "otel-collector", "grafana"
+    )
+    Invoke-Docker -Arguments @(
+        "compose", "rm", "--force",
+        "prometheus", "jaeger", "otel-collector", "grafana"
+    )
+}
+
+function Start-ObservabilityProcess {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Binary,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Environment
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Binary
+    $startInfo.WorkingDirectory = $repositoryRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($entry in $Environment.GetEnumerator()) {
+        $startInfo.Environment[$entry.Key] = $entry.Value
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        $process.Dispose()
+        throw "Failed to start observability-test process '$Binary'."
+    }
+
+    return [PSCustomObject]@{
+        Process = $process
+        StandardOutput = $process.StandardOutput.ReadToEndAsync()
+        StandardError = $process.StandardError.ReadToEndAsync()
+        Output = ""
+        Stopped = $false
+    }
+}
+
+function Stop-ObservabilityProcess {
+    param(
+        [Parameter(Mandatory)]
+        [PSCustomObject]$Handle
+    )
+
+    if ($Handle.Stopped) {
+        return $Handle.Output
+    }
+
+    $process = $Handle.Process
+    try {
+        if (-not $process.HasExited) {
+            if (-not $IsWindows) {
+                & kill -TERM $process.Id
+                if ($LASTEXITCODE -ne 0 -or -not $process.WaitForExit(10000)) {
+                    $process.Kill($true)
+                }
+            }
+            else {
+                $process.Kill($true)
+            }
+            if (-not $process.WaitForExit(10000)) {
+                throw "Observability-test process $($process.Id) did not exit."
+            }
+        }
+
+        $standardOutput = $Handle.StandardOutput.GetAwaiter().GetResult()
+        $standardError = $Handle.StandardError.GetAwaiter().GetResult()
+        $Handle.Output = "$standardOutput`n$standardError"
+        $Handle.Stopped = $true
+        return $Handle.Output
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Wait-PrometheusTargets {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL
+    )
+
+    $requiredJobs = @("quarry-api", "quarry-dispatcher", "quarry-worker")
+    $deadline = [DateTime]::UtcNow.AddSeconds(45)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $response = Invoke-RestMethod -Uri "$BaseURL/api/v1/targets" -TimeoutSec 5
+            $healthyJobs = @(
+                $response.data.activeTargets |
+                    Where-Object { $_.health -eq "up" } |
+                    ForEach-Object { $_.labels.job }
+            )
+            $missingJobs = @($requiredJobs | Where-Object { $_ -notin $healthyJobs })
+            if ($missingJobs.Count -eq 0) {
+                return
+            }
+        }
+        catch {
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Prometheus did not report all Quarry targets healthy within 45 seconds."
+}
+
+function Wait-PrometheusMetricFamilies {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL
+    )
+
+    $requiredFamilies = @(
+        "quarry_jobs_submitted_total",
+        "quarry_job_attempts_total",
+        "quarry_job_execution_duration_seconds",
+        "quarry_job_scheduling_delay_seconds",
+        "quarry_queue_depth",
+        "quarry_oldest_queued_job_age_seconds",
+        "quarry_active_jobs",
+        "quarry_active_workers",
+        "quarry_retries_scheduled_total",
+        "quarry_stale_reports_total",
+        "quarry_dispatch_claim_size"
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds(45)
+    $missing = $requiredFamilies
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $missing = @()
+        foreach ($family in $requiredFamilies) {
+            try {
+                $encodedFamily = [Uri]::EscapeDataString($family)
+                $response = Invoke-RestMethod -Uri "$BaseURL/api/v1/metadata?metric=$encodedFamily" -TimeoutSec 5
+                if ($response.status -ne "success" -or
+                    $response.data.PSObject.Properties.Name -notcontains $family) {
+                    $missing += $family
+                }
+            }
+            catch {
+                $missing += $family
+            }
+        }
+        if ($missing.Count -eq 0) {
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Prometheus metadata is missing required metric families: $($missing -join ', ')."
+}
+
+function Wait-PrometheusValue {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$Expression,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$Accept,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $encodedExpression = [Uri]::EscapeDataString($Expression)
+    $deadline = [DateTime]::UtcNow.AddSeconds(45)
+    $lastValue = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $response = Invoke-RestMethod -Uri "$BaseURL/api/v1/query?query=$encodedExpression" -TimeoutSec 5
+            $results = @($response.data.result)
+            if ($response.status -eq "success" -and $results.Count -gt 0) {
+                $lastValue = [double]::Parse(
+                    [string]$results[0].value[1],
+                    [Globalization.CultureInfo]::InvariantCulture
+                )
+                if (& $Accept $lastValue) {
+                    return $lastValue
+                }
+            }
+        }
+        catch {
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Prometheus did not report $Description within 45 seconds. Last value: $lastValue"
+}
+
+function Assert-GrafanaDashboard {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL
+    )
+
+    $response = Invoke-RestMethod -Uri "$BaseURL/api/dashboards/uid/quarry-overview" -TimeoutSec 10
+    if ($response.dashboard.uid -ne "quarry-overview" -or
+        $response.dashboard.title -ne "Quarry" -or
+        @($response.dashboard.panels).Count -ne 13) {
+        throw "Grafana did not return the provisioned 13-panel Quarry dashboard."
+    }
+}
+
+function Submit-ObservabilityJob {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$Type,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Payload,
+
+        [Parameter(Mandatory)]
+        [int]$MaxAttempts,
+
+        [Parameter(Mandatory)]
+        [int]$TimeoutMilliseconds
+    )
+
+    $body = @{
+        type = $Type
+        payload = $Payload
+        max_attempts = $MaxAttempts
+        timeout_ms = $TimeoutMilliseconds
+    } | ConvertTo-Json -Compress -Depth 4
+    $submitted = Invoke-RestMethod `
+        -Method Post `
+        -Uri "$BaseURL/v1/jobs" `
+        -ContentType "application/json" `
+        -Body $body `
+        -TimeoutSec 10
+    if ([string]::IsNullOrWhiteSpace($submitted.id) -or $submitted.status -ne "queued") {
+        throw "Observability-test submission did not return a queued job with an ID."
+    }
+    return $submitted
+}
+
+function Wait-ObservabilityJobStatus {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedStatus
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    $jobState = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $jobState = Invoke-RestMethod -Uri "$BaseURL/v1/jobs/$JobID" -TimeoutSec 5
+        if ($jobState.status -eq $ExpectedStatus) {
+            return $jobState
+        }
+        if ($jobState.status -in @("succeeded", "dead_lettered", "cancelled")) {
+            throw "Observability-test job $JobID reached '$($jobState.status)', expected '$ExpectedStatus'."
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    throw "Observability-test job $JobID did not reach '$ExpectedStatus' within 30 seconds. Last status: $($jobState.status)"
+}
+
+function Get-ObservabilityJobAttempts {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID
+    )
+
+    return @((Invoke-RestMethod -Uri "$BaseURL/v1/jobs/$JobID/attempts" -TimeoutSec 5).attempts)
+}
+
+function Wait-JaegerJobTrace {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID,
+
+        [int]$MinimumAttemptSpans = 1
+    )
+
+    $tags = [Uri]::EscapeDataString((@{ "job.id" = $JobID } | ConvertTo-Json -Compress))
+    $requiredOperations = @(
+        "POST",
+        "db.insert_job",
+        "dispatcher.claim",
+        "db.claim_job",
+        "worker.execute",
+        "handler",
+        "db.complete_attempt"
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds(45)
+    $lastOperations = @()
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $response = Invoke-RestMethod `
+                -Uri "$BaseURL/api/traces?service=quarry-api&tags=$tags&limit=20" `
+                -TimeoutSec 5
+            foreach ($trace in @($response.data)) {
+                $operations = @($trace.spans | ForEach-Object { $_.operationName })
+                $lastOperations = $operations
+                $missing = @($requiredOperations | Where-Object { $_ -notin $operations })
+                $attemptOperations = @("dispatcher.claim", "db.claim_job", "worker.execute", "handler", "db.complete_attempt")
+                $hasEveryAttempt = $true
+                foreach ($operation in $attemptOperations) {
+                    if (@($operations | Where-Object { $_ -eq $operation }).Count -lt $MinimumAttemptSpans) {
+                        $hasEveryAttempt = $false
+                    }
+                }
+                $reportCount = @($operations | Where-Object { $_ -like "*ReportAttempt*" }).Count
+                if ($missing.Count -eq 0 -and $hasEveryAttempt -and $reportCount -ge $MinimumAttemptSpans) {
+                    return [string]$trace.traceID
+                }
+            }
+        }
+        catch {
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Jaeger did not return the complete job trace within 45 seconds. Last operations: $($lastOperations -join ', ')."
+}
+
+function Assert-ObservabilityRetryLogs {
+    param(
+        [Parameter(Mandatory)]
+        [string]$JobID,
+
+        [Parameter(Mandatory)]
+        [string]$TraceID,
+
+        [Parameter(Mandatory)]
+        [string]$DispatcherOutput,
+
+        [Parameter(Mandatory)]
+        [string]$WorkerOutput
+    )
+
+    $combined = "$DispatcherOutput`n$WorkerOutput"
+    foreach ($value in @(
+        $JobID,
+        $TraceID,
+        '"msg":"retry scheduled"',
+        '"job_outcome":"timed_out"',
+        '"error_code":"execution_timeout"'
+    )) {
+        if (-not $combined.Contains($value)) {
+            throw "Observability-test retry logs do not contain '$value'."
+        }
+    }
+}
+
+function Assert-ObservabilityLogs {
+    param(
+        [Parameter(Mandatory)]
+        [string]$JobID,
+
+        [Parameter(Mandatory)]
+        [string]$TraceID,
+
+        [Parameter(Mandatory)]
+        [string]$ApiOutput,
+
+        [Parameter(Mandatory)]
+        [string]$DispatcherOutput,
+
+        [Parameter(Mandatory)]
+        [string]$WorkerOutput
+    )
+
+    $expectedMessages = @(
+        @{ Name = "API submission"; Output = $ApiOutput; Message = '"msg":"job submitted"' },
+        @{ Name = "dispatcher claim"; Output = $DispatcherOutput; Message = '"msg":"job claimed"' },
+        @{ Name = "dispatcher completion"; Output = $DispatcherOutput; Message = '"msg":"attempt completed"' },
+        @{ Name = "worker start"; Output = $WorkerOutput; Message = '"msg":"attempt started"' },
+        @{ Name = "worker acknowledgement"; Output = $WorkerOutput; Message = '"msg":"attempt report acknowledged"' }
+    )
+    foreach ($expected in $expectedMessages) {
+        if (-not $expected.Output.Contains($expected.Message) -or
+            -not $expected.Output.Contains($JobID)) {
+            throw "Observability-test logs do not contain the $($expected.Name) for job $JobID."
+        }
+    }
+
+    $combined = "$ApiOutput`n$DispatcherOutput`n$WorkerOutput"
+    if (-not $combined.Contains($TraceID) -or
+        -not $combined.Contains('"job_outcome":"succeeded"')) {
+        throw "Observability-test logs do not connect job $JobID, trace $TraceID, and the succeeded outcome."
+    }
+}
+
+function Assert-ObservabilityApplicationPortsAvailable {
+    foreach ($port in @(8080, 9090, 9464, 9465)) {
+        $listener = [System.Net.Sockets.TcpListener]::new(
+            [System.Net.IPAddress]::Loopback,
+            $port
+        )
+        try {
+            $listener.Start()
+        }
+        catch {
+            throw "Observability-test requires loopback port $port, but another process is using it."
+        }
+        finally {
+            $listener.Stop()
+        }
+    }
+}
+
+function Test-ObservabilityWorkflow {
+    $testID = [Guid]::NewGuid().ToString("N")
+    $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "quarry-observability-$testID"
+    $binaryExtension = if ($IsWindows) { ".exe" } else { "" }
+    $apiBinary = Join-Path $temporaryDirectory "quarry-api$binaryExtension"
+    $dispatcherBinary = Join-Path $temporaryDirectory "quarry-dispatcher$binaryExtension"
+    $workerBinary = Join-Path $temporaryDirectory "quarry-worker$binaryExtension"
+    $composeProject = "quarry-m5-$testID"
+    $savedEnvironment = @{}
+    $environmentNames = @(
+        "COMPOSE_PROJECT_NAME",
+        "QUARRY_POSTGRES_PORT",
+        "QUARRY_PROMETHEUS_PORT",
+        "QUARRY_GRAFANA_PORT",
+        "QUARRY_OTEL_GRPC_PORT",
+        "QUARRY_OTEL_HTTP_PORT",
+        "QUARRY_OTEL_HEALTH_PORT",
+        "QUARRY_JAEGER_PORT"
+    )
+    foreach ($name in $environmentNames) {
+        $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
+    }
+
+    $ports = [System.Collections.Generic.List[int]]::new()
+    while ($ports.Count -lt 7) {
+        $candidate = Get-AvailableLoopbackPort
+        if (-not $ports.Contains($candidate)) {
+            $ports.Add($candidate)
+        }
+    }
+
+    $env:COMPOSE_PROJECT_NAME = $composeProject
+    $env:QUARRY_POSTGRES_PORT = [string]$ports[0]
+    $env:QUARRY_PROMETHEUS_PORT = [string]$ports[1]
+    $env:QUARRY_GRAFANA_PORT = [string]$ports[2]
+    $env:QUARRY_OTEL_GRPC_PORT = [string]$ports[3]
+    $env:QUARRY_OTEL_HTTP_PORT = [string]$ports[4]
+    $env:QUARRY_OTEL_HEALTH_PORT = [string]$ports[5]
+    $env:QUARRY_JAEGER_PORT = [string]$ports[6]
+
+    $databaseURL = Get-PostgresConnectionString
+    $collectorEndpoint = "http://127.0.0.1:$($env:QUARRY_OTEL_HTTP_PORT)"
+    $prometheusURL = "http://127.0.0.1:$($env:QUARRY_PROMETHEUS_PORT)"
+    $grafanaURL = "http://127.0.0.1:$($env:QUARRY_GRAFANA_PORT)"
+    $jaegerURL = "http://127.0.0.1:$($env:QUARRY_JAEGER_PORT)"
+    $apiHandle = $null
+    $dispatcherHandle = $null
+    $workerHandle = $null
+    $processIDs = [System.Collections.Generic.List[int]]::new()
+
+    try {
+        Assert-ObservabilityApplicationPortsAvailable
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        Invoke-Go -Arguments @("build", "-o", $apiBinary, "./cmd/api")
+        Invoke-Go -Arguments @("build", "-o", $dispatcherBinary, "./cmd/dispatcher")
+        Invoke-Go -Arguments @("build", "-o", $workerBinary, "./cmd/worker")
+        Invoke-Docker -Arguments @("compose", "up", "--detach", "--wait", "postgres")
+        Invoke-Goose -MigrationCommand "up"
+        Start-ObservabilityInfrastructure
+
+        $apiHandle = Start-ObservabilityProcess -Binary $apiBinary -Environment @{
+            QUARRY_DATABASE_URL = $databaseURL
+            QUARRY_HTTP_ADDR = "127.0.0.1:8080"
+            OTEL_EXPORTER_OTLP_ENDPOINT = $collectorEndpoint
+        }
+        $processIDs.Add($apiHandle.Process.Id)
+        Wait-ApiReady -Process $apiHandle.Process -BaseURL "http://127.0.0.1:8080"
+
+        $dispatcherHandle = Start-ObservabilityProcess -Binary $dispatcherBinary -Environment @{
+            QUARRY_DATABASE_URL = $databaseURL
+            QUARRY_DISPATCHER_ADDR = "127.0.0.1:9090"
+            QUARRY_DISPATCHER_METRICS_ADDR = "127.0.0.1:9464"
+            QUARRY_RETRY_BASE_DELAY = "10ms"
+            QUARRY_RETRY_MAX_DELAY = "10ms"
+            OTEL_EXPORTER_OTLP_ENDPOINT = $collectorEndpoint
+        }
+        $processIDs.Add($dispatcherHandle.Process.Id)
+        Wait-TcpReady -Process $dispatcherHandle.Process -HostName "127.0.0.1" -Port 9090 -ProcessName "Dispatcher"
+
+        $workerHostName = "observability-worker-$testID"
+        $workerHandle = Start-ObservabilityProcess -Binary $workerBinary -Environment @{
+            QUARRY_DISPATCHER_ADDR = "127.0.0.1:9090"
+            QUARRY_WORKER_CONCURRENCY = "1"
+            QUARRY_WORKER_HOSTNAME = $workerHostName
+            QUARRY_WORKER_VERSION = "observability-test"
+            QUARRY_WORKER_METRICS_ADDR = "127.0.0.1:9465"
+            OTEL_EXPORTER_OTLP_ENDPOINT = $collectorEndpoint
+        }
+        $processIDs.Add($workerHandle.Process.Id)
+        $null = Wait-DistributedWorkers -HostNames @($workerHostName) -Processes @($workerHandle.Process)
+
+        Wait-PrometheusTargets -BaseURL $prometheusURL
+
+        $baseURL = "http://127.0.0.1:8080"
+        $submitted = Submit-ObservabilityJob -BaseURL $baseURL -Type "demo.echo" `
+            -Payload @{ message = "observability-test" } -MaxAttempts 1 -TimeoutMilliseconds 30000
+        $jobState = Wait-ObservabilityJobStatus -BaseURL $baseURL -JobID $submitted.id -ExpectedStatus "succeeded"
+        if ($jobState.result.message -ne "observability-test") {
+            throw "Observability-test job did not complete with the expected public API result."
+        }
+        $attempts = Get-ObservabilityJobAttempts -BaseURL $baseURL -JobID $submitted.id
+        if ($attempts.Count -ne 1 -or $attempts[0].status -ne "succeeded") {
+            throw "Observability-test public API did not return one succeeded attempt."
+        }
+
+        $retryJob = Submit-ObservabilityJob -BaseURL $baseURL -Type "demo.sleep" `
+            -Payload @{ duration_ms = 200 } -MaxAttempts 2 -TimeoutMilliseconds 25
+        $retryState = Wait-ObservabilityJobStatus -BaseURL $baseURL -JobID $retryJob.id -ExpectedStatus "dead_lettered"
+        if ($retryState.attempt_count -ne 2 -or $retryState.latest_failure.error_code -ne "execution_timeout") {
+            throw "Observability-test retry job did not dead-letter after two timed-out attempts."
+        }
+        $retryAttempts = Get-ObservabilityJobAttempts -BaseURL $baseURL -JobID $retryJob.id
+        if ($retryAttempts.Count -ne 2 -or
+            @($retryAttempts | Where-Object { $_.status -eq "timed_out" }).Count -ne 2) {
+            throw "Observability-test public API did not return two timed-out retry attempts."
+        }
+
+        Wait-PrometheusMetricFamilies -BaseURL $prometheusURL
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression "sum(quarry_jobs_submitted_total)" -Accept { param($value) $value -ge 1 } `
+            -Description "at least one submitted job"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression 'sum(quarry_job_attempts_total{outcome="succeeded"})' -Accept { param($value) $value -ge 1 } `
+            -Description "at least one succeeded attempt"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression 'sum(quarry_job_execution_duration_seconds_count{outcome="succeeded"})' -Accept { param($value) $value -ge 1 } `
+            -Description "at least one measured successful execution"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression 'sum(quarry_job_attempts_total{outcome="timed_out"})' -Accept { param($value) $value -ge 2 } `
+            -Description "two committed timed-out attempts"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression 'sum(quarry_job_execution_duration_seconds_count{outcome="timed_out"})' -Accept { param($value) $value -ge 2 } `
+            -Description "two measured timed-out executions"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression 'sum(quarry_retries_scheduled_total{reason="timed_out"})' -Accept { param($value) $value -ge 1 } `
+            -Description "one committed timeout retry"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression "sum(quarry_job_scheduling_delay_seconds_count)" -Accept { param($value) $value -ge 1 } `
+            -Description "at least one measured scheduling delay"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression "sum(quarry_dispatch_claim_size_count)" -Accept { param($value) $value -ge 1 } `
+            -Description "at least one measured dispatcher claim"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression "max(quarry_queue_snapshot_up)" -Accept { param($value) $value -eq 1 } `
+            -Description "a successful queue snapshot"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression "sum(quarry_queue_depth)" -Accept { param($value) $value -eq 0 } `
+            -Description "zero pending jobs"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression "max(quarry_oldest_queued_job_age_seconds)" -Accept { param($value) $value -eq 0 } `
+            -Description "zero oldest eligible job age"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression "max(quarry_active_jobs)" -Accept { param($value) $value -eq 0 } `
+            -Description "zero active jobs"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression "max(quarry_active_workers)" -Accept { param($value) $value -ge 1 } `
+            -Description "at least one active worker"
+
+        Assert-GrafanaDashboard -BaseURL $grafanaURL
+        $traceID = Wait-JaegerJobTrace -BaseURL $jaegerURL -JobID $submitted.id
+        $retryTraceID = Wait-JaegerJobTrace -BaseURL $jaegerURL -JobID $retryJob.id -MinimumAttemptSpans 2
+
+        Invoke-Docker -Arguments @("compose", "stop", "otel-collector")
+        $isolationJob = Submit-ObservabilityJob -BaseURL $baseURL -Type "demo.echo" `
+            -Payload @{ message = "collector-unavailable" } -MaxAttempts 1 -TimeoutMilliseconds 30000
+        $isolationState = Wait-ObservabilityJobStatus `
+            -BaseURL $baseURL -JobID $isolationJob.id -ExpectedStatus "succeeded"
+        $isolationAttempts = Get-ObservabilityJobAttempts -BaseURL $baseURL -JobID $isolationJob.id
+        if ($isolationState.result.message -ne "collector-unavailable" -or
+            $isolationAttempts.Count -ne 1 -or $isolationAttempts[0].status -ne "succeeded") {
+            throw "Job state changed when the OpenTelemetry Collector was unavailable."
+        }
+
+        $workerOutput = Stop-ObservabilityProcess -Handle $workerHandle
+        $dispatcherOutput = Stop-ObservabilityProcess -Handle $dispatcherHandle
+        $apiOutput = Stop-ObservabilityProcess -Handle $apiHandle
+        Assert-ObservabilityLogs -JobID $submitted.id -TraceID $traceID `
+            -ApiOutput $apiOutput -DispatcherOutput $dispatcherOutput -WorkerOutput $workerOutput
+        Assert-ObservabilityRetryLogs -JobID $retryJob.id -TraceID $retryTraceID `
+            -DispatcherOutput $dispatcherOutput -WorkerOutput $workerOutput
+        foreach ($output in @($apiOutput, $dispatcherOutput, $workerOutput)) {
+            if (-not $output.Contains($isolationJob.id)) {
+                throw "Observability-test logs do not contain Collector-unavailable job $($isolationJob.id)."
+            }
+        }
+
+        Write-Host "Observability test passed: success trace $traceID, retry trace $retryTraceID, Collector failure isolation, API, logs, Prometheus, Grafana, and Jaeger verified."
+    }
+    finally {
+        foreach ($handle in @($workerHandle, $dispatcherHandle, $apiHandle)) {
+            if ($null -ne $handle -and -not $handle.Stopped) {
+                try {
+                    $null = Stop-ObservabilityProcess -Handle $handle
+                }
+                catch {
+                    Write-Warning "Failed to stop observability-test process $($handle.Process.Id): $_"
+                }
+            }
+        }
+        try {
+            Invoke-Docker -Arguments @("compose", "down", "--volumes", "--remove-orphans")
+        }
+        finally {
+            try {
+                Remove-DistributedTestDirectory -Directory $temporaryDirectory
+            }
+            finally {
+                foreach ($name in $environmentNames) {
+                    [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name])
+                }
+            }
+        }
+    }
+
+    Assert-RecoveryCleanup -ComposeProject $composeProject `
+        -TemporaryDirectory $temporaryDirectory -ProcessIDs $processIDs.ToArray()
+    Write-Host "Observability-test cleanup verified: processes, temporary binaries, containers, network, and volume removed."
+}
+
 function Test-ComposeSmoke {
     $binaryExtension = if ($IsWindows) { ".exe" } else { "" }
     $apiBinary = Join-Path `
@@ -1790,7 +2527,8 @@ try {
             Test-GoVet
             Test-GoPackages
             Test-GoBuild
-            Invoke-Docker -Arguments @("compose", "config", "--quiet")
+            Test-ObservabilityConfiguration
+            Test-ObservabilityWorkflow
             Test-ComposeSmoke
             Test-DistributedProcesses
             Test-Recovery
@@ -1858,6 +2596,18 @@ try {
         }
         "semantics-test" {
             Test-Semantics
+        }
+        "observability-config-test" {
+            Test-ObservabilityConfiguration
+        }
+        "observability-test" {
+            Test-ObservabilityWorkflow
+        }
+        "observability-up" {
+            Start-ObservabilityInfrastructure
+        }
+        "observability-down" {
+            Stop-ObservabilityInfrastructure
         }
     }
 }

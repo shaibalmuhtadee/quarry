@@ -13,10 +13,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/shaibalmuhtadee/quarry/internal/dispatcher"
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	dispatcherv1 "github.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1"
 	"github.com/shaibalmuhtadee/quarry/internal/store/postgres"
+	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
 	"google.golang.org/grpc"
 )
 
@@ -29,6 +31,8 @@ const (
 	defaultRetryBaseDelay    = domain.DefaultRetryBaseDelay
 	defaultRetryMaxDelay     = domain.DefaultRetryMaxDelay
 	shutdownTimeout          = 10 * time.Second
+	defaultMetricsAddress    = ":9464"
+	defaultServiceName       = "quarry-dispatcher"
 )
 
 type config struct {
@@ -40,6 +44,7 @@ type config struct {
 	workerLiveness    time.Duration
 	retryBaseDelay    time.Duration
 	retryMaxDelay     time.Duration
+	telemetry         telemetry.Config
 }
 
 func main() {
@@ -130,6 +135,14 @@ func loadConfig() (config, error) {
 	if _, err := domain.NewRetryPolicy(retryBaseDelay, retryMaxDelay, rand.Int64N); err != nil {
 		return config{}, fmt.Errorf("configure retry policy: %w", err)
 	}
+	telemetryConfig, err := telemetry.LoadConfig(
+		defaultServiceName,
+		"QUARRY_DISPATCHER_METRICS_ADDR",
+		defaultMetricsAddress,
+	)
+	if err != nil {
+		return config{}, err
+	}
 
 	return config{
 		databaseURL:       databaseURL,
@@ -140,15 +153,46 @@ func loadConfig() (config, error) {
 		workerLiveness:    workerLiveness,
 		retryBaseDelay:    retryBaseDelay,
 		retryMaxDelay:     retryMaxDelay,
+		telemetry:         telemetryConfig,
 	}, nil
 }
 
-func run(ctx context.Context, cfg config, logger *slog.Logger) error {
+func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
+	telemetryRuntime, err := telemetry.New(ctx, cfg.telemetry)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := telemetryRuntime.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("telemetry shutdown failed", slog.Any("error", err))
+		}
+	}()
+	logger = slog.New(telemetry.NewTraceHandler(logger.Handler()))
+
+	metricsServer, err := telemetry.ListenMetrics(cfg.telemetry.MetricsAddress, telemetryRuntime.MetricsHandler())
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		runErr = errors.Join(runErr, metricsServer.Shutdown(shutdownCtx))
+	}()
+	logger.Info("dispatcher metrics starting", slog.String("address", metricsServer.Address()))
+
 	pool, err := postgres.NewPool(ctx, cfg.databaseURL)
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
+	if err := registerQueueHealthCollector(
+		telemetryRuntime.Registry(),
+		postgresQueueSnapshotSource{store: postgres.NewQueueSnapshotStore(pool)},
+	); err != nil {
+		return fmt.Errorf("register queue-health metrics: %w", err)
+	}
 
 	listener, err := net.Listen("tcp", cfg.dispatcherAddress)
 	if err != nil {
@@ -158,20 +202,30 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("configure retry policy: %w", err)
 	}
-	store := postgres.NewDispatcherStore(pool, cfg.leaseDuration, retryPolicy)
-	reaper, err := dispatcher.NewReaper(store, dispatcher.ReaperConfig{
+	store := postgres.NewDispatcherStoreWithTracer(
+		pool,
+		cfg.leaseDuration,
+		retryPolicy,
+		telemetryRuntime.Tracer("quarry/dispatcher/store"),
+	)
+	reaper, err := dispatcher.NewReaperWithMetrics(store, dispatcher.ReaperConfig{
 		Interval:              cfg.reaperInterval,
 		BatchSize:             cfg.reaperBatchSize,
 		WorkerLivenessTimeout: cfg.workerLiveness,
-	}, logger)
+	}, logger, telemetryRuntime.Metrics())
 	if err != nil {
 		return fmt.Errorf("configure lease reaper: %w", err)
 	}
 
-	server := grpc.NewServer()
+	server := grpc.NewServer(grpc.StatsHandler(telemetryRuntime.GRPCServerStatsHandler()))
 	dispatcherv1.RegisterDispatcherServiceServer(
 		server,
-		dispatcher.NewService(store),
+		dispatcher.NewServiceWithTelemetry(
+			store,
+			telemetryRuntime.Metrics(),
+			telemetryRuntime.Tracer("quarry/dispatcher/service"),
+			logger,
+		),
 	)
 	logger.Info("dispatcher starting", slog.String("address", listener.Addr().String()))
 
@@ -186,6 +240,32 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 	cancel()
 	<-reaperStopped
 	return err
+}
+
+func registerQueueHealthCollector(registerer prometheus.Registerer, source telemetry.QueueSnapshotSource) error {
+	return registerer.Register(telemetry.NewQueueHealthCollector(source))
+}
+
+type postgresQueueSnapshotSource struct {
+	store postgresQueueSnapshotReader
+}
+
+type postgresQueueSnapshotReader interface {
+	QueueSnapshot(context.Context) (postgres.QueueSnapshot, error)
+}
+
+func (source postgresQueueSnapshotSource) QueueSnapshot(ctx context.Context) (telemetry.QueueSnapshot, error) {
+	snapshot, err := source.store.QueueSnapshot(ctx)
+	if err != nil {
+		return telemetry.QueueSnapshot{}, err
+	}
+	return telemetry.QueueSnapshot{
+		Queued:            snapshot.Queued,
+		RetryWait:         snapshot.RetryWait,
+		OldestEligibleAge: snapshot.OldestEligibleAge,
+		ActiveJobs:        snapshot.ActiveJobs,
+		ActiveWorkers:     snapshot.ActiveWorkers,
+	}, nil
 }
 
 func serveDispatcher(

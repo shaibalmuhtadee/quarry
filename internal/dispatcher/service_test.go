@@ -1,11 +1,14 @@
 package dispatcher_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,16 +16,220 @@ import (
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	dispatcherv1 "github.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1"
 	"github.com/shaibalmuhtadee/quarry/internal/store/postgres"
+	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+func TestAcquireJobsContinuesEachPersistedTraceIndependently(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	tracer := provider.Tracer("test")
+	traceparents := make([]string, 2)
+	traceIDs := make([]trace.TraceID, 2)
+	for i := range traceparents {
+		parentCtx, parent := tracer.Start(context.Background(), "submission")
+		traceIDs[i] = parent.SpanContext().TraceID()
+		traceparents[i], _ = telemetry.TraceParentFromContext(parentCtx)
+		parent.End()
+	}
+
+	workerID := domain.NewWorkerID()
+	jobs := make([]postgres.AcquiredJob, 2)
+	for i := range jobs {
+		jobs[i] = postgres.AcquiredJob{
+			ID:            domain.NewJobID(),
+			AttemptNumber: mustAttemptNumber(t, 1),
+			Type:          mustJobType(t, "demo.trace"),
+			Payload:       mustPayload(t, `{"secret":"payload-value"}`),
+			Timeout:       time.Second,
+			TraceParent:   traceparents[i],
+		}
+	}
+	var logs bytes.Buffer
+	logger := slog.New(telemetry.NewTraceHandler(slog.NewTextHandler(&logs, nil)))
+	service := dispatcher.NewServiceWithTelemetry(
+		&fakeStore{acquireJobs: func(context.Context, domain.WorkerID, int32, []domain.JobType) ([]postgres.AcquiredJob, error) {
+			return jobs, nil
+		}},
+		nil,
+		tracer,
+		logger,
+	)
+	response, err := service.AcquireJobs(context.Background(), &dispatcherv1.AcquireJobsRequest{
+		WorkerId: workerID.String(), AvailableCapacity: 2, SupportedJobTypes: []string{"demo.trace"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.GetJobs()) != 2 {
+		t.Fatalf("acquired jobs = %d, want 2", len(response.GetJobs()))
+	}
+
+	claims := map[string]sdktrace.ReadOnlySpan{}
+	for _, span := range recorder.Ended() {
+		if span.Name() == "dispatcher.claim" {
+			claims[spanStringAttribute(t, span, "job.id")] = span
+		}
+	}
+	for i, job := range jobs {
+		claim := claims[job.ID.String()]
+		if claim == nil {
+			t.Fatalf("missing claim span for %s", job.ID)
+		}
+		if claim.SpanContext().TraceID() != traceIDs[i] {
+			t.Fatalf("claim %d trace ID = %s, want %s", i, claim.SpanContext().TraceID(), traceIDs[i])
+		}
+		if spanStringAttribute(t, claim, "job.type") != job.Type.String() ||
+			spanStringAttribute(t, claim, "worker.id") != workerID.String() ||
+			spanIntAttribute(t, claim, "job.attempt") != int64(job.AttemptNumber.Int32()) {
+			t.Fatalf("claim %d attributes = %v", i, claim.Attributes())
+		}
+		continued := telemetry.ContextFromTraceParent(context.Background(), response.GetJobs()[i].GetTraceparent())
+		if trace.SpanContextFromContext(continued).SpanID() != claim.SpanContext().SpanID() {
+			t.Fatalf("job %d did not carry its claim span", i)
+		}
+	}
+	if traceIDs[0] == traceIDs[1] {
+		t.Fatal("test parents unexpectedly share a trace")
+	}
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, jobs[0].ID.String()) || !strings.Contains(logOutput, workerID.String()) ||
+		!strings.Contains(logOutput, "trace_id=") {
+		t.Fatalf("claim log lacks trace and job identifiers: %s", logOutput)
+	}
+	if strings.Contains(logOutput, "payload-value") || strings.Contains(logOutput, traceparents[0]) {
+		t.Fatalf("claim log exposed payload or raw trace header: %s", logOutput)
+	}
+}
+
+func spanStringAttribute(t *testing.T, span sdktrace.ReadOnlySpan, key string) string {
+	t.Helper()
+	for _, value := range span.Attributes() {
+		if string(value.Key) == key {
+			return value.Value.AsString()
+		}
+	}
+	t.Fatalf("span %q lacks attribute %q", span.Name(), key)
+	return ""
+}
+
+func spanIntAttribute(t *testing.T, span sdktrace.ReadOnlySpan, key string) int64 {
+	t.Helper()
+	for _, value := range span.Attributes() {
+		if string(value.Key) == key {
+			return value.Value.AsInt64()
+		}
+	}
+	t.Fatalf("span %q lacks attribute %q", span.Name(), key)
+	return 0
+}
+
+func TestReportAttemptLogsSafeCommittedLifecycleIdentifiers(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	ctx, span := provider.Tracer("test").Start(context.Background(), "worker.execute")
+	defer span.End()
+	var logs bytes.Buffer
+	logger := slog.New(telemetry.NewTraceHandler(slog.NewTextHandler(&logs, nil)))
+	jobID := domain.NewJobID()
+	workerID := domain.NewWorkerID()
+	service := dispatcher.NewServiceWithTelemetry(
+		&fakeStore{reportAttempt: func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) (postgres.AttemptReportTransition, error) {
+			return postgres.AttemptReportTransition{
+				Applied: true, JobType: mustJobType(t, "demo.trace"),
+				AttemptStatus: domain.AttemptStatusRetryableFailed,
+				JobStatus:     domain.JobStatusRetryWait, ErrorCode: "dependency_timeout",
+			}, nil
+		}},
+		nil,
+		provider.Tracer("test"),
+		logger,
+	)
+	request := &dispatcherv1.ReportAttemptRequest{
+		WorkerId: workerID.String(), JobId: jobID.String(), AttemptNo: 1,
+		Outcome: &dispatcherv1.ReportAttemptRequest_RetryableFailure{RetryableFailure: &dispatcherv1.AttemptFailure{
+			ErrorCode: "dependency_timeout", ErrorMessage: "unsafe host and credential detail",
+		}},
+	}
+	_, err := service.ReportAttempt(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := logs.String()
+	for _, value := range []string{jobID.String(), workerID.String(), "demo.trace", "retryable_failure", "dependency_timeout", "trace_id=", "attempt completed", "retry scheduled"} {
+		if !strings.Contains(output, value) {
+			t.Fatalf("lifecycle log lacks %q: %s", value, output)
+		}
+	}
+	if strings.Contains(output, "unsafe host") {
+		t.Fatalf("lifecycle log exposed handler error: %s", output)
+	}
+
+	logs.Reset()
+	staleService := dispatcher.NewServiceWithTelemetry(
+		&fakeStore{reportAttempt: func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) (postgres.AttemptReportTransition, error) {
+			return postgres.AttemptReportTransition{}, postgres.ErrAttemptReportConflict
+		}},
+		nil,
+		provider.Tracer("test"),
+		logger,
+	)
+	if _, err := staleService.ReportAttempt(ctx, request); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("stale report error = %v", err)
+	}
+	output = logs.String()
+	if !strings.Contains(output, "stale attempt report") || !strings.Contains(output, jobID.String()) ||
+		!strings.Contains(output, workerID.String()) || strings.Contains(output, "unsafe host") {
+		t.Fatalf("stale report log is missing safe identifiers: %s", output)
+	}
+}
+
 type fakeStore struct {
 	registerWorker func(context.Context, postgres.WorkerRegistration) error
 	acquireJobs    func(context.Context, domain.WorkerID, int32, []domain.JobType) ([]postgres.AcquiredJob, error)
 	heartbeat      func(context.Context, domain.WorkerID, []postgres.HeartbeatAttempt) ([]postgres.HeartbeatResult, error)
-	reportAttempt  func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error
+	reportAttempt  func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) (postgres.AttemptReportTransition, error)
+}
+
+type serviceMetricRecorder struct {
+	attempts         []postgres.AttemptReportTransition
+	claimSizes       []int
+	schedulingDelays []time.Duration
+	retries          []telemetry.RetryReason
+	staleReports     int
+}
+
+func (metrics *serviceMetricRecorder) AttemptCompleted(
+	jobType domain.JobType,
+	status domain.AttemptStatus,
+	errorCode string,
+) {
+	metrics.attempts = append(metrics.attempts, postgres.AttemptReportTransition{
+		JobType:       jobType,
+		AttemptStatus: status,
+		ErrorCode:     errorCode,
+	})
+}
+
+func (metrics *serviceMetricRecorder) DispatchClaim(size int) {
+	metrics.claimSizes = append(metrics.claimSizes, size)
+}
+
+func (metrics *serviceMetricRecorder) JobSchedulingDelay(_ domain.JobType, delay time.Duration) {
+	metrics.schedulingDelays = append(metrics.schedulingDelays, delay)
+}
+
+func (metrics *serviceMetricRecorder) RetryScheduled(reason telemetry.RetryReason) {
+	metrics.retries = append(metrics.retries, reason)
+}
+
+func (metrics *serviceMetricRecorder) StaleReport() {
+	metrics.staleReports++
 }
 
 func (store *fakeStore) RegisterWorker(ctx context.Context, registration postgres.WorkerRegistration) error {
@@ -55,15 +262,15 @@ func (store *fakeStore) Heartbeat(
 	return store.heartbeat(ctx, workerID, attempts)
 }
 
-func (store *fakeStore) ReportAttempt(
+func (store *fakeStore) ReportAttemptTransition(
 	ctx context.Context,
 	workerID domain.WorkerID,
 	jobID domain.JobID,
 	attemptNumber domain.AttemptNumber,
 	outcome domain.AttemptOutcome,
-) error {
+) (postgres.AttemptReportTransition, error) {
 	if store.reportAttempt == nil {
-		return nil
+		return postgres.AttemptReportTransition{}, nil
 	}
 	return store.reportAttempt(ctx, workerID, jobID, attemptNumber, outcome)
 }
@@ -162,6 +369,7 @@ func TestAcquireJobsParsesRequestAndMapsJobs(t *testing.T) {
 	}
 	jobType := mustJobType(t, "demo.echo")
 	payload := mustPayload(t, `{"message":"hello"}`)
+	traceparent := "00-0102030405060708090a0b0c0d0e0f10-0102030405060708-01"
 	var capturedWorkerID domain.WorkerID
 	var capturedCapacity int32
 	var capturedTypes []domain.JobType
@@ -182,6 +390,7 @@ func TestAcquireJobsParsesRequestAndMapsJobs(t *testing.T) {
 					Type:          jobType,
 					Payload:       payload,
 					Timeout:       30 * time.Second,
+					TraceParent:   traceparent,
 				},
 			}, nil
 		},
@@ -206,8 +415,54 @@ func TestAcquireJobsParsesRequestAndMapsJobs(t *testing.T) {
 	}
 	job := response.GetJobs()[0]
 	if job.GetJobId() != jobID.String() || job.GetAttemptNo() != 2 || job.GetJobType() != "demo.echo" ||
-		string(job.GetPayloadJson()) != `{"message":"hello"}` || job.GetTimeoutMs() != 30000 {
+		string(job.GetPayloadJson()) != `{"message":"hello"}` || job.GetTimeoutMs() != 30000 ||
+		job.GetTraceparent() != traceparent {
 		t.Fatalf("acquired response job = %#v", job)
+	}
+}
+
+func TestAcquireJobsRecordsCommittedClaimMetrics(t *testing.T) {
+	workerID := domain.NewWorkerID()
+	jobType := mustJobType(t, "demo.echo")
+	attemptNumber, err := domain.NewAttemptNumber(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	store := &fakeStore{
+		acquireJobs: func(context.Context, domain.WorkerID, int32, []domain.JobType) ([]postgres.AcquiredJob, error) {
+			calls++
+			if calls == 1 {
+				return []postgres.AcquiredJob{{
+					ID:              domain.NewJobID(),
+					AttemptNumber:   attemptNumber,
+					Type:            jobType,
+					Payload:         mustPayload(t, `{}`),
+					Timeout:         time.Second,
+					SchedulingDelay: 250 * time.Millisecond,
+				}}, nil
+			}
+			return []postgres.AcquiredJob{}, nil
+		},
+	}
+	metrics := &serviceMetricRecorder{}
+	service := dispatcher.NewServiceWithMetrics(store, metrics)
+	request := &dispatcherv1.AcquireJobsRequest{
+		WorkerId:          workerID.String(),
+		AvailableCapacity: 1,
+		SupportedJobTypes: []string{"demo.echo"},
+	}
+	for range 2 {
+		if _, err := service.AcquireJobs(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if !reflect.DeepEqual(metrics.claimSizes, []int{1, 0}) {
+		t.Fatalf("claim sizes = %v, want [1 0]", metrics.claimSizes)
+	}
+	if !reflect.DeepEqual(metrics.schedulingDelays, []time.Duration{250 * time.Millisecond}) {
+		t.Fatalf("scheduling delays = %v", metrics.schedulingDelays)
 	}
 }
 
@@ -346,12 +601,12 @@ func TestReportAttemptParsesSuccessfulOutcome(t *testing.T) {
 			gotJobID domain.JobID,
 			attemptNumber domain.AttemptNumber,
 			outcome domain.AttemptOutcome,
-		) error {
+		) (postgres.AttemptReportTransition, error) {
 			if gotWorkerID != workerID || gotJobID != jobID || attemptNumber.Int32() != 1 {
 				t.Fatalf("reported identity = worker %s, job %s, attempt %d", gotWorkerID, gotJobID, attemptNumber.Int32())
 			}
 			capturedOutcome = outcome
-			return nil
+			return postgres.AttemptReportTransition{}, nil
 		},
 	})
 
@@ -406,9 +661,9 @@ func TestReportAttemptParsesFailureOutcomes(t *testing.T) {
 					_ domain.JobID,
 					_ domain.AttemptNumber,
 					outcome domain.AttemptOutcome,
-				) error {
+				) (postgres.AttemptReportTransition, error) {
 					captured = outcome
-					return nil
+					return postgres.AttemptReportTransition{}, nil
 				},
 			})
 			_, err := service.ReportAttempt(context.Background(), test.request())
@@ -418,6 +673,109 @@ func TestReportAttemptParsesFailureOutcomes(t *testing.T) {
 			failure, ok := captured.Failure()
 			if captured.Kind() != test.kind || !ok || failure.Code() != "dependency_timeout" || failure.Message() != "dependency timed out" {
 				t.Fatalf("captured outcome = %#v", captured)
+			}
+		})
+	}
+}
+
+func TestReportAttemptRecordsOnlyNewCommittedTransition(t *testing.T) {
+	workerID := domain.NewWorkerID()
+	jobID := domain.NewJobID()
+	jobType := mustJobType(t, "demo.echo")
+	calls := 0
+	store := &fakeStore{
+		reportAttempt: func(
+			context.Context,
+			domain.WorkerID,
+			domain.JobID,
+			domain.AttemptNumber,
+			domain.AttemptOutcome,
+		) (postgres.AttemptReportTransition, error) {
+			calls++
+			if calls == 3 {
+				return postgres.AttemptReportTransition{}, postgres.ErrAttemptReportConflict
+			}
+			return postgres.AttemptReportTransition{
+				Applied:       calls == 1,
+				JobType:       jobType,
+				AttemptStatus: domain.AttemptStatusRetryableFailed,
+				JobStatus:     domain.JobStatusRetryWait,
+				ErrorCode:     "dependency_timeout",
+			}, nil
+		},
+	}
+	metrics := &serviceMetricRecorder{}
+	service := dispatcher.NewServiceWithMetrics(store, metrics)
+	request := validReportRequest(workerID, jobID)
+
+	for range 2 {
+		if _, err := service.ReportAttempt(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := service.ReportAttempt(context.Background(), request); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("stale report error = %v", err)
+	}
+
+	if len(metrics.attempts) != 1 || metrics.attempts[0].AttemptStatus != domain.AttemptStatusRetryableFailed {
+		t.Fatalf("attempt metrics = %#v", metrics.attempts)
+	}
+	if !reflect.DeepEqual(metrics.retries, []telemetry.RetryReason{telemetry.RetryReasonRetryableFailure}) {
+		t.Fatalf("retry metrics = %v", metrics.retries)
+	}
+	if metrics.staleReports != 1 {
+		t.Fatalf("stale report metrics = %d, want 1", metrics.staleReports)
+	}
+}
+
+func TestReportAttemptRecordsCommittedOutcomeAndRetrySemantics(t *testing.T) {
+	workerID := domain.NewWorkerID()
+	jobID := domain.NewJobID()
+	jobType := mustJobType(t, "demo.echo")
+	tests := []struct {
+		name          string
+		attemptStatus domain.AttemptStatus
+		jobStatus     domain.JobStatus
+		errorCode     string
+		wantRetry     telemetry.RetryReason
+	}{
+		{name: "succeeded", attemptStatus: domain.AttemptStatusSucceeded, jobStatus: domain.JobStatusSucceeded},
+		{name: "retryable", attemptStatus: domain.AttemptStatusRetryableFailed, jobStatus: domain.JobStatusRetryWait, errorCode: "dependency_timeout", wantRetry: telemetry.RetryReasonRetryableFailure},
+		{name: "permanent", attemptStatus: domain.AttemptStatusPermanentFailed, jobStatus: domain.JobStatusDeadLettered, errorCode: "invalid_input"},
+		{name: "exhausted", attemptStatus: domain.AttemptStatusRetryableFailed, jobStatus: domain.JobStatusDeadLettered, errorCode: "dependency_timeout"},
+		{name: "timed out", attemptStatus: domain.AttemptStatusTimedOut, jobStatus: domain.JobStatusRetryWait, errorCode: "execution_timeout", wantRetry: telemetry.RetryReasonTimedOut},
+		{name: "panicked", attemptStatus: domain.AttemptStatusPanicked, jobStatus: domain.JobStatusRetryWait, errorCode: "handler_panicked", wantRetry: telemetry.RetryReasonPanicked},
+		{name: "cancelled", attemptStatus: domain.AttemptStatusCancelled, jobStatus: domain.JobStatusCancelled, errorCode: "cancellation_requested"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transition := postgres.AttemptReportTransition{
+				Applied:       true,
+				JobType:       jobType,
+				AttemptStatus: test.attemptStatus,
+				JobStatus:     test.jobStatus,
+				ErrorCode:     test.errorCode,
+			}
+			store := &fakeStore{
+				reportAttempt: func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) (postgres.AttemptReportTransition, error) {
+					return transition, nil
+				},
+			}
+			metrics := &serviceMetricRecorder{}
+			service := dispatcher.NewServiceWithMetrics(store, metrics)
+			if _, err := service.ReportAttempt(context.Background(), validReportRequest(workerID, jobID)); err != nil {
+				t.Fatal(err)
+			}
+			if len(metrics.attempts) != 1 || metrics.attempts[0].AttemptStatus != test.attemptStatus ||
+				metrics.attempts[0].ErrorCode != test.errorCode {
+				t.Fatalf("attempt metrics = %#v", metrics.attempts)
+			}
+			if test.wantRetry == "" && len(metrics.retries) != 0 {
+				t.Fatalf("unexpected retry metrics = %v", metrics.retries)
+			}
+			if test.wantRetry != "" && !reflect.DeepEqual(metrics.retries, []telemetry.RetryReason{test.wantRetry}) {
+				t.Fatalf("retry metrics = %v", metrics.retries)
 			}
 		})
 	}
@@ -528,8 +886,8 @@ func TestServiceMapsStoreErrorsToStableStatusCodes(t *testing.T) {
 		{
 			name: "attempt conflict",
 			service: dispatcher.NewService(&fakeStore{
-				reportAttempt: func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error {
-					return postgres.ErrAttemptReportConflict
+				reportAttempt: func(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) (postgres.AttemptReportTransition, error) {
+					return postgres.AttemptReportTransition{}, postgres.ErrAttemptReportConflict
 				},
 			}),
 			call: func(service *dispatcher.Service) error {
@@ -606,6 +964,15 @@ func mustPayload(t *testing.T, value string) domain.Payload {
 		t.Fatalf("parse payload: %v", err)
 	}
 	return payload
+}
+
+func mustAttemptNumber(t *testing.T, value int32) domain.AttemptNumber {
+	t.Helper()
+	number, err := domain.NewAttemptNumber(value)
+	if err != nil {
+		t.Fatalf("parse attempt number: %v", err)
+	}
+	return number
 }
 
 func assertStatusCode(t *testing.T, err error, want codes.Code) {

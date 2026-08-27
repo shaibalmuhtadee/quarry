@@ -294,6 +294,7 @@ type AcquiredJob struct {
 	JobType       string                 `protobuf:"bytes,3,opt,name=job_type,json=jobType,proto3" json:"job_type,omitempty"`
 	PayloadJson   []byte                 `protobuf:"bytes,4,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"`
 	TimeoutMs     int64                  `protobuf:"varint,5,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
+	Traceparent   string                 `protobuf:"bytes,6,opt,name=traceparent,proto3" json:"traceparent,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -361,6 +362,13 @@ func (x *AcquiredJob) GetTimeoutMs() int64 {
 		return x.TimeoutMs
 	}
 	return 0
+}
+
+func (x *AcquiredJob) GetTraceparent() string {
+	if x != nil {
+		return x.Traceparent
+	}
+	return ""
 }
 
 type HeartbeatRequest struct {
@@ -899,7 +907,7 @@ const file_quarry_dispatcher_v1_dispatcher_proto_rawDesc = "" +
 	"\x12available_capacity\x18\x02 \x01(\rR\x11availableCapacity\x12.\n" +
 	"\x13supported_job_types\x18\x03 \x03(\tR\x11supportedJobTypes\"L\n" +
 	"\x13AcquireJobsResponse\x125\n" +
-	"\x04jobs\x18\x01 \x03(\v2!.quarry.dispatcher.v1.AcquiredJobR\x04jobs\"\xa0\x01\n" +
+	"\x04jobs\x18\x01 \x03(\v2!.quarry.dispatcher.v1.AcquiredJobR\x04jobs\"\xc2\x01\n" +
 	"\vAcquiredJob\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x1d\n" +
 	"\n" +
@@ -907,7 +915,8 @@ const file_quarry_dispatcher_v1_dispatcher_proto_rawDesc = "" +
 	"\bjob_type\x18\x03 \x01(\tR\ajobType\x12!\n" +
 	"\fpayload_json\x18\x04 \x01(\fR\vpayloadJson\x12\x1d\n" +
 	"\n" +
-	"timeout_ms\x18\x05 \x01(\x03R\ttimeoutMs\"\x80\x01\n" +
+	"timeout_ms\x18\x05 \x01(\x03R\ttimeoutMs\x12 \n" +
+	"\vtraceparent\x18\x06 \x01(\tR\vtraceparent\"\x80\x01\n" +
 	"\x10HeartbeatRequest\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12O\n" +
 	"\x0factive_attempts\x18\x02 \x03(\v2&.quarry.dispatcher.v1.HeartbeatAttemptR\x0eactiveAttempts\"H\n" +

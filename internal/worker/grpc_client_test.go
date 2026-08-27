@@ -74,6 +74,7 @@ func TestGRPCClientPreservesRegistrationAcquisitionAndReportIdentity(t *testing.
 		t.Fatal(err)
 	}
 	startedAt := time.Now().UTC().Truncate(time.Nanosecond)
+	traceparent := "00-0102030405060708090a0b0c0d0e0f10-0102030405060708-01"
 	rpc := &recordingRPCClient{
 		jobs: []*dispatcherv1.AcquiredJob{{
 			JobId:       jobID.String(),
@@ -81,6 +82,7 @@ func TestGRPCClientPreservesRegistrationAcquisitionAndReportIdentity(t *testing.
 			JobType:     jobType.String(),
 			PayloadJson: []byte(`{"message":"hello"}`),
 			TimeoutMs:   2500,
+			Traceparent: traceparent,
 		}},
 		heartbeats: []*dispatcherv1.HeartbeatAttemptResult{{
 			JobId:           jobID.String(),
@@ -110,7 +112,7 @@ func TestGRPCClientPreservesRegistrationAcquisitionAndReportIdentity(t *testing.
 	}
 	if len(jobs) != 1 || jobs[0].ID != jobID || jobs[0].AttemptNumber != attempt ||
 		jobs[0].Type != jobType || string(jobs[0].Payload.JSON()) != `{"message":"hello"}` ||
-		jobs[0].Timeout != 2500*time.Millisecond {
+		jobs[0].Timeout != 2500*time.Millisecond || jobs[0].TraceParent != traceparent {
 		t.Fatalf("acquired jobs = %#v", jobs)
 	}
 	heartbeats, err := client.Heartbeat(context.Background(), workerID, []HeartbeatAttempt{{
@@ -153,6 +155,35 @@ func TestGRPCClientPreservesRegistrationAcquisitionAndReportIdentity(t *testing.
 		rpc.report.GetAttemptNo() != uint32(attempt.Int32()) ||
 		string(rpc.report.GetSucceeded().GetResultJson()) != `{"ok":true}` {
 		t.Fatalf("report request = %#v", rpc.report)
+	}
+}
+
+func TestGRPCClientClearsInvalidAcquiredTraceparent(t *testing.T) {
+	t.Parallel()
+
+	jobID := domain.NewJobID()
+	rpc := &recordingRPCClient{jobs: []*dispatcherv1.AcquiredJob{{
+		JobId:       jobID.String(),
+		AttemptNo:   1,
+		JobType:     "demo.echo",
+		PayloadJson: []byte(`{}`),
+		TimeoutMs:   1000,
+		Traceparent: "invalid",
+	}}}
+	client, err := NewGRPCClient(rpc, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobType, err := domain.ParseJobType("demo.echo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := client.Acquire(context.Background(), domain.NewWorkerID(), 1, []domain.JobType{jobType})
+	if err != nil {
+		t.Fatalf("acquire job with invalid traceparent: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].ID != jobID || jobs[0].TraceParent != "" {
+		t.Fatalf("acquired jobs = %#v", jobs)
 	}
 }
 

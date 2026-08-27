@@ -20,9 +20,10 @@ func TestWorkerAppliesSubmittedTimeoutAndOverridesHandlerError(t *testing.T) {
 
 	job := makeJobs(t, 1, "demo.timeout")[0]
 	job.Timeout = 30 * time.Millisecond
+	metrics := newWorkerMetricRecorder(1)
 	observedDeadline := make(chan time.Duration, 1)
 	observedCause := make(chan error, 1)
-	outcome := runSingleJob(t, job, nil, func(ctx context.Context, _ domain.Payload) (domain.Result, error) {
+	outcome := runSingleJobWithMetrics(t, job, nil, metrics, func(ctx context.Context, _ domain.Payload) (domain.Result, error) {
 		deadline, ok := ctx.Deadline()
 		if !ok {
 			t.Error("handler context has no deadline")
@@ -42,6 +43,10 @@ func TestWorkerAppliesSubmittedTimeoutAndOverridesHandlerError(t *testing.T) {
 		t.Fatalf("handler context cause = %v, want execution timeout", cause)
 	}
 	assertExecutionFailure(t, outcome, domain.AttemptOutcomeKindTimedOut, executionTimeoutCode, executionTimeoutMessage)
+	metric := <-metrics.executions
+	if metric.outcome != domain.AttemptOutcomeKindTimedOut || metric.jobType != job.Type || metric.duration <= 0 {
+		t.Fatalf("timeout execution metric = %#v", metric)
+	}
 }
 
 func TestWorkerTimeoutBoundaryUsesFirstCancellationCause(t *testing.T) {
@@ -80,7 +85,7 @@ func TestWorkerTimeoutBoundaryUsesFirstCancellationCause(t *testing.T) {
 	})
 }
 
-func TestWorkerRecoversPanicLogsStackAndContinues(t *testing.T) {
+func TestWorkerRecoversPanicLogsSafeIdentifiersAndContinues(t *testing.T) {
 	t.Parallel()
 
 	panicJob := makeJobs(t, 1, "demo.panic")[0]
@@ -116,6 +121,8 @@ func TestWorkerRecoversPanicLogsStackAndContinues(t *testing.T) {
 			return mustResult(t, `{"ok":true}`), nil
 		},
 	})
+	metrics := newWorkerMetricRecorder(2)
+	runtime.metrics = metrics
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -132,13 +139,23 @@ func TestWorkerRecoversPanicLogsStackAndContinues(t *testing.T) {
 		t.Fatalf("post-panic outcome = %q, want succeeded", successOutcome.Kind())
 	}
 	output := logs.String()
-	if !strings.Contains(output, "secret panic value") || !strings.Contains(output, "runtime/debug.Stack") ||
-		!strings.Contains(output, panicJob.ID.String()) || !strings.Contains(output, "demo.panic") {
-		t.Fatalf("panic log does not contain value, stack, and attempt identity: %s", output)
+	if strings.Contains(output, "secret panic value") || strings.Contains(output, "runtime/debug.Stack") {
+		t.Fatalf("panic log exposed handler-controlled data: %s", output)
+	}
+	if !strings.Contains(output, panicJob.ID.String()) || !strings.Contains(output, "demo.panic") ||
+		!strings.Contains(output, "handler_panicked") {
+		t.Fatalf("panic log does not contain safe attempt identity: %s", output)
 	}
 	failure, _ := panicOutcome.Failure()
 	if strings.Contains(failure.Code(), "secret") || strings.Contains(failure.Message(), "secret") {
 		t.Fatalf("persisted panic failure exposed panic value: %#v", failure)
+	}
+	metricOutcomes := map[domain.AttemptOutcomeKind]int{}
+	for range 2 {
+		metricOutcomes[(<-metrics.executions).outcome]++
+	}
+	if metricOutcomes[domain.AttemptOutcomeKindPanicked] != 1 || metricOutcomes[domain.AttemptOutcomeKindSucceeded] != 1 {
+		t.Fatalf("execution metric outcomes = %v", metricOutcomes)
 	}
 }
 
@@ -195,6 +212,16 @@ func TestWorkerCannotReleaseSlotUntilContextIgnoringHandlerReturns(t *testing.T)
 }
 
 func runSingleJob(t *testing.T, job Job, logger *slog.Logger, handler Handler) domain.AttemptOutcome {
+	return runSingleJobWithMetrics(t, job, logger, nil, handler)
+}
+
+func runSingleJobWithMetrics(
+	t *testing.T,
+	job Job,
+	logger *slog.Logger,
+	metrics workerMetrics,
+	handler Handler,
+) domain.AttemptOutcome {
 	t.Helper()
 	var acquired atomic.Bool
 	dispatcher := &fakeDispatcher{}
@@ -210,6 +237,7 @@ func runSingleJob(t *testing.T, job Job, logger *slog.Logger, handler Handler) d
 		return nil
 	}
 	runtime := newTestWorkerWithLogger(t, dispatcher, 1, logger, map[string]Handler{job.Type.String(): handler})
+	runtime.metrics = metrics
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runWorker(runtime, ctx)
 	var outcome domain.AttemptOutcome

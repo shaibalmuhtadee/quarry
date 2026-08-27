@@ -7,7 +7,8 @@ INSERT INTO jobs (
     max_attempts,
     timeout_ms,
     idempotency_key,
-    request_hash
+    request_hash,
+    traceparent
 )
 VALUES (
     sqlc.arg(id),
@@ -17,7 +18,8 @@ VALUES (
     sqlc.arg(max_attempts),
     sqlc.arg(timeout_ms),
     sqlc.narg(idempotency_key),
-    sqlc.narg(request_hash)
+    sqlc.narg(request_hash),
+    sqlc.narg(traceparent)
 )
 ON CONFLICT (job_type, idempotency_key) WHERE idempotency_key IS NOT NULL
 DO NOTHING

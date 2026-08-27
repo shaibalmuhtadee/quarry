@@ -4,12 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	dispatcherv1 "github.com/shaibalmuhtadee/quarry/internal/rpc/generated/dispatcher/v1"
 	"github.com/shaibalmuhtadee/quarry/internal/store/postgres"
+	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -18,16 +23,41 @@ type store interface {
 	RegisterWorker(context.Context, postgres.WorkerRegistration) error
 	AcquireJobs(context.Context, domain.WorkerID, int32, []domain.JobType) ([]postgres.AcquiredJob, error)
 	Heartbeat(context.Context, domain.WorkerID, []postgres.HeartbeatAttempt) ([]postgres.HeartbeatResult, error)
-	ReportAttempt(context.Context, domain.WorkerID, domain.JobID, domain.AttemptNumber, domain.AttemptOutcome) error
+	ReportAttemptTransition(
+		context.Context,
+		domain.WorkerID,
+		domain.JobID,
+		domain.AttemptNumber,
+		domain.AttemptOutcome,
+	) (postgres.AttemptReportTransition, error)
+}
+
+type serviceMetrics interface {
+	AttemptCompleted(domain.JobType, domain.AttemptStatus, string)
+	DispatchClaim(int)
+	JobSchedulingDelay(domain.JobType, time.Duration)
+	RetryScheduled(telemetry.RetryReason)
+	StaleReport()
 }
 
 type Service struct {
 	dispatcherv1.UnimplementedDispatcherServiceServer
-	store store
+	store   store
+	metrics serviceMetrics
+	tracer  trace.Tracer
+	logger  *slog.Logger
 }
 
 func NewService(store store) *Service {
-	return &Service{store: store}
+	return NewServiceWithTelemetry(store, nil, trace.NewNoopTracerProvider().Tracer("quarry/dispatcher"), slog.Default())
+}
+
+func NewServiceWithMetrics(store store, metrics serviceMetrics) *Service {
+	return NewServiceWithTelemetry(store, metrics, trace.NewNoopTracerProvider().Tracer("quarry/dispatcher"), slog.Default())
+}
+
+func NewServiceWithTelemetry(store store, metrics serviceMetrics, tracer trace.Tracer, logger *slog.Logger) *Service {
+	return &Service{store: store, metrics: metrics, tracer: tracer, logger: logger}
 }
 
 func (service *Service) RegisterWorker(
@@ -70,7 +100,6 @@ func (service *Service) RegisterWorker(
 	if err != nil {
 		return nil, internalError(err)
 	}
-
 	return &dispatcherv1.RegisterWorkerResponse{}, nil
 }
 
@@ -110,18 +139,49 @@ func (service *Service) AcquireJobs(
 	if err != nil {
 		return nil, internalError(err)
 	}
+	if service.metrics != nil {
+		service.metrics.DispatchClaim(len(jobs))
+		for _, job := range jobs {
+			service.metrics.JobSchedulingDelay(job.Type, job.SchedulingDelay)
+		}
+	}
 
 	response := &dispatcherv1.AcquireJobsResponse{
 		Jobs: make([]*dispatcherv1.AcquiredJob, 0, len(jobs)),
 	}
 	for _, job := range jobs {
+		claimCtx := telemetry.ContextFromTraceParent(context.Background(), job.TraceParent)
+		claimCtx, claimSpan := service.tracer.Start(claimCtx, "dispatcher.claim", trace.WithAttributes(
+			attribute.String("job.id", job.ID.String()),
+			attribute.String("job.type", job.Type.String()),
+			attribute.Int("job.attempt", int(job.AttemptNumber.Int32())),
+			attribute.String("worker.id", workerID.String()),
+		))
+		_, databaseSpan := service.tracer.Start(claimCtx, "db.claim_job", trace.WithAttributes(
+			attribute.String("job.id", job.ID.String()),
+			attribute.String("job.type", job.Type.String()),
+			attribute.Int("job.attempt", int(job.AttemptNumber.Int32())),
+			attribute.String("worker.id", workerID.String()),
+		))
+		databaseSpan.End()
+		traceparent, _ := telemetry.TraceParentFromContext(claimCtx)
+		service.logger.InfoContext(
+			claimCtx,
+			"job claimed",
+			slog.String("job_id", job.ID.String()),
+			slog.String("job_type", job.Type.String()),
+			slog.Int("attempt_no", int(job.AttemptNumber.Int32())),
+			slog.String("worker_id", workerID.String()),
+		)
 		response.Jobs = append(response.Jobs, &dispatcherv1.AcquiredJob{
 			JobId:       job.ID.String(),
 			AttemptNo:   uint32(job.AttemptNumber.Int32()),
 			JobType:     job.Type.String(),
 			PayloadJson: job.Payload.JSON(),
 			TimeoutMs:   job.Timeout.Milliseconds(),
+			Traceparent: traceparent,
 		})
+		claimSpan.End()
 	}
 
 	return response, nil
@@ -215,15 +275,82 @@ func (service *Service) ReportAttempt(
 		return nil, invalidArgument(err.Error())
 	}
 
-	err = service.store.ReportAttempt(ctx, workerID, jobID, attemptNumber, outcome)
+	transition, err := service.store.ReportAttemptTransition(ctx, workerID, jobID, attemptNumber, outcome)
 	if errors.Is(err, postgres.ErrAttemptReportConflict) {
+		if service.metrics != nil {
+			service.metrics.StaleReport()
+		}
+		service.logger.WarnContext(
+			ctx,
+			"stale attempt report",
+			slog.String("job_id", jobID.String()),
+			slog.Int("attempt_no", int(attemptNumber.Int32())),
+			slog.String("worker_id", workerID.String()),
+			slog.String("job_outcome", string(outcome.Kind())),
+		)
 		return nil, status.Error(codes.FailedPrecondition, "attempt report does not match the current stored attempt")
 	}
 	if err != nil {
 		return nil, internalError(err)
 	}
+	if service.metrics != nil && transition.Applied {
+		service.metrics.AttemptCompleted(transition.JobType, transition.AttemptStatus, transition.ErrorCode)
+		if transition.JobStatus == domain.JobStatusRetryWait {
+			if reason, ok := retryReason(transition.AttemptStatus); ok {
+				service.metrics.RetryScheduled(reason)
+			}
+		}
+	}
+	if transition.Applied {
+		service.logger.InfoContext(
+			ctx,
+			"attempt completed",
+			slog.String("job_id", jobID.String()),
+			slog.String("job_type", transition.JobType.String()),
+			slog.Int("attempt_no", int(attemptNumber.Int32())),
+			slog.String("worker_id", workerID.String()),
+			slog.String("job_outcome", string(outcome.Kind())),
+			slog.String("error_code", transition.ErrorCode),
+		)
+		if transition.JobStatus == domain.JobStatusRetryWait {
+			service.logger.InfoContext(
+				ctx,
+				"retry scheduled",
+				slog.String("job_id", jobID.String()),
+				slog.String("job_type", transition.JobType.String()),
+				slog.Int("attempt_no", int(attemptNumber.Int32())),
+				slog.String("worker_id", workerID.String()),
+				slog.String("job_outcome", string(outcome.Kind())),
+				slog.String("error_code", transition.ErrorCode),
+			)
+		}
+		if transition.JobStatus == domain.JobStatusCancelled {
+			service.logger.InfoContext(
+				ctx,
+				"job cancelled",
+				slog.String("job_id", jobID.String()),
+				slog.String("job_type", transition.JobType.String()),
+				slog.Int("attempt_no", int(attemptNumber.Int32())),
+				slog.String("worker_id", workerID.String()),
+				slog.String("error_code", transition.ErrorCode),
+			)
+		}
+	}
 
 	return &dispatcherv1.ReportAttemptResponse{}, nil
+}
+
+func retryReason(status domain.AttemptStatus) (telemetry.RetryReason, bool) {
+	switch status {
+	case domain.AttemptStatusRetryableFailed:
+		return telemetry.RetryReasonRetryableFailure, true
+	case domain.AttemptStatusTimedOut:
+		return telemetry.RetryReasonTimedOut, true
+	case domain.AttemptStatusPanicked:
+		return telemetry.RetryReasonPanicked, true
+	default:
+		return "", false
+	}
 }
 
 func parseAttemptOutcome(request *dispatcherv1.ReportAttemptRequest) (domain.AttemptOutcome, error) {

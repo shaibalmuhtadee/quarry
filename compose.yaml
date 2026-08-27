@@ -17,5 +17,57 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  prometheus:
+    # Pinned to Prometheus 3.12.0 for reproducible local observability.
+    image: prom/prometheus:v3.12.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=24h
+    ports:
+      - "${QUARRY_PROMETHEUS_PORT:-9091}:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
+
+  otel-collector:
+    # Pinned to the Collector Contrib 0.153.0 distribution for OTLP and health-check support.
+    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.153.0
+    command:
+      - --config=/etc/otelcol-contrib/config.yaml
+    ports:
+      - "${QUARRY_OTEL_GRPC_PORT:-4317}:4317"
+      - "${QUARRY_OTEL_HTTP_PORT:-4318}:4318"
+      - "${QUARRY_OTEL_HEALTH_PORT:-13133}:13133"
+    volumes:
+      - ./deploy/observability/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+
+  jaeger:
+    # Pinned to Jaeger 2.20.0. Its built-in all-in-one config uses in-memory trace storage.
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.20.0
+    ports:
+      - "${QUARRY_JAEGER_PORT:-16686}:16686"
+    restart: unless-stopped
+
+  grafana:
+    # Pinned to Grafana 13.1.0 for reproducible dashboard provisioning.
+    image: grafana/grafana:13.1.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    ports:
+      - "${QUARRY_GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
 volumes:
   postgres-data:

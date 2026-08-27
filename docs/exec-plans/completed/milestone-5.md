@@ -1,0 +1,752 @@
+# Milestone 5 execution plan
+
+## Milestone goal
+
+Add metrics, traces, structured identifiers, and local observability infrastructure around Quarry's existing execution path. A developer must be able to diagnose queue health and inspect one submitted job without reading PostgreSQL rows manually.
+
+Milestone 5 does not add load generation, benchmarks, benchmark results, acknowledgement-loss fault injection, application container images, Kubernetes resources, workflow behavior, another queue, or any other Milestone 6 or Milestone 7 feature.
+
+## Existing foundation
+
+Milestones 0 through 4 already provide:
+
+- durable jobs and attempts in PostgreSQL,
+- HTTP submission, lookup, attempt history, and cancellation,
+- gRPC worker registration, acquisition, heartbeats, and outcome reports,
+- bounded worker execution,
+- leases, stale-attempt fencing, and crash recovery,
+- durable retries, backoff, and dead-letter behavior,
+- execution timeouts, panic recovery, and cooperative cancellation,
+- graceful worker drain and forced-shutdown recovery,
+- JSON `log/slog` output from every process,
+- API request logs that can include `job_id`,
+- worker startup and panic logs with some execution identifiers,
+- rerunnable process tests and a common PowerShell validation interface.
+
+The repository has no Prometheus client use, `/metrics` route, OpenTelemetry setup, persisted trace context, Collector, Jaeger configuration, Grafana configuration, or dashboard. OpenTelemetry modules currently listed in `go.mod` are indirect dependencies of development tools and tests.
+
+## Approved decisions
+
+### Trace continuation across asynchronous work
+
+- Persist one W3C `traceparent` value with each logical job.
+- Do not persist `tracestate`, baggage, arbitrary request headers, or vendor-specific propagation data.
+- Preserve the original job trace context on an idempotent submission replay.
+- Treat missing or invalid incoming trace context as absent instead of storing malformed text.
+- Carry `traceparent` as opaque execution metadata in `AcquiredJob`. Workers remain unaware of PostgreSQL.
+- Instrument worker-to-dispatcher gRPC calls, but do not use the acquisition polling span as the parent of every acquired job.
+- After a batch claim commits, start one `dispatcher.claim` span per job from that job's persisted trace parent.
+- Inject the `dispatcher.claim` span context into the matching `AcquiredJob` response.
+- Start `worker.execute` from the context carried by that job.
+- Let the attempt context carry the trace through handler execution, outcome reporting, and durable completion.
+
+One `AcquireJobs` call can claim jobs from different traces. A single polling RPC cannot be the parent of all of them. Per-job continuation keeps each trace valid and makes one job readable as one trace in Jaeger.
+
+### Telemetry ownership and failure behavior
+
+- Add a small `internal/telemetry` package for process telemetry setup, Prometheus instruments, context-aware logging, trace propagation helpers, and metrics HTTP serving.
+- Give each process its own Prometheus registry and OpenTelemetry provider.
+- Keep telemetry outside application correctness. Metrics, logs, and traces never become authoritative state.
+- Fail process startup for invalid telemetry configuration.
+- Do not fail job submission, acquisition, execution, reporting, or recovery because an exporter or collector is unavailable.
+- Shut down application work before flushing and stopping telemetry.
+- Use standard OpenTelemetry environment variables where they fit the required configuration.
+- Use service-specific metrics listener configuration for dispatcher and worker processes.
+- Expose the API's `/metrics` route on its existing HTTP server.
+- Run a small metrics-only HTTP server beside the dispatcher and each worker.
+
+### Structured logs
+
+- Keep `log/slog` as the logging API.
+- Wrap the configured handler so records logged with a trace context receive `trace_id` and `span_id`.
+- Add `job_id`, `job_type`, `attempt_no`, `worker_id`, `outcome`, and safe `error_code` fields where the event has those values.
+- Log attempt start, completion, retry scheduling, stale reports, cancellation, and lease recovery at their owning component.
+- Do not log payloads, idempotency keys, trace headers, unsafe handler errors, arbitrary panic values outside the existing protected panic log, or public error messages as metric labels.
+
+### Metric semantics
+
+- Record event metrics only after the related PostgreSQL transaction commits or the worker observes the completed local action.
+- Return small typed transition facts from dispatcher store operations when the caller needs the committed outcome for metrics or logs.
+- Mark exact repeated reports as already applied so they do not increment counters again.
+- Query queue-health gauges from PostgreSQL at scrape time. Do not maintain authoritative queue gauges in process memory.
+- Use PostgreSQL time for scheduling delay and queue-age calculations.
+- Use bounded labels only.
+- Do not use `job_id`, `worker_id`, `idempotency_key`, `error_message`, payload content, URLs, or arbitrary input as metric labels.
+- Do not label API submission or queue gauges by `job_type`. The public API accepts client-controlled job types, so that label is not bounded there.
+- Label attempt and execution metrics by `job_type` only after the job matches the worker's finite handler registry.
+- Preserve the Milestone 4 worker-state decision. `quarry_active_workers` may retain a stopped process until the reaper marks it lost.
+
+The metrics have these meanings:
+
+| Metric | Owner and meaning | Labels |
+| --- | --- | --- |
+| `quarry_jobs_submitted_total` | API count of newly committed logical jobs | none |
+| `quarry_job_attempts_total` | Dispatcher count of newly committed terminal attempts | `job_type`, `outcome`, `error_code` |
+| `quarry_job_execution_duration_seconds` | Worker duration of one handler invocation | `job_type`, `outcome` |
+| `quarry_job_scheduling_delay_seconds` | Dispatcher claim time minus durable `available_at` | `job_type` |
+| `quarry_queue_depth` | PostgreSQL count of `queued` and `retry_wait` jobs | `status` |
+| `quarry_oldest_queued_job_age_seconds` | PostgreSQL age of the oldest currently eligible pending job | none |
+| `quarry_active_jobs` | PostgreSQL count of `running` jobs | none |
+| `quarry_active_workers` | PostgreSQL count of workers still marked `active` | none |
+| `quarry_lease_expirations_total` | Dispatcher count of committed expired attempts | `outcome` |
+| `quarry_retries_scheduled_total` | Dispatcher count of committed transitions to `retry_wait` | `reason` |
+| `quarry_stale_reports_total` | Dispatcher count of fenced attempt reports | none |
+| `quarry_dispatch_claim_size` | Dispatcher count of jobs in each successful acquisition result | none |
+| `quarry_worker_poll_errors_total` | Worker count of failed acquisition calls | `error_code` |
+
+The PostgreSQL collector may add one bounded health metric for snapshot-query success. A failed snapshot must not appear as a valid cached value.
+
+### Queue-health definitions
+
+- `quarry_queue_depth` reports separate `queued` and `retry_wait` values.
+- `quarry_oldest_queued_job_age_seconds` considers only jobs that are eligible at scrape time.
+- A future `retry_wait` job does not appear overdue before its `available_at` time.
+- PostgreSQL calculates age from its own current time.
+- Grafana uses `max`, not `sum`, for database snapshot gauges so future dispatcher replicas do not multiply one shared value.
+
+### Local observability infrastructure
+
+- Add pinned Prometheus, Grafana, OpenTelemetry Collector, and Jaeger images to Compose.
+- Do not use `latest` image tags.
+- Keep Go services on the host during Milestone 5.
+- Configure Prometheus to scrape the host API, dispatcher, and one demonstration worker.
+- Support Docker Desktop and Linux host access through `host.docker.internal` plus a host-gateway mapping.
+- Configure the Collector to receive OTLP traces and export them to Jaeger.
+- Provision the Prometheus Grafana datasource and the Quarry dashboard from committed files.
+- Do not require manual Grafana setup.
+- Defer API, dispatcher, and worker container images and full-system Compose startup to Milestone 7.
+
+## Slice 1: telemetry runtime and endpoints
+
+Status: complete
+
+### Goal
+
+Create the shared telemetry runtime, configuration, context-aware logging support, and Prometheus endpoints. Do not add job-specific instruments or spans yet.
+
+### Expected files and areas
+
+- new files under `internal/telemetry/`
+- `cmd/api/main.go` and tests
+- `cmd/dispatcher/main.go` and tests
+- `cmd/worker/main.go` and tests
+- `internal/api/handler.go`
+- `go.mod`
+- `go.sum`
+- `docs/current-status.md`
+- this execution plan
+
+### Dependencies
+
+- Prometheus Go client
+- OpenTelemetry API and SDK
+- OTLP trace exporter
+- official OpenTelemetry HTTP instrumentation
+- official OpenTelemetry gRPC instrumentation
+- existing `log/slog`, HTTP, gRPC, and process-shutdown code
+
+### Important decisions
+
+- Build one telemetry runtime per process.
+- Use a custom Prometheus registry instead of the package-global registry.
+- Register standard Go and process collectors explicitly.
+- Add the API `/metrics` route to the existing HTTP server.
+- Run metrics-only HTTP servers for dispatcher and worker.
+- Give metrics servers bounded read, write, idle, and shutdown timeouts.
+- Use a `slog.Handler` wrapper to add trace and span identifiers from `context.Context`.
+- Keep telemetry startup and shutdown explicit in each command.
+- Do not add job-specific metrics or tracing in this slice.
+
+### Validation required
+
+- telemetry configuration default and override tests
+- invalid telemetry configuration tests
+- registry isolation tests
+- metrics endpoint content tests
+- metrics server shutdown tests
+- tracer-provider shutdown tests
+- context-aware `slog` handler tests
+- existing command lifecycle regression tests
+- `go test -count=1 ./internal/telemetry ./cmd/api ./cmd/dispatcher ./cmd/worker`
+- `go test -race -count=1 ./internal/telemetry`
+- `go vet ./internal/telemetry ./cmd/api ./cmd/dispatcher ./cmd/worker`
+- `pwsh ./scripts/dev.ps1 check`
+- `git diff --check`
+
+### Milestone requirements satisfied
+
+- telemetry configuration foundation
+- Prometheus endpoint foundation
+- OpenTelemetry runtime foundation
+- trace identifiers in context-aware logs
+
+### Decisions and deviations discovered during implementation
+
+- The OTLP HTTP exporter defaults to `http://localhost:4318/v1/traces`. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` overrides the full trace endpoint, while `OTEL_EXPORTER_OTLP_ENDPOINT` supplies the base URL. Invalid endpoint URLs fail configuration before process startup.
+- The dispatcher metrics listener defaults to `:9464`. The worker listener defaults to an ephemeral port because local tests and normal development can run several workers on one host. `QUARRY_WORKER_METRICS_ADDR` can pin the demonstration worker to a Prometheus scrape port in Slice 6.
+- Trace-exporter shutdown failures produce a warning after application shutdown instead of changing successful application work into a process failure. Metrics listener startup and shutdown errors still fail the owning process because they indicate a local lifecycle error.
+- No architecture deviation was required. Job-specific metrics, HTTP and gRPC instrumentation, spans, trace persistence, and observability infrastructure remain deferred to their approved slices.
+
+### Validation evidence
+
+- `go test -count=1 ./internal/telemetry ./cmd/api ./cmd/dispatcher ./cmd/worker` passed on Windows.
+- `go vet ./internal/telemetry ./cmd/api ./cmd/dispatcher ./cmd/worker` passed on Windows.
+- Native Windows `go test -race` could not run because the installed Go toolchain has no CGO compiler. `docker run --rm -v "${PWD}:/src" -w /src golang:1.27.0-bookworm go test -race -count=1 ./internal/telemetry` passed on Linux.
+- `pwsh ./scripts/dev.ps1 check` passed after the worker metrics listener default changed from a fixed port to an ephemeral port. The command passed package tests, builds, static checks, generated-code checks, migration checks, the API smoke path, the multi-worker distributed test, crash recovery, and the Milestone 4 semantics process test.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
+
+## Slice 2: committed event metrics
+
+Status: complete
+
+### Goal
+
+Instrument submissions, claims, terminal attempts, retries, lease expiration, stale reports, handler duration, claim sizes, and worker poll errors.
+
+### Expected files and areas
+
+- `internal/telemetry/metrics.go` and tests
+- `internal/api/handler.go`
+- `internal/dispatcher/service.go`
+- `internal/dispatcher/reaper.go`
+- `internal/store/postgres/dispatcher_store.go`
+- `internal/worker/worker.go`
+- existing API, dispatcher, store, and worker tests
+- `docs/current-status.md`
+- this execution plan
+
+### Dependencies
+
+- Slice 1
+- existing durable attempt transitions
+- existing typed attempt outcomes and safe failure codes
+- existing worker acquisition and handler boundaries
+
+### Important decisions
+
+- Add typed committed-transition results only where exact metric ownership requires them.
+- Record submission metrics only for newly inserted logical jobs.
+- Do not count deduplicated replays as new jobs.
+- Record terminal attempt metrics only for newly applied transitions.
+- Keep exact repeated reports idempotent for both state and metrics.
+- Count a retry only when the committed job state becomes `retry_wait`.
+- Record handler duration after the handler returns, times out, or panics.
+- Map gRPC failures to bounded canonical codes for poll-error labels.
+- Keep metrics calls unable to return application errors.
+
+### Validation required
+
+- exact metric-family and label tests through a test registry
+- new submission versus deduplicated replay tests
+- repeated report does not double-count
+- retryable, permanent, exhausted, timeout, panic, cancellation, and success outcome tests
+- lease-expiry retry, dead-letter, and cancellation metric tests
+- stale-report metric tests
+- worker poll-error metric tests
+- handler-duration observation tests
+- claim-size tests for empty and non-empty successful acquisitions
+- `go test -count=1 ./internal/api ./internal/dispatcher ./internal/store/postgres/... ./internal/worker/...`
+- relevant worker and dispatcher race tests
+- `pwsh ./scripts/dev.ps1 check`
+- `git diff --check`
+
+### Milestone requirements satisfied
+
+- Prometheus event counters
+- Prometheus execution and scheduling histograms
+- attempt-outcome diagnosis
+- retry, lease, stale-report, claim, and worker-error visibility
+
+### Decisions and deviations discovered during implementation
+
+- PostgreSQL returns the scheduling delay from `statement_timestamp() - available_at` as part of the committed claim query. This keeps the measurement on the same database clock that controls eligibility.
+- Attempt-report and lease-recovery store methods return typed transition facts after commit. Exact repeated reports return `Applied: false`, so state and metrics remain idempotent.
+- Handler duration is observed once per completed invocation before report retries. Worker poll errors use lowercase canonical gRPC status codes.
+- Lease-expiration outcomes use the final durable job status. A retry is counted only for `retry_wait`, with `lease_expired` as the reason.
+- The expected file set expanded to the dispatcher SQL query and generated sqlc output because committed scheduling delay and job type must come from the durable transition. No architecture deviation was required.
+- PostgreSQL queue-health gauges, trace persistence and spans, dashboards, and observability infrastructure remain deferred to Slices 3 through 7.
+
+### Validation evidence
+
+- Exact metric-family and label tests, new versus deduplicated submission tests, idempotent repeated-report tests, all terminal outcome tests, lease-expiry outcome tests, stale-report tests, handler-duration tests, poll-error tests, and empty/non-empty claim-size tests passed in their owning packages.
+- `pwsh ./scripts/dev.ps1 generate-check` passed after regenerating the sqlc query output.
+- `go test -count=1 ./internal/telemetry ./internal/api ./internal/dispatcher ./internal/store/postgres/... ./internal/worker/...` passed on Windows, including real PostgreSQL transition and scheduling-delay tests.
+- `go vet ./internal/telemetry ./internal/api ./internal/dispatcher ./internal/store/postgres/... ./internal/worker/...` passed on Windows.
+- Native Windows race tests remain unavailable because the installed toolchain has no CGO compiler. `docker run --rm -v "${PWD}:/src" -w /src golang:1.27.0-bookworm go test -race -count=1 ./internal/telemetry ./internal/worker/...` passed on Linux. The focused dispatcher service and reaper race command also passed; package-wide dispatcher race execution was not used because its Testcontainers integration tests cannot start sibling containers from inside that container.
+- `pwsh ./scripts/dev.ps1 check` passed. It covered package tests, builds, static checks, generated-code checks, migrations, API smoke behavior, distributed execution, crash recovery, and shutdown semantics.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
+
+## Slice 3: PostgreSQL queue-health metrics
+
+Status: complete
+
+### Goal
+
+Expose authoritative queue depth, oldest eligible job age, running-job count, and active-worker count.
+
+### Expected files and areas
+
+- a new observability query under `internal/store/postgres/queries/`
+- generated sqlc code
+- PostgreSQL queue-snapshot adapter
+- Prometheus collector under `internal/telemetry/`
+- dispatcher command wiring and tests
+- real PostgreSQL integration tests
+- `docs/current-status.md`
+- this execution plan
+
+### Dependencies
+
+- Slice 1
+- existing job and worker state
+- sqlc
+- pgx
+- Testcontainers PostgreSQL support
+
+### Important decisions
+
+- Query all queue-health values from one PostgreSQL snapshot when practical.
+- Report separate `queued` and `retry_wait` queue-depth values.
+- Calculate oldest age only from currently eligible pending jobs.
+- Use PostgreSQL time for age calculations.
+- Report zero when no eligible pending job exists.
+- Preserve the existing worker liveness and lost-worker transition semantics.
+- Expose snapshot-query failure through one bounded collector-health metric.
+- Do not return stale cached database values as current gauges.
+
+### Validation required
+
+- empty queue produces zero gauges
+- queued and retry-wait jobs produce exact depth values
+- a future retry does not affect oldest eligible age
+- an eligible retry affects oldest eligible age
+- running jobs produce the exact active-job value
+- worker active-to-lost transition changes the active-worker value
+- collector query failure does not panic or stop dispatcher work
+- real PostgreSQL concurrency does not produce inconsistent negative values
+- `go test -count=1 ./internal/telemetry ./internal/store/postgres/... ./cmd/dispatcher`
+- `pwsh ./scripts/dev.ps1 generate-check`
+- `pwsh ./scripts/dev.ps1 check`
+- `git diff --check`
+
+### Milestone requirements satisfied
+
+- queue-health Prometheus gauges
+- database-authoritative operational diagnosis
+- queue-health part of the Milestone 5 definition of done
+
+### Decisions and deviations discovered during implementation
+
+- One SQL statement returns queued, retry-wait, running-job, active-worker, and oldest-eligible-age values from one PostgreSQL statement snapshot.
+- Queue depth includes all durable `queued` and `retry_wait` jobs. Oldest age includes only jobs whose `available_at` is not in the future and returns zero when none are eligible.
+- Active-worker count uses the durable worker state. The collector does not mark workers lost, so the existing reaper remains the owner of the active-to-lost transition.
+- A failed or timed-out snapshot emits `quarry_queue_snapshot_up` with value zero and omits the database gauges. The collector uses no cache and cannot report an old snapshot as current.
+- The dispatcher owns the adapter between PostgreSQL and the shared telemetry collector. This keeps the API and worker telemetry runtime independent of PostgreSQL types.
+- No schema migration or architecture deviation was required. Durable trace context, spans, dashboards, and observability infrastructure remain deferred to Slices 4 through 7.
+
+### Validation evidence
+
+- `go test -count=1 ./internal/telemetry ./internal/store/postgres/... ./cmd/dispatcher` passed. The PostgreSQL tests covered empty values, exact queued and retry-wait depth, future and eligible retry ages, running jobs, active-to-lost worker state, and concurrent snapshots with no negative values.
+- Collector tests verified exact metric values and labels. A query failure emitted only `quarry_queue_snapshot_up 0` and did not panic or expose stale gauges.
+- `go vet ./internal/telemetry ./internal/store/postgres/... ./cmd/dispatcher` passed.
+- `pwsh ./scripts/dev.ps1 generate-check` passed.
+- `go list -deps ./cmd/worker` contained no `internal/store/postgres` dependency after the dispatcher adapter was added.
+- `pwsh ./scripts/dev.ps1 check` passed. It covered package tests, builds, static checks, generated-code checks, migrations, API smoke behavior, distributed execution, crash recovery, and shutdown semantics.
+- `git diff --check` passed.
+- Docker Desktop was initially stopped. After it started, the required real PostgreSQL validation passed without a code workaround.
+- GitHub-hosted CI was not run.
+
+## Slice 4: durable trace-context contract
+
+Status: complete
+
+### Goal
+
+Persist the submission trace context and carry it through PostgreSQL, the dispatcher, and the worker contract without enabling the complete trace path yet.
+
+### Expected files and areas
+
+- new migration `internal/store/postgres/migrations/00008_add_job_traceparent.sql`
+- `internal/store/postgres/queries/jobs.sql`
+- `internal/store/postgres/queries/dispatcher.sql`
+- generated sqlc code
+- `internal/store/postgres/job_store.go`
+- `internal/store/postgres/dispatcher_store.go`
+- `proto/quarry/dispatcher/v1/dispatcher.proto`
+- generated Protocol Buffer and gRPC code
+- `internal/dispatcher/service.go`
+- `internal/worker/grpc_client.go`
+- `internal/worker/worker.go`
+- migration, store, contract, dispatcher, and client tests
+- `docs/current-status.md`
+- this execution plan
+
+### Dependencies
+
+- Slice 1 trace propagation helper
+- existing submission and idempotency behavior
+- existing claim transaction and `AcquiredJob` path
+- Goose
+- sqlc
+- Buf
+- real PostgreSQL integration tests
+
+### Important decisions
+
+- Add one nullable `jobs.traceparent` column.
+- Store only a valid W3C `traceparent` value.
+- Leave the column null when no valid trace context exists.
+- Preserve the first submission's trace context during an idempotent replay.
+- Return the stored value from the atomic claim query.
+- Carry it in one new `AcquiredJob` field.
+- Treat the field as opaque metadata until the worker telemetry boundary extracts it.
+- Keep workflow, scheduling, and database details out of the RPC.
+
+### Validation required
+
+- migration apply, rollback, and reapplication
+- valid submission context persists
+- missing or invalid context persists as null
+- idempotent replay preserves the original context
+- claim returns the stored context
+- Protocol Buffer round-trip tests
+- gRPC service and client mapping tests
+- invalid acquired context does not corrupt worker state
+- `go test -count=1 ./internal/store/postgres/... ./internal/dispatcher ./internal/worker ./internal/rpc`
+- `pwsh ./scripts/dev.ps1 migration-test`
+- `pwsh ./scripts/dev.ps1 generate-check`
+- `pwsh ./scripts/dev.ps1 check`
+- `git diff --check`
+
+### Milestone requirements satisfied
+
+- trace-context persistence across asynchronous job execution
+- execution contract needed by the required trace demonstration
+
+### Decisions and deviations discovered during implementation
+
+- The Slice 4 dependency list referred to a Slice 1 propagation helper, but Slice 1 had intentionally deferred propagation. Slice 4 added the small helper needed to serialize and validate canonical W3C `traceparent` values.
+- Migration 8 adds a nullable `jobs.traceparent` column and a PostgreSQL check constraint for canonical version-00 values with nonzero trace and parent identifiers. Existing rows remain null.
+- `JobStore.SubmitJob` derives `traceparent` from the OpenTelemetry span context. Missing or invalid contexts become SQL null.
+- Idempotent replay still uses `DO NOTHING`, so a later request cannot replace the first submission's trace context.
+- The atomic claim query returns `traceparent` with the claimed row. The dispatcher carries it through the existing `AcquiredJob` contract and Protocol Buffer field 6.
+- The worker client validates the acquired value. It clears invalid metadata without rejecting or changing the rest of the job.
+- The worker stores the value as opaque job metadata. HTTP and gRPC instrumentation, span creation, worker context extraction, and lifecycle trace logs remain deferred to Slice 5.
+- No architecture deviation was required.
+
+### Validation evidence
+
+- Telemetry tests passed for canonical serialization, missing and invalid contexts, zero identifiers, and noncanonical input.
+- The real PostgreSQL test passed for valid, missing, and invalid submission contexts, first-writer idempotency, and atomic claim transport.
+- Protocol Buffer round-trip, dispatcher mapping, worker client mapping, and invalid acquired-context tests passed.
+- `go test -count=1 ./internal/store/postgres/... ./internal/dispatcher ./internal/worker ./internal/rpc` passed.
+- `pwsh ./scripts/dev.ps1 migration-test` passed migration apply, rollback, and reapplication through version 8. It also verified null backfill plus valid and invalid database values.
+- `pwsh ./scripts/dev.ps1 generate-check` passed for sqlc and Protocol Buffer output.
+- `go vet ./internal/telemetry ./internal/store/postgres/... ./internal/dispatcher ./internal/worker ./internal/rpc` passed.
+- `pwsh ./scripts/dev.ps1 check` passed. It covered package tests, builds, static checks, generated-code checks, migrations, API smoke behavior, distributed execution, crash recovery, and shutdown semantics.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
+
+## Slice 5: end-to-end tracing and lifecycle logs
+
+Status: complete
+
+### Goal
+
+Produce one connected trace from HTTP submission through persistence, claim, worker execution, handler invocation, outcome reporting, and durable completion. Add consistent identifiers to lifecycle logs.
+
+### Expected files and areas
+
+- tracing support under `internal/telemetry/`
+- `cmd/api/main.go`
+- `cmd/dispatcher/main.go`
+- `cmd/worker/main.go`
+- `internal/api/handler.go`
+- `internal/api/logging.go`
+- `internal/store/postgres/job_store.go`
+- `internal/store/postgres/dispatcher_store.go`
+- `internal/dispatcher/service.go`
+- `internal/dispatcher/reaper.go`
+- `internal/worker/worker.go`
+- HTTP, gRPC, store, worker, tracing, and logging tests
+- `docs/current-status.md`
+- this execution plan
+
+### Dependencies
+
+- Slices 1 and 4
+- official OpenTelemetry HTTP instrumentation
+- official OpenTelemetry gRPC instrumentation
+- OpenTelemetry in-memory span recorder for tests
+- existing process contexts and attempt-lifetime contexts
+
+### Important decisions
+
+- Instrument inbound HTTP and both sides of gRPC.
+- Add manual spans for `db.insert_job`, `dispatcher.claim`, `worker.execute`, `handler`, and `db.complete_attempt`.
+- Start each `dispatcher.claim` span from its stored trace parent after the claim transaction commits.
+- Inject the new per-job context into the acquired job.
+- Start the worker attempt context from the acquired job context.
+- Let report RPC instrumentation carry the attempt context back to the dispatcher.
+- Add `job.id`, `job.type`, `job.attempt`, `worker.id`, and `job.outcome` trace attributes where available.
+- Add lifecycle logs for claim, attempt start, completion, retry scheduling, stale report, cancellation, and lease recovery.
+- Keep payloads, idempotency keys, raw trace headers, and unsafe errors out of logs and span attributes.
+
+### Validation required
+
+- in-memory exporter proves the representative spans share one trace ID
+- parentage crosses the persisted asynchronous boundary
+- one batch containing jobs from different traces preserves separate trace IDs
+- worker execution and handler spans use the matching job trace
+- report and database-completion spans remain under the attempt trace
+- required trace attributes appear on the correct spans
+- logs contain available job, attempt, worker, trace, outcome, and safe failure identifiers
+- unsafe payload, handler error, and idempotency values do not appear in logs or trace attributes
+- focused HTTP, gRPC, worker, and real PostgreSQL integration tests
+- relevant worker and dispatcher race tests
+- `pwsh ./scripts/dev.ps1 check`
+- `git diff --check`
+
+### Milestone requirements satisfied
+
+- OpenTelemetry tracing
+- required end-to-end trace path in code
+- structured identifiers in logs
+- single-job inspection foundation
+
+### Decisions and deviations discovered during implementation
+
+- Telemetry remains component-local: HTTP and gRPC instrumentation receive the process tracer provider explicitly instead of depending on OpenTelemetry global state.
+- A multi-job claim transaction can commit jobs from unrelated persisted traces. The dispatcher therefore starts each `dispatcher.claim` span only after commit from that job's stored parent, creates a child `db.claim_job` span to record the committed database handoff, and injects the claim span into the returned job. `db.claim_job` does not claim to measure the shared transaction because assigning that transaction to one job trace would produce false parentage.
+- The worker keeps `worker.execute` open through the acknowledged report. It copies that span context onto the uncancelled attempt context for reporting so a handler cancellation or deadline cannot prevent the durable outcome report while the report RPC remains in the attempt trace.
+- Lifecycle logs contain bounded identifiers, outcomes, and safe failure codes. Handler error messages, panic values and stacks, payloads, idempotency keys, and raw trace headers are omitted. Lease-recovery transitions now carry the existing job ID, attempt number, and persisted trace parent to the reaper for correlated logs; no schema change was required.
+- Official OpenTelemetry HTTP and gRPC instrumentation were added at the process boundaries. No architecture deviation was required, and Slice 6 infrastructure remains deferred.
+
+### Validation evidence
+
+- In-memory span-recorder tests passed for inbound HTTP, both gRPC sides, persisted asynchronous parentage, mixed-trace claim batches, worker and handler parentage, report context, PostgreSQL completion, and required span attributes.
+- Lifecycle-log tests passed for submission, claim, attempt start and acknowledgement, committed completion, retry scheduling, stale reports, cancellation, panic handling, and lease recovery. The tests verify that handler-controlled errors, panic details, payload values, and raw trace headers are absent.
+- `go test -count=1 ./internal/telemetry ./internal/api ./internal/dispatcher ./internal/store/postgres/... ./internal/worker/... ./cmd/api ./cmd/dispatcher ./cmd/worker` passed on Windows, including real PostgreSQL tests.
+- `go vet ./internal/telemetry ./internal/api ./internal/dispatcher ./internal/store/postgres/... ./internal/worker/... ./cmd/api ./cmd/dispatcher ./cmd/worker` passed on Windows.
+- Native Windows race tests remain unavailable because the installed Go toolchain has no CGO compiler. `docker run --rm -v "${PWD}:/src" -w /src golang:1.27.0-bookworm go test -race -count=1 ./internal/telemetry ./internal/worker ./internal/dispatcher -run "Test(AcquireJobsContinuesEachPersistedTraceIndependently|ReportAttemptLogsSafeCommittedLifecycleIdentifiers|ReaperRecordsCommittedRecoveryOutcomes|HTTPAndGRPCInstrumentationPreserveContext|WorkerContinuesAcquiredTraceThroughHandlerAndReport|WorkerRecoversPanicLogsSafeIdentifiersAndContinues)$"` passed on Linux. A broader package-level race invocation was not usable because dispatcher integration tests attempted to start Testcontainers from inside that container; those real PostgreSQL tests passed in the Windows focused suite and full check.
+- `pwsh ./scripts/dev.ps1 check` passed after the final implementation and test changes. It passed package tests, builds, static and generated-code checks, migration checks, the API smoke path, multi-worker distributed execution, crash recovery, and the Milestone 4 semantics process test.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
+
+## Slice 6: Prometheus, Grafana, Collector, and Jaeger
+
+Status: complete
+
+### Goal
+
+Run the local observability infrastructure and provision a useful Quarry Grafana dashboard.
+
+### Expected files and areas
+
+- `compose.yaml`
+- new Prometheus configuration under `deploy/observability/`
+- new OpenTelemetry Collector configuration under `deploy/observability/`
+- Grafana datasource provisioning
+- Grafana dashboard provisioning
+- Quarry dashboard JSON
+- Jaeger service configuration
+- `scripts/dev.ps1` infrastructure commands
+- configuration validation tests
+- `docs/current-status.md`
+- this execution plan
+
+### Dependencies
+
+- Slices 1 through 5
+- pinned Prometheus image
+- pinned Grafana image
+- pinned OpenTelemetry Collector image
+- pinned Jaeger image
+- Docker Compose
+
+### Important decisions
+
+- Pin compatible image versions and document them in Compose.
+- Do not add application images.
+- Run the Go services on the host.
+- Scrape the API, dispatcher, and one demonstration worker through the host gateway.
+- Provision the Prometheus datasource and dashboard from committed files.
+- Export Collector traces to Jaeger.
+- Use `max` for shared PostgreSQL snapshot gauges.
+- Include panels for queue depth, oldest eligible age, active jobs, active workers, submissions, attempt outcomes, scheduling delay, execution duration, retries, lease expirations, stale reports, claim size, and worker poll errors.
+- Keep every dashboard query free of unbounded labels.
+
+### Validation required
+
+- `docker compose config --quiet`
+- Prometheus configuration validation
+- Collector configuration startup
+- Grafana health check
+- Grafana datasource provisioning check
+- Grafana dashboard provisioning check
+- Jaeger health and trace-ingestion check
+- Prometheus reports the three Go service targets healthy
+- infrastructure shutdown and cleanup verification
+- `git diff --check`
+
+### Milestone requirements satisfied
+
+- Prometheus infrastructure
+- Grafana dashboard
+- OpenTelemetry Collector
+- Jaeger
+- local telemetry configuration
+- visual queue-health diagnosis
+
+### Decisions and deviations discovered during implementation
+
+- Compose pins Prometheus 3.12.0, Grafana 13.1.0, OpenTelemetry Collector Contrib 0.153.0, and Jaeger 2.20.0. Registry manifests and real container startup confirmed each image.
+- Prometheus uses static `host.docker.internal` targets for the host-run API on port 8080, dispatcher on port 9464, and one demonstration worker on port 9465. The Compose `host-gateway` mapping also supports Docker Engine on Linux.
+- The Collector accepts OTLP over HTTP and gRPC, exposes its health extension, batches traces, and exports OTLP over the private Compose network to Jaeger. Jaeger uses its built-in all-in-one configuration and transient in-memory storage.
+- Grafana provisions a read-only Prometheus datasource and the committed `quarry-overview` dashboard. Anonymous viewer access keeps the local development stack usable without stored credentials.
+- The dashboard contains 13 panels for every metric group required by this slice. PostgreSQL snapshot gauges use `max`; counters and histograms aggregate only bounded labels.
+- `observability-config-test` validates Compose, Prometheus, the Collector, and committed dashboard wiring. `observability-up` starts the four services and waits for their HTTP health endpoints. `observability-down` removes only the four observability containers and does not remove PostgreSQL data.
+- No application images, durable state, schema changes, or architecture deviations were added. The submitted-job demonstration and user-facing observability documentation remain deferred to Slice 7.
+
+### Validation evidence
+
+- `pwsh ./scripts/dev.ps1 observability-config-test` passed. `docker compose config --quiet`, Prometheus `promtool check config`, Collector `validate`, and `go test -count=1 ./deploy/observability` all passed.
+- `pwsh ./scripts/dev.ps1 observability-up` started pinned Prometheus, Grafana, Collector, and Jaeger containers. Docker reported all four containers healthy, and the command reached each service health endpoint.
+- Grafana's HTTP API returned the provisioned `quarry-prometheus` datasource and the `quarry-overview` dashboard with 13 panels. A browser check confirmed that the dashboard rendered the queue gauges and readable three-panel metric rows.
+- Prometheus reported `quarry-api`, `quarry-dispatcher`, and `quarry-worker` healthy while the three real Go services ran on the committed host ports.
+- An OTLP/HTTP trace sent to the Collector appeared under the expected trace ID in Jaeger's HTTP API. This proved Collector-to-Jaeger trace ingestion without bypassing the Collector.
+- `observability-down` plus `db-down` removed the validation containers and Compose network. No validation service port remained open. The PostgreSQL data volume was preserved.
+- `pwsh ./scripts/dev.ps1 check` passed after the final dashboard change. It covered package tests, builds, static and generated-code checks, native observability configuration checks, migrations, API smoke behavior, distributed execution, crash recovery, and shutdown semantics.
+- `git diff --check` passed.
+- GitHub-hosted CI was not run.
+
+## Slice 7: observability demonstration and documentation
+
+Status: complete
+
+### Goal
+
+Add one rerunnable command that proves the Milestone 5 workflow without manual PostgreSQL inspection, then document how to use it.
+
+### Expected files and areas
+
+- `scripts/dev.ps1`
+- process-test helpers
+- focused observability integration tests
+- `README.md`
+- `docs/current-status.md`
+- this execution plan
+
+### Dependencies
+
+- Slices 1 through 6
+- existing process-test and cleanup helpers
+- public Quarry HTTP API
+- Prometheus HTTP API
+- Grafana HTTP API
+- Jaeger HTTP API
+
+### Important decisions
+
+- Add `pwsh ./scripts/dev.ps1 observability-test`.
+- Start isolated PostgreSQL and observability infrastructure.
+- Start real API, dispatcher, and worker processes with telemetry enabled.
+- Submit one deterministic job through the public API.
+- Verify completion through the public API.
+- Verify the required metric families and queue-health values through Prometheus.
+- Find the job trace in Jaeger by `job.id`.
+- Require spans for submission, persistence, claim, worker execution, handler execution, report, and completion.
+- Verify that Grafana provisioned the Quarry dashboard.
+- Add `observability-test` to `check` only after two consecutive standalone passes.
+- Do not collect benchmark throughput, load-test latency percentiles, recovery measurements, or benchmark output.
+
+### Validation required
+
+- `pwsh ./scripts/dev.ps1 observability-test` twice
+- `pwsh ./scripts/dev.ps1 check`
+- relevant Linux race-detector command for worker and dispatcher concurrency
+- process, container, network, volume, and temporary-file cleanup checks
+- `git diff --check`
+- `git status --short`
+
+### Milestone requirements satisfied
+
+- required submitted-job trace demonstration
+- queue health without direct PostgreSQL inspection
+- one-job inspection through the API, logs, and Jaeger
+- documented telemetry configuration
+- complete Milestone 5 definition of done, subject to the separate audit
+
+### Decisions and deviations discovered during implementation
+
+- `observability-test` uses a unique Compose project, an isolated PostgreSQL volume, and random host ports for PostgreSQL and the observability services. The API, dispatcher, and worker use ports 8080, 9090, 9464, and 9465 because the committed Prometheus configuration must scrape stable host targets. The command checks those ports before startup and fails with the conflicting port number.
+- The command captures the three process log streams in memory. It verifies the job ID in submission, claim, start, completion, and report-acknowledgement records, then connects those records to the Jaeger trace ID and succeeded outcome. It does not persist payloads or temporary logs.
+- The successful job exposes the metric families that the command verifies through Prometheus. Retry, lease-expiry, and worker-poll-error vectors do not produce Prometheus metadata until those events occur, so their definition and labels remain covered by the existing metric and configuration tests rather than synthetic failure events in this one-job demonstration.
+- The live OpenTelemetry HTTP server span is named `POST`; `http.request` is the instrumentation operation passed by the API before HTTP route-method naming. The Jaeger assertion follows the exported live span and still requires the full persistence, claim, worker, handler, report, and completion path.
+- After two consecutive standalone passes, `observability-test` was added to the canonical `check` command. No database inspection, benchmark, load generator, recovery measurement, or later-milestone behavior was added.
+
+### Validation evidence
+
+- `pwsh ./scripts/dev.ps1 observability-test` passed twice consecutively after the final test corrections. The runs verified jobs `f0736306-a3ae-44f2-abbf-e47ac1ea7b3f` and `83d446a7-ba10-4e96-9996-a30661731367`, with complete Jaeger traces `8ee81d33bc1d8901959a380dcd1a101c` and `efa644c114d20adebfda6bb74c571919`.
+- Both standalone runs verified one succeeded `demo.echo` job and attempt through the public API, all three Prometheus targets, the success-path metric families, zero pending and active jobs, one active worker, a healthy queue snapshot, the 13-panel Grafana dashboard, the required structured lifecycle logs, and the complete job trace in Jaeger.
+- Both standalone runs removed their host processes, temporary binaries, five containers, Compose network, and PostgreSQL volume. The cleanup assertions found no remaining resource labeled with the unique Compose project.
+- `pwsh ./scripts/dev.ps1 check` passed with `observability-test` included. Its observability run verified job `05bcdebc-1e3d-4250-b5ed-53d4a0416e2a` and trace `3f24e6dfcf6498f8976c2ee4606a1491`, then the full check passed package tests, builds, static and generated-code checks, observability configuration, migrations, the API smoke path, multi-worker distributed execution, crash recovery, and shutdown semantics.
+- `docker run --rm -v "${PWD}:/src" -w /src golang:1.27.0-bookworm go test -race -count=1 ./internal/telemetry ./internal/worker ./internal/dispatcher -run "Test(AcquireJobsContinuesEachPersistedTraceIndependently|ReportAttemptLogsSafeCommittedLifecycleIdentifiers|ReaperRecordsCommittedRecoveryOutcomes|HTTPAndGRPCInstrumentationPreserveContext|WorkerContinuesAcquiredTraceThroughHandlerAndReport|WorkerRecoversPanicLogsSafeIdentifiersAndContinues)$"` passed on Linux.
+- `git diff --check` passed after the implementation and documentation changes.
+- `git status --short` showed only the four expected Slice 7 files: `scripts/dev.ps1`, `README.md`, this execution plan, and `docs/current-status.md`.
+- GitHub-hosted CI was not run.
+
+## Milestone audit
+
+Status: complete
+
+### Findings
+
+- All Milestone 5 build requirements are present in the implementation: 13 Prometheus metric families, PostgreSQL queue-health gauges, OpenTelemetry HTTP and gRPC tracing, persisted W3C `traceparent`, structured lifecycle identifiers, pinned local observability services, a provisioned Grafana dashboard, and documented telemetry configuration.
+- Metric inspection found bounded labels only. Submission and queue metrics omit job type. Attempt and execution job types come from a worker's finite handler registry. Error labels use stable codes. Job IDs, worker IDs, idempotency keys, messages, payloads, URLs, and arbitrary input do not appear as metric labels.
+- Submission, claim, attempt, retry, lease-expiry, and stale-report metrics run only after the owning operation commits or completes. Repeated identical reports return `Applied: false` and do not increment terminal-attempt or retry counters. The worker records handler duration once before any report retry.
+- `GetQueueSnapshot` uses one PostgreSQL statement timestamp. It separates `queued` and `retry_wait`, excludes future work from oldest-eligible age, reports zero for an empty eligible queue, and reads running jobs and active workers from durable state. Collector failure emits only `quarry_queue_snapshot_up 0`; it does not return cached gauges.
+- Trace inspection found one parent chain across HTTP submission, `db.insert_job`, each post-commit `dispatcher.claim`, `db.claim_job`, `worker.execute`, `handler`, the report RPC, and `db.complete_attempt`. Mixed acquisition batches continue each stored trace separately. An idempotent replay preserves the first trace parent.
+- Lifecycle logs contain job, attempt, worker, trace, outcome, and safe failure identifiers where available. Tests and live output show that payloads, idempotency keys, raw trace headers, handler-controlled error details, and panic values do not appear.
+- Prometheus scrapes the API, dispatcher, and demonstration worker. Grafana provisions the Prometheus datasource and 13-panel dashboard. Shared PostgreSQL gauges use `max`. The Collector exports OTLP traces to Jaeger.
+- The audit found two missing process-level proofs. `observability-test` inspected only a successful trace and did not stop the Collector during application work. The audit extended the command with a two-attempt timeout trace and a successful job after Collector shutdown. No runtime architecture or database behavior changed.
+- No Milestone 6 load generator, benchmark, benchmark data, benchmark documentation, acknowledgement-loss injection, application image, or Kubernetes resource exists.
+
+### Validation evidence
+
+- `pwsh ./scripts/dev.ps1 observability-test` passed after the audit fix. It verified success trace `180375e0c9bb79e8a25a493f43d6aac6`, two-attempt timeout trace `9bbc97e6f87944b234aee7b03619cff9`, public job and attempt state, structured logs, success and retry metrics, queue-health gauges, three healthy Prometheus targets, the provisioned Grafana dashboard, and Jaeger spans. It then stopped the Collector and proved that another job still succeeded. Cleanup removed every temporary process, binary, container, network, and volume.
+- `go test -count=1 ./internal/telemetry ./internal/api ./internal/dispatcher ./internal/store/postgres/... ./internal/worker/... ./cmd/api ./cmd/dispatcher ./cmd/worker ./deploy/observability` passed, including real PostgreSQL tests.
+- `pwsh ./scripts/dev.ps1 generate-check` passed.
+- `pwsh ./scripts/dev.ps1 migration-test` passed against real PostgreSQL.
+- `docker run --rm -v "${PWD}:/src" -w /src golang:1.27.0-bookworm go test -race -count=1 ./internal/telemetry ./internal/worker ./internal/dispatcher -run "Test(AcquireJobsContinuesEachPersistedTraceIndependently|ReportAttemptLogsSafeCommittedLifecycleIdentifiers|ReaperRecordsCommittedRecoveryOutcomes|HTTPAndGRPCInstrumentationPreserveContext|WorkerContinuesAcquiredTraceThroughHandlerAndReport|WorkerRecoversPanicLogsSafeIdentifiersAndContinues)$"` passed on Linux.
+- `pwsh ./scripts/dev.ps1 check` passed with the expanded process proof. Its live observability run verified success trace `8f7dc26ce5b148a1777d503abaa0ace6`, two-attempt timeout trace `37530487a0a7690b146145c91307ff72`, and Collector failure isolation. The command also passed package tests, builds, static and generated-code checks, observability configuration validation, migrations, API smoke behavior, distributed execution, crash recovery, shutdown semantics, and cleanup.
+- `git diff --check` passed after the implementation, documentation, status, and execution-plan changes.
+- GitHub-hosted CI was not run.
+
+After every slice is complete, perform a separate audit against `docs/project-plan.md`. Completed slice statuses are not proof that the milestone is complete.
+
+The audit must:
+
+- compare the implementation with the complete observability section and Milestone 5 definition of done,
+- inspect every metric's meaning and labels for cardinality, stale values, or double counting,
+- inspect a real successful job trace,
+- inspect at least one retry or lease-expiry trace,
+- verify the trace parentage across persistence and batch acquisition,
+- verify that telemetry failures cannot change job state,
+- verify that logs contain safe structured identifiers and no unsafe values,
+- verify queue diagnosis through Prometheus and Grafana without direct PostgreSQL inspection,
+- verify one-job inspection through the public API, logs, and Jaeger,
+- run `pwsh ./scripts/dev.ps1 observability-test`,
+- run `pwsh ./scripts/dev.ps1 check`,
+- run relevant race tests,
+- run generated-code and migration checks,
+- inspect the diff for unnecessary scope,
+- confirm that no Milestone 6 load generator, benchmark, benchmark data, benchmark documentation, or acknowledgement-loss fault injection exists,
+- record all observed evidence in this plan and `docs/current-status.md`.
+
+Only after the audit passes:
+
+- mark Milestone 5 complete in `docs/current-status.md`,
+- move this file to `docs/exec-plans/completed/milestone-5.md`.

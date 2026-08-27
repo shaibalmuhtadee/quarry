@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -59,6 +60,55 @@ func (check readinessCheckerFunc) Ping(ctx context.Context) error {
 func newTestHandler(store api.JobStore) http.Handler {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return api.NewHandler(store, readinessCheckerFunc(func(context.Context) error { return nil }), logger)
+}
+
+type submissionMetricRecorder struct {
+	count int
+}
+
+func (metrics *submissionMetricRecorder) JobSubmitted() {
+	metrics.count++
+}
+
+func TestCreateJobCountsOnlyNewSubmission(t *testing.T) {
+	createdAt := time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC)
+	var stored domain.Job
+	calls := 0
+	store := &fakeJobStore{
+		submitJob: func(_ context.Context, submission domain.JobSubmission) (domain.JobSubmissionResult, error) {
+			calls++
+			if calls == 1 {
+				stored = jobFromSubmission(submission, createdAt)
+				return domain.JobSubmissionResult{Job: stored}, nil
+			}
+			return domain.JobSubmissionResult{Job: stored, Deduplicated: true}, nil
+		},
+	}
+	metrics := &submissionMetricRecorder{}
+	handler := api.NewHandlerWithMetrics(
+		store,
+		readinessCheckerFunc(func(context.Context) error { return nil }),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		http.NotFoundHandler(),
+		metrics,
+	)
+
+	for range 2 {
+		request := httptest.NewRequest(
+			http.MethodPost,
+			"/v1/jobs",
+			strings.NewReader(`{"type":"email.send","payload":{},"timeout_ms":30000}`),
+		)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusCreated && response.Code != http.StatusOK {
+			t.Fatalf("response status = %d: %s", response.Code, response.Body.String())
+		}
+	}
+
+	if metrics.count != 1 {
+		t.Fatalf("submitted metric count = %d, want 1", metrics.count)
+	}
 }
 
 func TestCreateJobUsesDefaultsAndReturnsCreatedJob(t *testing.T) {
@@ -472,6 +522,35 @@ func TestCancelJobReturnsStoredCancellationState(t *testing.T) {
 			assertJSONField(t, fields, "status", string(job.Status))
 			assertJSONField(t, fields, "cancel_requested_at", requestedAt.Format(time.RFC3339Nano))
 		})
+	}
+}
+
+func TestCancelJobLogsSafeLifecycleIdentifiers(t *testing.T) {
+	job := testJob(t)
+	job.Status = domain.JobStatusCancelled
+	store := &fakeJobStore{requestCancellation: func(context.Context, domain.JobID) (domain.Job, error) {
+		return job, nil
+	}}
+	var logs bytes.Buffer
+	handler := api.NewHandler(
+		store,
+		readinessCheckerFunc(func(context.Context) error { return nil }),
+		slog.New(slog.NewTextHandler(&logs, nil)),
+	)
+	request := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID.String()+"/cancel", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("response status = %d: %s", response.Code, response.Body.String())
+	}
+	output := logs.String()
+	for _, value := range []string{"job cancellation requested", job.ID.String(), job.Type.String(), "cancelled"} {
+		if !strings.Contains(output, value) {
+			t.Fatalf("cancellation log lacks %q: %s", value, output)
+		}
+	}
+	if strings.Contains(output, "omitted") {
+		t.Fatalf("cancellation log exposed payload: %s", output)
 	}
 }
 

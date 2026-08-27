@@ -13,23 +13,38 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
 	postgresdb "github.com/shaibalmuhtadee/quarry/internal/store/postgres/generated"
+	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type JobStore struct {
 	pool    *pgxpool.Pool
 	queries *postgresdb.Queries
+	tracer  trace.Tracer
 }
 
 func NewJobStore(pool *pgxpool.Pool) *JobStore {
-	return &JobStore{pool: pool, queries: postgresdb.New(pool)}
+	return NewJobStoreWithTracer(pool, trace.NewNoopTracerProvider().Tracer("quarry/store/postgres"))
+}
+
+func NewJobStoreWithTracer(pool *pgxpool.Pool, tracer trace.Tracer) *JobStore {
+	return &JobStore{pool: pool, queries: postgresdb.New(pool), tracer: tracer}
 }
 
 func (store *JobStore) SubmitJob(ctx context.Context, submission domain.JobSubmission) (domain.JobSubmissionResult, error) {
+	ctx, span := store.tracer.Start(ctx, "db.insert_job", trace.WithAttributes(
+		attribute.String("job.id", submission.ID().String()),
+		attribute.String("job.type", submission.Type().String()),
+	))
+	defer span.End()
+
 	var idempotencyKey pgtype.Text
 	requestHash, idempotent := submission.RequestHash()
 	if key, ok := submission.IdempotencyKey(); ok {
 		idempotencyKey = pgtype.Text{String: key.String(), Valid: true}
 	}
+	traceparentValue, hasTraceparent := telemetry.TraceParentFromContext(ctx)
 	row, err := store.queries.SubmitJob(ctx, postgresdb.SubmitJobParams{
 		ID:             submission.ID().UUID(),
 		JobType:        submission.Type().String(),
@@ -38,6 +53,10 @@ func (store *JobStore) SubmitJob(ctx context.Context, submission domain.JobSubmi
 		TimeoutMs:      submission.Timeout().Milliseconds(),
 		IdempotencyKey: idempotencyKey,
 		RequestHash:    requestHash,
+		Traceparent: pgtype.Text{
+			String: traceparentValue,
+			Valid:  hasTraceparent,
+		},
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		if !idempotent {
