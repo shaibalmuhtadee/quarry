@@ -4,7 +4,7 @@ param(
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
         "generate", "generate-check", "format-check", "vet", "build",
-        "smoke-test", "distributed-test", "recovery-test", "semantics-test",
+        "smoke-test", "distributed-test", "recovery-test", "ack-loss-test", "failure-test", "semantics-test",
         "observability-config-test", "observability-test", "observability-up", "observability-down"
     )]
     [string]$Command = "check"
@@ -937,8 +937,11 @@ ORDER BY job_attempts.attempt_no;
     }
 }
 
-function Assert-RecoveryCleanup {
+function Assert-ProcessTestCleanup {
     param(
+        [Parameter(Mandatory)]
+        [string]$TestName,
+
         [Parameter(Mandatory)]
         [string]$ComposeProject,
 
@@ -950,11 +953,11 @@ function Assert-RecoveryCleanup {
     )
 
     if (Test-Path -LiteralPath $TemporaryDirectory) {
-        throw "Recovery-test temporary directory still exists: $TemporaryDirectory"
+        throw "$TestName temporary directory still exists: $TemporaryDirectory"
     }
     foreach ($processID in $ProcessIDs) {
         if ($null -ne (Get-Process -Id $processID -ErrorAction SilentlyContinue)) {
-            throw "Recovery-test process $processID is still running."
+            throw "$TestName process $processID is still running."
         }
     }
     $containers = @(Invoke-Docker -Arguments @(
@@ -967,7 +970,7 @@ function Assert-RecoveryCleanup {
         "volume", "ls", "--quiet", "--filter", "label=com.docker.compose.project=$ComposeProject"
     ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($containers.Count -ne 0 -or $networks.Count -ne 0 -or $volumes.Count -ne 0) {
-        throw "Recovery-test Compose resources remain after cleanup."
+        throw "$TestName Compose resources remain after cleanup."
     }
 }
 
@@ -1390,6 +1393,7 @@ ORDER BY jobs.id, attempts.attempt_no;
 
 function Test-SemanticsProcesses {
     $testID = [Guid]::NewGuid().ToString("N")
+    $sleepDurationMilliseconds = 6000
     $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "quarry-semantics-$testID"
     $apiBinary = Join-Path $temporaryDirectory "quarry-api.exe"
     $dispatcherBinary = Join-Path $temporaryDirectory "quarry-dispatcher.exe"
@@ -1446,10 +1450,13 @@ function Test-SemanticsProcesses {
         $processIDs.Add($dispatcherProcess.Id)
         Wait-TcpReady -Process $dispatcherProcess -HostName "127.0.0.1" -Port $dispatcherPort -ProcessName "Dispatcher"
 
-        $gracefulJobID = Submit-SemanticsJob -BaseURL $baseURL -Type "demo.sleep" -Payload @{ duration_ms = 1500 }
+        $gracefulJobID = Submit-SemanticsJob `
+            -BaseURL $baseURL `
+            -Type "demo.sleep" `
+            -Payload @{ duration_ms = $sleepDurationMilliseconds }
         $gracefulHost = "semantics-graceful-$testID"
         Start-SemanticsWorker -ContainerName $gracefulContainer -TemporaryDirectory $temporaryDirectory `
-            -DispatcherAddress $containerDispatcherAddress -HostName $gracefulHost -ShutdownTimeout "3s"
+            -DispatcherAddress $containerDispatcherAddress -HostName $gracefulHost -ShutdownTimeout "8s"
         $gracefulWorkerID = Wait-SemanticsWorker -HostName $gracefulHost -ContainerName $gracefulContainer
         $null = Wait-SemanticsAttemptRenewal -JobID $gracefulJobID -ContainerName $gracefulContainer
         $cancelledJobID = Submit-SemanticsJob -BaseURL $baseURL -Type "demo.echo" -Payload "must-not-run"
@@ -1464,7 +1471,10 @@ function Test-SemanticsProcesses {
             throw "Queued semantics job did not cancel."
         }
 
-        $forcedJobID = Submit-SemanticsJob -BaseURL $baseURL -Type "demo.sleep" -Payload @{ duration_ms = 1500 }
+        $forcedJobID = Submit-SemanticsJob `
+            -BaseURL $baseURL `
+            -Type "demo.sleep" `
+            -Payload @{ duration_ms = $sleepDurationMilliseconds }
         $forcedHost = "semantics-forced-$testID"
         Start-SemanticsWorker -ContainerName $forcedContainer -TemporaryDirectory $temporaryDirectory `
             -DispatcherAddress $containerDispatcherAddress -HostName $forcedHost -ShutdownTimeout "200ms"
@@ -1485,10 +1495,11 @@ WHERE jobs.id = '$forcedJobID'::uuid AND attempts.attempt_no = 1;
 
         $replacementHost = "semantics-replacement-$testID"
         Start-SemanticsWorker -ContainerName $replacementContainer -TemporaryDirectory $temporaryDirectory `
-            -DispatcherAddress $containerDispatcherAddress -HostName $replacementHost -ShutdownTimeout "3s"
+            -DispatcherAddress $containerDispatcherAddress -HostName $replacementHost -ShutdownTimeout "8s"
         $replacementWorkerID = Wait-SemanticsWorker -HostName $replacementHost -ContainerName $replacementContainer
         $finalState = Wait-SemanticsJobStatus -BaseURL $baseURL -JobID $forcedJobID -ExpectedStatus "succeeded" -TimeoutSeconds 30
-        if ($finalState.attempt_count -ne 2 -or $finalState.result.slept_ms -ne 1500) {
+        if ($finalState.attempt_count -ne 2 -or
+            $finalState.result.slept_ms -ne $sleepDurationMilliseconds) {
             throw "Replacement attempt did not complete forced-shutdown job."
         }
         Stop-SemanticsWorkerGracefully -ContainerName $replacementContainer
@@ -1524,7 +1535,8 @@ WHERE jobs.id = '$forcedJobID'::uuid AND attempts.attempt_no = 1;
         }
     }
 
-    Assert-RecoveryCleanup -ComposeProject $composeProject -TemporaryDirectory $temporaryDirectory -ProcessIDs $processIDs.ToArray()
+    Assert-ProcessTestCleanup -TestName "Semantics-test" -ComposeProject $composeProject `
+        -TemporaryDirectory $temporaryDirectory -ProcessIDs $processIDs.ToArray()
     foreach ($container in $workerContainers) {
         $remaining = @(
             Invoke-Docker -Arguments @("ps", "--all", "--quiet", "--filter", "name=^/$container$") |
@@ -1716,20 +1728,466 @@ function Test-RecoveryProcesses {
         }
     }
 
-    Assert-RecoveryCleanup `
+    Assert-ProcessTestCleanup `
+        -TestName "Recovery-test" `
         -ComposeProject $composeProject `
         -TemporaryDirectory $temporaryDirectory `
         -ProcessIDs $processIDs.ToArray()
     Write-Host "Recovery-test cleanup verified: processes, temporary binaries, containers, network, and volume removed."
 }
 
-function Test-Recovery {
-    Test-RecoveryProcesses
+function Test-StaleCompletion {
     Invoke-Go -Arguments @(
         "test", "-count=1",
         "-run", "^TestStaleAttemptReportAfterRecoveryThroughGRPCAndPostgres$",
         "./internal/dispatcher"
     )
+}
+
+function Test-Recovery {
+    Test-RecoveryProcesses
+    Test-StaleCompletion
+}
+
+function Wait-AcknowledgementLossFirstExecution {
+    param(
+        [Parameter(Mandatory)]
+        [string]$MarkerPath,
+
+        [Parameter(Mandatory)]
+        [System.Diagnostics.Process]$WorkerProcess
+    )
+
+    $expectedMarker = "completed`n"
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $MarkerPath) {
+            $contents = [System.IO.File]::ReadAllText($MarkerPath)
+            if ($contents -eq $expectedMarker) {
+                if (-not $WorkerProcess.WaitForExit(10000)) {
+                    throw "Fault-enabled worker did not exit after its handler returned success."
+                }
+                if ($WorkerProcess.ExitCode -eq 0) {
+                    throw "Fault-enabled worker exited successfully instead of reporting the injected failure."
+                }
+                return
+            }
+            if ($contents.Length -gt $expectedMarker.Length -or
+                (-not $expectedMarker.StartsWith($contents, [StringComparison]::Ordinal))) {
+                throw "Fault-enabled worker wrote unexpected marker content '$contents'."
+            }
+        }
+        elseif ($WorkerProcess.HasExited) {
+            throw "Fault-enabled worker exited with code $($WorkerProcess.ExitCode) before writing its marker."
+        }
+        Start-Sleep -Milliseconds 50
+    }
+
+    throw "Fault-enabled worker did not write one marker and exit within 30 seconds."
+}
+
+function Get-AcknowledgementLossAttemptOneState {
+    param(
+        [Parameter(Mandatory)]
+        [string]$JobID
+    )
+
+    if ($JobID -notmatch '^[0-9a-f-]{36}$') {
+        throw "Acknowledgement-loss job has invalid ID '$JobID'."
+    }
+    $query = @"
+SELECT
+    jobs.status,
+    jobs.attempt_count,
+    jobs.current_worker_id::text,
+    jobs.lease_expires_at::text,
+    job_attempts.status,
+    COALESCE(job_attempts.error_code, ''),
+    job_attempts.finished_at IS NULL,
+    workers.last_seen_at::text
+FROM jobs
+JOIN job_attempts ON job_attempts.job_id = jobs.id AND job_attempts.attempt_no = 1
+JOIN workers ON workers.id = job_attempts.worker_id
+WHERE jobs.id = '$JobID'::uuid;
+"@
+    $rows = @(
+        Invoke-PostgresRows -Query $query |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -match '\|' }
+    )
+    if ($rows.Count -eq 0) {
+        return $null
+    }
+    if ($rows.Count -ne 1) {
+        throw "PostgreSQL returned $($rows.Count) active acknowledgement-loss rows, expected one."
+    }
+    $columns = $rows[0].Split('|')
+    if ($columns.Count -ne 8) {
+        throw "PostgreSQL returned an unexpected acknowledgement-loss row: '$($rows[0])'."
+    }
+    return [PSCustomObject]@{
+        JobStatus = $columns[0]
+        AttemptCount = $columns[1]
+        WorkerID = $columns[2]
+        LeaseExpiresAt = $columns[3]
+        AttemptStatus = $columns[4]
+        ErrorCode = $columns[5]
+        AttemptUnfinished = $columns[6]
+        WorkerLastSeenAt = $columns[7]
+    }
+}
+
+function Assert-AcknowledgementLossAttemptOneUnreported {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID,
+
+        [Parameter(Mandatory)]
+        [string]$WorkerID
+    )
+
+    $job = Invoke-RestMethod -Method Get -Uri "$BaseURL/v1/jobs/$JobID" -TimeoutSec 10
+    if ($job.status -ne 'running' -or $job.attempt_count -ne 1 -or $null -ne $job.result) {
+        throw "The public API did not keep the unreported job on running attempt 1."
+    }
+    $attemptResponse = Invoke-RestMethod `
+        -Method Get `
+        -Uri "$BaseURL/v1/jobs/$JobID/attempts" `
+        -TimeoutSec 10
+    $attempts = @($attemptResponse.attempts)
+    if ($attempts.Count -ne 1) {
+        throw "Acknowledgement-loss job has $($attempts.Count) HTTP attempts before recovery, expected one."
+    }
+    $attempt = $attempts[0]
+    if ($attempt.attempt_no -ne 1 -or $attempt.worker_id -ne $WorkerID -or
+        $attempt.status -ne 'running' -or $null -ne $attempt.finished_at -or
+        $null -ne $attempt.error_code) {
+        throw "The public API did not expose attempt 1 as running and unreported on the fault-enabled worker."
+    }
+
+    $state = Get-AcknowledgementLossAttemptOneState -JobID $JobID
+    if ($null -eq $state -or $state.JobStatus -ne 'running' -or
+        $state.AttemptCount -ne '1' -or $state.WorkerID -ne $WorkerID -or
+        $state.AttemptStatus -ne 'running' -or $state.ErrorCode -ne '' -or
+        $state.AttemptUnfinished -ne 't') {
+        throw "PostgreSQL did not keep attempt 1 running and unreported on the fault-enabled worker."
+    }
+    return $state
+}
+
+function Wait-AcknowledgementLossJobSucceeded {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID,
+
+        [Parameter(Mandatory)]
+        [System.Diagnostics.Process[]]$Processes
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        foreach ($process in $Processes) {
+            if ($process.HasExited) {
+                throw "Acknowledgement-loss process exited early with code $($process.ExitCode)."
+            }
+        }
+        $state = Invoke-RestMethod -Method Get -Uri "$BaseURL/v1/jobs/$JobID" -TimeoutSec 10
+        if ($state.status -eq 'succeeded') {
+            return $state
+        }
+        if ($state.status -notin @('running', 'retry_wait')) {
+            throw "Acknowledgement-loss job $JobID reached unexpected status '$($state.status)'."
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    throw "Acknowledgement-loss job $JobID did not succeed within 30 seconds."
+}
+
+function Assert-AcknowledgementLossState {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID,
+
+        [Parameter(Mandatory)]
+        [string]$FirstWorkerID,
+
+        [Parameter(Mandatory)]
+        [string]$SecondWorkerID,
+
+        [Parameter(Mandatory)]
+        [string]$MarkerPath,
+
+        [Parameter(Mandatory)]
+        [object]$JobState
+    )
+
+    if ($JobState.attempt_count -ne 2 -or $JobState.result.marker -ne 'written') {
+        throw "Acknowledgement-loss job did not return the expected attempt count and result."
+    }
+    $attemptResponse = Invoke-RestMethod `
+        -Method Get `
+        -Uri "$BaseURL/v1/jobs/$JobID/attempts" `
+        -TimeoutSec 10
+    $attempts = @($attemptResponse.attempts)
+    if ($attempts.Count -ne 2) {
+        throw "Acknowledgement-loss job has $($attempts.Count) HTTP attempts, expected two."
+    }
+    if ($attempts[0].attempt_no -ne 1 -or $attempts[0].worker_id -ne $FirstWorkerID -or
+        $attempts[0].status -ne 'abandoned' -or $attempts[0].error_code -ne 'lease_expired' -or
+        [string]::IsNullOrWhiteSpace($attempts[0].finished_at)) {
+        throw "HTTP did not return attempt 1 as lease-expired and abandoned by the fault-enabled worker."
+    }
+    if ($attempts[1].attempt_no -ne 2 -or $attempts[1].worker_id -ne $SecondWorkerID -or
+        $attempts[1].status -ne 'succeeded' -or $null -ne $attempts[1].error_code -or
+        [string]::IsNullOrWhiteSpace($attempts[1].finished_at)) {
+        throw "HTTP did not return attempt 2 as succeeded by the replacement worker."
+    }
+
+    $markerContents = [System.IO.File]::ReadAllText($MarkerPath)
+    if ($markerContents -ne "completed`ncompleted`n") {
+        throw "Acknowledgement-loss marker contains unexpected executions: '$markerContents'."
+    }
+
+    $query = @"
+SELECT
+    jobs.status,
+    jobs.attempt_count,
+    jobs.current_worker_id IS NULL,
+    jobs.lease_expires_at IS NULL,
+    jobs.result = '{"marker":"written"}'::jsonb,
+    jobs.finished_at IS NOT NULL,
+    job_attempts.attempt_no,
+    job_attempts.worker_id::text,
+    job_attempts.status,
+    COALESCE(job_attempts.error_code, ''),
+    job_attempts.finished_at IS NOT NULL,
+    CASE WHEN job_attempts.attempt_no = 2 THEN jobs.finished_at = job_attempts.finished_at ELSE true END,
+    (SELECT state FROM workers WHERE id = '$FirstWorkerID'::uuid),
+    (SELECT state FROM workers WHERE id = '$SecondWorkerID'::uuid)
+FROM jobs
+JOIN job_attempts ON job_attempts.job_id = jobs.id
+WHERE jobs.id = '$JobID'::uuid
+ORDER BY job_attempts.attempt_no;
+"@
+    $rows = @(
+        Invoke-PostgresRows -Query $query |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -match '\|' }
+    )
+    if ($rows.Count -ne 2) {
+        throw "PostgreSQL returned $($rows.Count) acknowledgement-loss rows, expected two."
+    }
+    for ($index = 0; $index -lt 2; $index++) {
+        $columns = $rows[$index].Split('|')
+        if ($columns.Count -ne 14) {
+            throw "PostgreSQL returned an unexpected acknowledgement-loss row: '$($rows[$index])'."
+        }
+        $attemptNumber = [string]($index + 1)
+        $expectedWorkerID = if ($index -eq 0) { $FirstWorkerID } else { $SecondWorkerID }
+        $expectedAttemptStatus = if ($index -eq 0) { 'abandoned' } else { 'succeeded' }
+        $expectedErrorCode = if ($index -eq 0) { 'lease_expired' } else { '' }
+        if ($columns[0] -ne 'succeeded' -or $columns[1] -ne '2' -or
+            $columns[2] -ne 't' -or $columns[3] -ne 't' -or $columns[4] -ne 't' -or
+            $columns[5] -ne 't' -or $columns[6] -ne $attemptNumber -or
+            $columns[7] -ne $expectedWorkerID -or $columns[8] -ne $expectedAttemptStatus -or
+            $columns[9] -ne $expectedErrorCode -or $columns[10] -ne 't' -or
+            $columns[11] -ne 't' -or $columns[12] -ne 'lost' -or $columns[13] -ne 'active') {
+            throw "PostgreSQL stored invalid acknowledgement-loss state: '$($rows[$index])'."
+        }
+    }
+}
+
+function Test-AcknowledgementLossProcesses {
+    $testID = [Guid]::NewGuid().ToString("N")
+    $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "quarry-ack-loss-$testID"
+    $binaryExtension = if ($IsWindows) { ".exe" } else { "" }
+    $apiBinary = Join-Path $temporaryDirectory "quarry-api$binaryExtension"
+    $dispatcherBinary = Join-Path $temporaryDirectory "quarry-dispatcher$binaryExtension"
+    $workerBinary = Join-Path $temporaryDirectory "quarry-worker$binaryExtension"
+    $markerPath = Join-Path $temporaryDirectory "side-effects.log"
+    $composeProject = "quarry-m6-ack-$testID"
+    $previousComposeProject = $env:COMPOSE_PROJECT_NAME
+    $previousPostgresPort = $env:QUARRY_POSTGRES_PORT
+    $apiProcess = $null
+    $dispatcherProcess = $null
+    $firstWorkerProcess = $null
+    $secondWorkerProcess = $null
+    $processIDs = [System.Collections.Generic.List[int]]::new()
+
+    $env:COMPOSE_PROJECT_NAME = $composeProject
+    $env:QUARRY_POSTGRES_PORT = [string](Get-AvailableLoopbackPort)
+    $databaseURL = Get-PostgresConnectionString
+
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        Invoke-Go -Arguments @("build", "-o", $apiBinary, "./cmd/api")
+        Invoke-Go -Arguments @("build", "-o", $dispatcherBinary, "./cmd/dispatcher")
+        Invoke-Go -Arguments @("build", "-o", $workerBinary, "./cmd/worker")
+        Invoke-Docker -Arguments @("compose", "up", "--detach", "--wait", "postgres")
+        Invoke-Goose -MigrationCommand "up"
+
+        $httpPort = Get-AvailableLoopbackPort
+        $dispatcherPort = Get-AvailableLoopbackPort
+        $httpAddress = "127.0.0.1:$httpPort"
+        $dispatcherAddress = "127.0.0.1:$dispatcherPort"
+        $baseURL = "http://$httpAddress"
+        $apiProcess = Start-DistributedProcess -Binary $apiBinary -Environment @{
+            QUARRY_DATABASE_URL = $databaseURL
+            QUARRY_HTTP_ADDR = $httpAddress
+        }
+        $processIDs.Add($apiProcess.Id)
+        Wait-ApiReady -Process $apiProcess -BaseURL $baseURL
+
+        $dispatcherProcess = Start-DistributedProcess -Binary $dispatcherBinary -Environment @{
+            QUARRY_DATABASE_URL = $databaseURL
+            QUARRY_DISPATCHER_ADDR = $dispatcherAddress
+            QUARRY_LEASE_DURATION = "2s"
+            QUARRY_REAPER_INTERVAL = "100ms"
+            QUARRY_REAPER_BATCH_SIZE = "10"
+            QUARRY_WORKER_LIVENESS_TIMEOUT = "2s"
+        }
+        $processIDs.Add($dispatcherProcess.Id)
+        Wait-TcpReady `
+            -Process $dispatcherProcess `
+            -HostName "127.0.0.1" `
+            -Port $dispatcherPort `
+            -ProcessName "Dispatcher"
+
+        $firstWorkerHostName = "ack-loss-worker-1-$testID"
+        $firstWorkerProcess = Start-DistributedProcess -Binary $workerBinary -Environment @{
+            QUARRY_DISPATCHER_ADDR = $dispatcherAddress
+            QUARRY_WORKER_CONCURRENCY = "1"
+            QUARRY_WORKER_HOSTNAME = $firstWorkerHostName
+            QUARRY_WORKER_VERSION = "ack-loss-test"
+            QUARRY_HEARTBEAT_INTERVAL = "250ms"
+            QUARRY_TEST_SIDE_EFFECT_FILE = $markerPath
+            QUARRY_TEST_EXIT_AFTER_HANDLER_SUCCESS = "true"
+        }
+        $processIDs.Add($firstWorkerProcess.Id)
+        $firstWorkerIDs = @(Wait-DistributedWorkers `
+            -HostNames @($firstWorkerHostName) `
+            -Processes @($firstWorkerProcess))
+        $firstWorkerID = $firstWorkerIDs[0]
+
+        $body = @{
+            type = "test.side_effect"
+            payload = @{}
+            max_attempts = 2
+            timeout_ms = 30000
+        } | ConvertTo-Json -Compress -Depth 4
+        $submitted = Invoke-RestMethod `
+            -Method Post `
+            -Uri "$BaseURL/v1/jobs" `
+            -ContentType "application/json" `
+            -Body $body `
+            -TimeoutSec 10
+        if ([string]::IsNullOrWhiteSpace($submitted.id) -or $submitted.status -ne 'queued') {
+            throw "Acknowledgement-loss submission did not return a queued job with an ID."
+        }
+
+        Wait-AcknowledgementLossFirstExecution `
+            -MarkerPath $markerPath `
+            -WorkerProcess $firstWorkerProcess
+        $unreportedState = Assert-AcknowledgementLossAttemptOneUnreported `
+            -BaseURL $baseURL `
+            -JobID $submitted.id `
+            -WorkerID $firstWorkerID
+        Start-Sleep -Milliseconds 750
+        $unchangedState = Get-AcknowledgementLossAttemptOneState -JobID $submitted.id
+        if ($null -eq $unchangedState -or
+            $unchangedState.LeaseExpiresAt -ne $unreportedState.LeaseExpiresAt -or
+            $unchangedState.WorkerLastSeenAt -ne $unreportedState.WorkerLastSeenAt) {
+            throw "The fault-enabled worker lease or last_seen_at advanced after its injected exit."
+        }
+
+        $secondWorkerHostName = "ack-loss-worker-2-$testID"
+        $secondWorkerProcess = Start-DistributedProcess -Binary $workerBinary -Environment @{
+            QUARRY_DISPATCHER_ADDR = $dispatcherAddress
+            QUARRY_WORKER_CONCURRENCY = "1"
+            QUARRY_WORKER_HOSTNAME = $secondWorkerHostName
+            QUARRY_WORKER_VERSION = "ack-loss-test"
+            QUARRY_HEARTBEAT_INTERVAL = "250ms"
+            QUARRY_TEST_SIDE_EFFECT_FILE = $markerPath
+            QUARRY_TEST_EXIT_AFTER_HANDLER_SUCCESS = ""
+        }
+        $processIDs.Add($secondWorkerProcess.Id)
+        $secondWorkerIDs = @(Wait-DistributedWorkers `
+            -HostNames @($secondWorkerHostName) `
+            -Processes @($secondWorkerProcess))
+        $secondWorkerID = $secondWorkerIDs[0]
+        if ($secondWorkerID -eq $firstWorkerID) {
+            throw "The replacement worker reused the fault-enabled worker ID."
+        }
+
+        $finalState = Wait-AcknowledgementLossJobSucceeded `
+            -BaseURL $baseURL `
+            -JobID $submitted.id `
+            -Processes @($apiProcess, $dispatcherProcess, $secondWorkerProcess)
+        Assert-AcknowledgementLossState `
+            -BaseURL $baseURL `
+            -JobID $submitted.id `
+            -FirstWorkerID $firstWorkerID `
+            -SecondWorkerID $secondWorkerID `
+            -MarkerPath $markerPath `
+            -JobState $finalState
+        Write-Host "Acknowledgement-loss test passed: the first worker wrote a side effect without reporting, attempt 1 expired, and the replacement worker wrote the second side effect and completed attempt 2."
+    }
+    finally {
+        try {
+            $stopErrors = @()
+            foreach ($process in @($secondWorkerProcess, $firstWorkerProcess, $dispatcherProcess, $apiProcess)) {
+                if ($null -eq $process) {
+                    continue
+                }
+                try {
+                    Stop-DistributedProcess -Process $process
+                }
+                catch {
+                    $stopErrors += $_
+                }
+            }
+            if ($stopErrors.Count -gt 0) {
+                throw "Failed to stop $($stopErrors.Count) acknowledgement-loss processes."
+            }
+        }
+        finally {
+            try {
+                Invoke-Docker -Arguments @("compose", "down", "--volumes")
+            }
+            finally {
+                try {
+                    Remove-DistributedTestDirectory -Directory $temporaryDirectory
+                }
+                finally {
+                    $env:COMPOSE_PROJECT_NAME = $previousComposeProject
+                    $env:QUARRY_POSTGRES_PORT = $previousPostgresPort
+                }
+            }
+        }
+    }
+
+    Assert-ProcessTestCleanup `
+        -TestName "Acknowledgement-loss test" `
+        -ComposeProject $composeProject `
+        -TemporaryDirectory $temporaryDirectory `
+        -ProcessIDs $processIDs.ToArray()
+    Write-Host "Acknowledgement-loss cleanup verified: processes, marker file, temporary binaries, containers, network, and volume removed."
+}
+
+function Test-FailureSuite {
+    Test-RecoveryProcesses
+    Test-AcknowledgementLossProcesses
+    Test-StaleCompletion
 }
 
 function Get-ConfiguredPort {
@@ -2463,7 +2921,7 @@ function Test-ObservabilityWorkflow {
         }
     }
 
-    Assert-RecoveryCleanup -ComposeProject $composeProject `
+    Assert-ProcessTestCleanup -TestName "Observability-test" -ComposeProject $composeProject `
         -TemporaryDirectory $temporaryDirectory -ProcessIDs $processIDs.ToArray()
     Write-Host "Observability-test cleanup verified: processes, temporary binaries, containers, network, and volume removed."
 }
@@ -2531,7 +2989,7 @@ try {
             Test-ObservabilityWorkflow
             Test-ComposeSmoke
             Test-DistributedProcesses
-            Test-Recovery
+            Test-FailureSuite
             Test-Semantics
         }
         "db-config" {
@@ -2593,6 +3051,12 @@ try {
         }
         "recovery-test" {
             Test-Recovery
+        }
+        "ack-loss-test" {
+            Test-AcknowledgementLossProcesses
+        }
+        "failure-test" {
+            Test-FailureSuite
         }
         "semantics-test" {
             Test-Semantics

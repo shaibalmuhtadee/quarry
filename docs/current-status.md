@@ -1,9 +1,9 @@
 # Current status
 
-- Current milestone: Milestone 5, observability
-- Milestone status: complete
+- Current milestone: Milestone 6, failure suite and benchmarking
+- Milestone status: in progress
 - Completed milestones: Milestones 0, 1, 2, 3, 4, and 5
-- Current area of work: Milestone 5 audit complete; Milestone 6 not started
+- Current area of work: Milestone 6 Slice 3 complete; Slice 4 not started
 - Known blockers: none
 - Known architecture deviations: none
 - Known implementation deviations: PowerShell provides the common command interface instead of GNU Make. The project plan permits an equivalent command interface, and this choice does not change the system architecture.

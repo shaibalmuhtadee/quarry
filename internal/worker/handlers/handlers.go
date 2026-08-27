@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"time"
 
 	"github.com/shaibalmuhtadee/quarry/internal/domain"
@@ -13,9 +14,11 @@ import (
 )
 
 const (
-	EchoType        = "demo.echo"
-	PayloadSizeType = "demo.payload_size"
-	SleepType       = "demo.sleep"
+	EchoType             = "demo.echo"
+	PayloadSizeType      = "demo.payload_size"
+	SleepType            = "demo.sleep"
+	TestSideEffectType   = "test.side_effect"
+	testSideEffectMarker = "completed\n"
 )
 
 func Registry() map[string]worker.Handler {
@@ -23,6 +26,30 @@ func Registry() map[string]worker.Handler {
 		EchoType:        Echo,
 		PayloadSizeType: PayloadSize,
 		SleepType:       Sleep,
+	}
+}
+
+func NewTestSideEffectHandler(markerPath string) worker.Handler {
+	return func(ctx context.Context, _ domain.Payload) (domain.Result, error) {
+		if err := ctx.Err(); err != nil {
+			return domain.Result{}, err
+		}
+		file, err := os.OpenFile(markerPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return domain.Result{}, fmt.Errorf("open side-effect marker: %w", err)
+		}
+		if _, err := file.WriteString(testSideEffectMarker); err != nil {
+			_ = file.Close()
+			return domain.Result{}, fmt.Errorf("write side-effect marker: %w", err)
+		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			return domain.Result{}, fmt.Errorf("sync side-effect marker: %w", err)
+		}
+		if err := file.Close(); err != nil {
+			return domain.Result{}, fmt.Errorf("close side-effect marker: %w", err)
+		}
+		return domain.ParseResult([]byte(`{"marker":"written"}`))
 	}
 }
 

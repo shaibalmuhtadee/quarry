@@ -154,7 +154,7 @@ Run the complete local validation:
 pwsh ./scripts/dev.ps1 check
 ```
 
-This checks formatting, dependencies, pinned tools, generated code, static analysis, tests, builds, and the Compose configuration. It runs both the HTTP smoke test and the distributed process test against PostgreSQL.
+This checks formatting, dependencies, pinned tools, generated code, static analysis, tests, builds, and the Compose configuration. It also runs the HTTP smoke test, distributed process test, failure suite, observability proof, and execution-semantics proof against PostgreSQL.
 
 Run the Milestone 5 observability proof by itself:
 
@@ -187,6 +187,22 @@ pwsh ./scripts/dev.ps1 recovery-test
 ```
 
 The recovery test starts isolated API, dispatcher, worker, and PostgreSQL processes. It submits a long-running `demo.sleep` job, proves worker 1 renews attempt 1, kills that worker without graceful shutdown, and proves the lease and worker heartbeat stop advancing. Worker 2 then completes attempt 2. The test verifies both attempts through HTTP and PostgreSQL, runs a stale-report gRPC integration test, and checks that all temporary processes and Docker resources were removed.
+
+Run the acknowledgement-loss proof by itself:
+
+```powershell
+pwsh ./scripts/dev.ps1 ack-loss-test
+```
+
+The acknowledgement-loss test starts a fault-enabled worker that appends one marker after handler success and exits before `ReportAttempt`. The test proves that attempt 1 remains unreported, its lease stops advancing, and PostgreSQL abandons it with `lease_expired`. A replacement worker appends the second marker and completes attempt 2. The test checks public attempt history, direct PostgreSQL state, and cleanup.
+
+Run every required failure proof:
+
+```powershell
+pwsh ./scripts/dev.ps1 failure-test
+```
+
+The failure suite runs the worker-death recovery process test, the acknowledgement-loss process test, and the stale-completion gRPC and PostgreSQL test.
 
 Run the HTTP smoke test by itself:
 

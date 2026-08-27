@@ -242,6 +242,149 @@ func TestWorkerHoldsSlotUntilSuccessReportIsAcknowledged(t *testing.T) {
 	}
 }
 
+func TestWorkerPostHandlerSuccessHookStopsBeforeReport(t *testing.T) {
+	t.Parallel()
+
+	injectedErr := errors.New("injected post-handler failure")
+	job := makeJobs(t, 1, "test.side_effect")[0]
+	var acquired atomic.Bool
+	var reports atomic.Int32
+	dispatcher := &fakeDispatcher{}
+	dispatcher.acquire = func(context.Context, domain.WorkerID, uint32, []domain.JobType) ([]Job, error) {
+		if acquired.CompareAndSwap(false, true) {
+			return []Job{job}, nil
+		}
+		return nil, nil
+	}
+	dispatcher.report = func(
+		context.Context,
+		domain.WorkerID,
+		domain.JobID,
+		domain.AttemptNumber,
+		domain.AttemptOutcome,
+	) error {
+		reports.Add(1)
+		return nil
+	}
+
+	var sideEffectRecorded atomic.Bool
+	var hookCalls atomic.Int32
+	runtime := newTestWorker(t, dispatcher, 1, map[string]Handler{
+		"test.side_effect": func(context.Context, domain.Payload) (domain.Result, error) {
+			sideEffectRecorded.Store(true)
+			return mustResult(t, `{"marker":"written"}`), nil
+		},
+	})
+	runtime.testAfterHandlerSuccess = func(got Job) error {
+		hookCalls.Add(1)
+		if !sideEffectRecorded.Load() {
+			t.Error("post-handler hook ran before the handler side effect")
+		}
+		if got.ID != job.ID || got.AttemptNumber != job.AttemptNumber {
+			t.Errorf("hook job = (%s, %d), want (%s, %d)", got.ID, got.AttemptNumber.Int32(), job.ID, job.AttemptNumber.Int32())
+		}
+		return injectedErr
+	}
+	metrics := newWorkerMetricRecorder(1)
+	runtime.metrics = metrics
+
+	err := awaitRun(t, runWorker(runtime, context.Background()))
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("worker error = %v, want injected failure", err)
+	}
+	if got := hookCalls.Load(); got != 1 {
+		t.Fatalf("post-handler hook calls = %d, want 1", got)
+	}
+	if got := reports.Load(); got != 0 {
+		t.Fatalf("attempt reports = %d, want 0", got)
+	}
+	metric := <-metrics.executions
+	if metric.outcome != domain.AttemptOutcomeKindSucceeded {
+		t.Fatalf("execution metric outcome = %q, want succeeded", metric.outcome)
+	}
+}
+
+func TestWorkerPostHandlerSuccessHookRunsAtMostOnce(t *testing.T) {
+	t.Parallel()
+
+	injectedErr := errors.New("injected post-handler failure")
+	var hookCalls atomic.Int32
+	runtime := &Worker{testAfterHandlerSuccess: func(Job) error {
+		hookCalls.Add(1)
+		return injectedErr
+	}}
+	outcome, err := domain.NewSucceededOutcome(mustResult(t, `{"ok":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := makeJobs(t, 1, "test.side_effect")[0]
+
+	const callers = 16
+	start := make(chan struct{})
+	errorsSeen := make(chan error, callers)
+	var group sync.WaitGroup
+	for range callers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			errorsSeen <- runtime.runTestAfterHandlerSuccess(job, outcome)
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(errorsSeen)
+
+	injectedErrors := 0
+	for err := range errorsSeen {
+		if errors.Is(err, injectedErr) {
+			injectedErrors++
+		} else if err != nil {
+			t.Fatalf("post-handler hook error = %v", err)
+		}
+	}
+	if got := hookCalls.Load(); got != 1 {
+		t.Fatalf("post-handler hook calls = %d, want 1", got)
+	}
+	if injectedErrors != 1 {
+		t.Fatalf("callers that observed injected failure = %d, want 1", injectedErrors)
+	}
+}
+
+func TestWorkerPostHandlerSuccessHookIgnoresNonSuccessOutcomes(t *testing.T) {
+	t.Parallel()
+
+	failure, err := domain.NewAttemptFailure("test_failure", "test failure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	constructors := []func(domain.AttemptFailure) (domain.AttemptOutcome, error){
+		domain.NewRetryableFailureOutcome,
+		domain.NewPermanentFailureOutcome,
+		domain.NewCancelledOutcome,
+		domain.NewTimedOutOutcome,
+		domain.NewPanickedOutcome,
+	}
+	var hookCalls atomic.Int32
+	runtime := &Worker{testAfterHandlerSuccess: func(Job) error {
+		hookCalls.Add(1)
+		return errors.New("unexpected hook call")
+	}}
+	job := makeJobs(t, 1, "test.side_effect")[0]
+	for _, constructor := range constructors {
+		outcome, err := constructor(failure)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := runtime.runTestAfterHandlerSuccess(job, outcome); err != nil {
+			t.Fatalf("non-success outcome %q triggered hook: %v", outcome.Kind(), err)
+		}
+	}
+	if got := hookCalls.Load(); got != 0 {
+		t.Fatalf("post-handler hook calls = %d, want 0", got)
+	}
+}
+
 func TestWorkerRetriesTransientReportWithSameIdentity(t *testing.T) {
 	t.Parallel()
 
