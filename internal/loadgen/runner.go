@@ -132,16 +132,22 @@ func (runner *Runner) runSlot(
 	drainDeadline time.Time,
 	samples chan<- Sample,
 ) {
-	for runner.now().Before(measurementEndedAt) {
-		sequence := runner.sequence.Add(1)
+	for {
 		startedAt := runner.now()
+		if !startedAt.Before(measurementEndedAt) {
+			return
+		}
+		sequence := runner.sequence.Add(1)
 		phase := phaseAt(startedAt, measurementStartedAt)
 		request := runner.submission(sequence)
 		header := SampleHeader{
-			Sequence:            sequence,
-			Phase:               phase,
-			JobType:             request.JobType,
-			SubmissionStartedAt: startedAt,
+			RunID:                runner.config.RunID,
+			Sequence:             sequence,
+			Phase:                phase,
+			JobType:              request.JobType,
+			SubmissionStartedAt:  startedAt,
+			MeasurementStartedAt: measurementStartedAt,
+			MeasurementEndedAt:   measurementEndedAt,
 		}
 		sample, continueSlot := runner.runJob(ctx, header, request, drainDeadline)
 		samples <- sample

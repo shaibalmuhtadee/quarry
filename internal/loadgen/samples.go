@@ -16,10 +16,13 @@ const maximumSampleLineBytes = 4 << 20
 type sampleEnvelope struct {
 	SchemaVersion         int              `json:"schema_version"`
 	Kind                  SampleKind       `json:"kind"`
+	RunID                 string           `json:"run_id"`
 	Sequence              uint64           `json:"sequence"`
 	Phase                 Phase            `json:"phase"`
 	JobType               string           `json:"job_type"`
 	SubmissionStartedAt   time.Time        `json:"submission_started_at"`
+	MeasurementStartedAt  time.Time        `json:"measurement_started_at"`
+	MeasurementEndedAt    time.Time        `json:"measurement_ended_at"`
 	SubmissionCompletedAt *time.Time       `json:"submission_completed_at,omitempty"`
 	MayHaveCommitted      *bool            `json:"may_have_committed,omitempty"`
 	JobID                 string           `json:"job_id,omitempty"`
@@ -111,12 +114,15 @@ func envelopeFromSample(sample Sample) (sampleEnvelope, error) {
 	}
 	header := sample.Header()
 	envelope := sampleEnvelope{
-		SchemaVersion:       SampleSchemaVersion,
-		Kind:                sample.Kind(),
-		Sequence:            header.Sequence,
-		Phase:               header.Phase,
-		JobType:             header.JobType,
-		SubmissionStartedAt: header.SubmissionStartedAt,
+		SchemaVersion:        SampleSchemaVersion,
+		Kind:                 sample.Kind(),
+		RunID:                header.RunID,
+		Sequence:             header.Sequence,
+		Phase:                header.Phase,
+		JobType:              header.JobType,
+		SubmissionStartedAt:  header.SubmissionStartedAt,
+		MeasurementStartedAt: header.MeasurementStartedAt,
+		MeasurementEndedAt:   header.MeasurementEndedAt,
 	}
 	switch value := sample.(type) {
 	case SubmissionFailureSample:
@@ -152,10 +158,13 @@ func (envelope sampleEnvelope) sample() (Sample, error) {
 		return nil, err
 	}
 	header := SampleHeader{
-		Sequence:            envelope.Sequence,
-		Phase:               envelope.Phase,
-		JobType:             envelope.JobType,
-		SubmissionStartedAt: envelope.SubmissionStartedAt,
+		RunID:                envelope.RunID,
+		Sequence:             envelope.Sequence,
+		Phase:                envelope.Phase,
+		JobType:              envelope.JobType,
+		SubmissionStartedAt:  envelope.SubmissionStartedAt,
+		MeasurementStartedAt: envelope.MeasurementStartedAt,
+		MeasurementEndedAt:   envelope.MeasurementEndedAt,
 	}
 	switch envelope.Kind {
 	case SampleKindSubmissionFailed:
@@ -198,6 +207,9 @@ func (envelope sampleEnvelope) validate() error {
 	if envelope.Sequence == 0 {
 		return errors.New("sample sequence must be positive")
 	}
+	if envelope.RunID == "" {
+		return errors.New("sample run ID is required")
+	}
 	if _, err := parsePhase(string(envelope.Phase)); err != nil {
 		return err
 	}
@@ -206,6 +218,15 @@ func (envelope sampleEnvelope) validate() error {
 	}
 	if envelope.SubmissionStartedAt.IsZero() {
 		return errors.New("sample submission start is required")
+	}
+	if envelope.MeasurementStartedAt.IsZero() || !envelope.MeasurementEndedAt.After(envelope.MeasurementStartedAt) {
+		return errors.New("sample measurement window must be positive")
+	}
+	if envelope.Phase == PhaseWarmup && !envelope.SubmissionStartedAt.Before(envelope.MeasurementStartedAt) {
+		return errors.New("warmup sample starts at or after the measurement boundary")
+	}
+	if envelope.Phase == PhaseMeasurement && (envelope.SubmissionStartedAt.Before(envelope.MeasurementStartedAt) || !envelope.SubmissionStartedAt.Before(envelope.MeasurementEndedAt)) {
+		return errors.New("measurement sample starts outside the measurement window")
 	}
 	for _, requestError := range envelope.Errors {
 		if requestError.Operation != OperationSubmit && requestError.Operation != OperationPoll && requestError.Operation != OperationAttempts {

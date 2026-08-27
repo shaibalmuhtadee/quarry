@@ -200,6 +200,41 @@ func TestPhaseAttribution(t *testing.T) {
 	}
 }
 
+func TestRunnerKeepsWarmupAndMeasurementInOneRun(t *testing.T) {
+	client := newBoundedClient(time.Millisecond)
+	runner := newTestRunner(t, client, Config{
+		RunID:               "continuous-phases",
+		WarmupDuration:      20 * time.Millisecond,
+		MeasurementDuration: 20 * time.Millisecond,
+		DrainTimeout:        100 * time.Millisecond,
+		PollInterval:        time.Millisecond,
+		MaxOutstanding:      1,
+		MaxHTTPConcurrency:  1,
+	})
+
+	result, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatalf("run load generator: %v", err)
+	}
+	var warmup, measurement int
+	for _, sample := range result.Samples {
+		header := sample.Header()
+		if header.RunID != result.RunID || !header.MeasurementStartedAt.Equal(result.MeasurementStartedAt) ||
+			!header.MeasurementEndedAt.Equal(result.MeasurementEndedAt) {
+			t.Fatalf("sample metadata = %#v, result = %#v", header, result)
+		}
+		switch header.Phase {
+		case PhaseWarmup:
+			warmup++
+		case PhaseMeasurement:
+			measurement++
+		}
+	}
+	if warmup == 0 || measurement == 0 {
+		t.Fatalf("phase samples = warmup %d, measurement %d", warmup, measurement)
+	}
+}
+
 func newTestRunner(t *testing.T, client Client, cfg Config) *Runner {
 	t.Helper()
 	runner, err := NewRunner(client, cfg, func(sequence uint64) Submission {

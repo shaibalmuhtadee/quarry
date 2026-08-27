@@ -15,6 +15,11 @@ type DurationPercentiles struct {
 }
 
 type Summary struct {
+	RunID                  string              `json:"run_id"`
+	MeasurementStartedAt   time.Time           `json:"measurement_started_at"`
+	MeasurementEndedAt     time.Time           `json:"measurement_ended_at"`
+	WarmupSampleCount      int                 `json:"warmup_sample_count"`
+	MeasurementSampleCount int                 `json:"measurement_sample_count"`
 	SubmittedCount         int                 `json:"submitted_count"`
 	CompletedCount         int                 `json:"completed_count"`
 	SuccessfulCount        int                 `json:"successful_count"`
@@ -30,30 +35,63 @@ type Summary struct {
 }
 
 func Summarize(result RunResult) (Summary, error) {
-	duration := result.MeasurementEndedAt.Sub(result.MeasurementStartedAt)
-	if duration <= 0 {
-		return Summary{}, errors.New("measurement window must be positive")
+	summary, err := SummarizeSamples(result.Samples)
+	if err != nil {
+		return Summary{}, err
 	}
+	if result.RunID != summary.RunID || !result.MeasurementStartedAt.Equal(summary.MeasurementStartedAt) ||
+		!result.MeasurementEndedAt.Equal(summary.MeasurementEndedAt) {
+		return Summary{}, errors.New("run result metadata does not match its samples")
+	}
+	return summary, nil
+}
+
+func SummarizeSamples(samples []Sample) (Summary, error) {
+	if len(samples) == 0 {
+		return Summary{}, errors.New("cannot summarize an empty sample set")
+	}
+	first := samples[0].Header()
+	if first.RunID == "" || first.MeasurementStartedAt.IsZero() || !first.MeasurementEndedAt.After(first.MeasurementStartedAt) {
+		return Summary{}, errors.New("samples require a run ID and positive measurement window")
+	}
+	duration := first.MeasurementEndedAt.Sub(first.MeasurementStartedAt)
 	var summary Summary
+	summary.RunID = first.RunID
+	summary.MeasurementStartedAt = first.MeasurementStartedAt
+	summary.MeasurementEndedAt = first.MeasurementEndedAt
 	var endToEnd, scheduling, attemptDuration, clientObserved []time.Duration
-	for _, sample := range result.Samples {
+	sequences := make(map[uint64]struct{}, len(samples))
+	for _, sample := range samples {
 		header := sample.Header()
-		if header.Phase != PhaseMeasurement {
+		if header.RunID != first.RunID || !header.MeasurementStartedAt.Equal(first.MeasurementStartedAt) ||
+			!header.MeasurementEndedAt.Equal(first.MeasurementEndedAt) {
+			return Summary{}, errors.New("samples contain inconsistent run metadata")
+		}
+		if _, exists := sequences[header.Sequence]; exists {
+			return Summary{}, errors.New("samples contain a duplicate sequence")
+		}
+		sequences[header.Sequence] = struct{}{}
+		if header.Phase == PhaseWarmup {
+			summary.WarmupSampleCount++
 			continue
 		}
+		if header.Phase != PhaseMeasurement {
+			return Summary{}, errors.New("sample contains an invalid phase")
+		}
+		summary.MeasurementSampleCount++
 		switch value := sample.(type) {
 		case SubmissionFailureSample:
 			summary.SubmissionFailureCount++
 		case IncompleteJobSample:
 			summary.IncompleteCount++
-			if withinMeasurement(value.SubmissionCompletedAt, result) {
+			if withinMeasurement(value.SubmissionCompletedAt, first.MeasurementStartedAt, first.MeasurementEndedAt) {
 				summary.SubmittedCount++
 			}
 		case TerminalJobSample:
-			if withinMeasurement(value.SubmissionCompletedAt, result) {
+			if withinMeasurement(value.SubmissionCompletedAt, first.MeasurementStartedAt, first.MeasurementEndedAt) {
 				summary.SubmittedCount++
 			}
-			if !withinMeasurement(value.FinishedAt, result) {
+			if !withinMeasurement(value.FinishedAt, first.MeasurementStartedAt, first.MeasurementEndedAt) {
 				continue
 			}
 			summary.CompletedCount++
@@ -72,6 +110,8 @@ func Summarize(result RunResult) (Summary, error) {
 					attemptDuration = append(attemptDuration, attempt.FinishedAt.Sub(attempt.StartedAt))
 				}
 			}
+		default:
+			return Summary{}, errors.New("samples contain an unsupported sample type")
 		}
 	}
 	summary.SubmittedPerSecond = Rate(summary.SubmittedCount, duration)
@@ -107,6 +147,6 @@ func NearestRank(values []time.Duration, percentile int) (time.Duration, bool) {
 	return ordered[rank-1], true
 }
 
-func withinMeasurement(value time.Time, result RunResult) bool {
-	return !value.Before(result.MeasurementStartedAt) && !value.After(result.MeasurementEndedAt)
+func withinMeasurement(value, startedAt, endedAt time.Time) bool {
+	return !value.Before(startedAt) && value.Before(endedAt)
 }

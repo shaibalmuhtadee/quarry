@@ -19,10 +19,12 @@ import (
 
 func TestParseConfig(t *testing.T) {
 	output := filepath.Join(t.TempDir(), "samples.jsonl.gz")
+	summary := filepath.Join(filepath.Dir(output), "summary.json")
 	cfg, err := parseConfig([]string{
 		"-output", output,
-		"-job-type", "demo.echo",
-		"-payload", `{"message":"hello"}`,
+		"-summary", summary,
+		"-workload", "b",
+		"-seed", "41",
 		"-warmup", "0s",
 		"-measurement", "2s",
 		"-drain-timeout", "3s",
@@ -33,7 +35,8 @@ func TestParseConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse config: %v", err)
 	}
-	if cfg.outputPath != output || cfg.submission.JobType != "demo.echo" || cfg.run.MeasurementDuration != 2*time.Second ||
+	if cfg.outputPath != output || cfg.summaryPath != summary || cfg.workload != loadgen.WorkloadSimulatedIO || cfg.seed != 41 ||
+		cfg.run.MeasurementDuration != 2*time.Second ||
 		cfg.run.DrainTimeout != 3*time.Second || cfg.run.PollInterval != 4*time.Millisecond ||
 		cfg.run.MaxOutstanding != 5 || cfg.run.MaxHTTPConcurrency != 2 {
 		t.Fatalf("config = %#v", cfg)
@@ -41,17 +44,23 @@ func TestParseConfig(t *testing.T) {
 }
 
 func TestParseConfigRejectsBoundaryErrors(t *testing.T) {
-	validOutput := filepath.Join(t.TempDir(), "samples.jsonl.gz")
+	directory := t.TempDir()
+	validOutput := filepath.Join(directory, "samples.jsonl.gz")
+	validSummary := filepath.Join(directory, "summary.json")
+	valid := []string{"-output", validOutput, "-summary", validSummary, "-workload", "a"}
 	for _, test := range []struct {
 		name string
 		args []string
 	}{
-		{name: "missing output", args: []string{"-job-type", "demo.echo", "-payload", `{}`}},
-		{name: "missing output parent", args: []string{"-output", filepath.Join(t.TempDir(), "missing", "samples.gz"), "-job-type", "demo.echo", "-payload", `{}`}},
-		{name: "missing job type", args: []string{"-output", validOutput, "-payload", `{}`}},
-		{name: "malformed payload", args: []string{"-output", validOutput, "-job-type", "demo.echo", "-payload", `{`}},
-		{name: "fractional timeout", args: []string{"-output", validOutput, "-job-type", "demo.echo", "-payload", `{}`, "-job-timeout", "1500us"}},
-		{name: "invalid runner config", args: []string{"-output", validOutput, "-job-type", "demo.echo", "-payload", `{}`, "-max-outstanding", "0"}},
+		{name: "missing output", args: []string{"-summary", validSummary, "-workload", "a"}},
+		{name: "missing summary", args: []string{"-output", validOutput, "-workload", "a"}},
+		{name: "missing output parent", args: []string{"-output", filepath.Join(directory, "missing", "samples.gz"), "-summary", validSummary, "-workload", "a"}},
+		{name: "missing summary parent", args: []string{"-output", validOutput, "-summary", filepath.Join(directory, "missing", "summary.json"), "-workload", "a"}},
+		{name: "same output paths", args: []string{"-output", validOutput, "-summary", validOutput, "-workload", "a"}},
+		{name: "missing workload", args: []string{"-output", validOutput, "-summary", validSummary}},
+		{name: "unknown workload", args: append(append([]string{}, valid...), "-workload", "c")},
+		{name: "fractional timeout", args: append(append([]string{}, valid...), "-job-timeout", "1500us")},
+		{name: "invalid runner config", args: append(append([]string{}, valid...), "-max-outstanding", "0")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := parseConfig(test.args, &bytes.Buffer{}, time.Now().UTC()); err == nil {
@@ -91,13 +100,15 @@ func TestRunWritesCompressedSamplesFromPublicHTTPFlow(t *testing.T) {
 	defer server.Close()
 
 	outputPath := filepath.Join(t.TempDir(), "samples.jsonl.gz")
+	summaryPath := filepath.Join(filepath.Dir(outputPath), "summary.json")
 	var stdout, stderr bytes.Buffer
 	err := run(context.Background(), []string{
 		"-api-url", server.URL,
 		"-output", outputPath,
+		"-summary", summaryPath,
 		"-run-id", "command-test",
-		"-job-type", "demo.echo",
-		"-payload", `{"message":"hello"}`,
+		"-workload", "a",
+		"-seed", "41",
 		"-warmup", "0s",
 		"-measurement", "5ms",
 		"-drain-timeout", "50ms",
@@ -126,5 +137,21 @@ func TestRunWritesCompressedSamplesFromPublicHTTPFlow(t *testing.T) {
 	}
 	if terminal, ok := samples[0].(loadgen.TerminalJobSample); !ok || terminal.JobID != jobID || len(terminal.Attempts) != 1 {
 		t.Fatalf("first sample = %#v", samples[0])
+	}
+	regenerated, err := loadgen.SummarizeSamples(samples)
+	if err != nil {
+		t.Fatalf("regenerate summary: %v", err)
+	}
+	encodedSummary, err := os.ReadFile(summaryPath)
+	if err != nil {
+		t.Fatalf("read summary output: %v", err)
+	}
+	var persisted loadgen.Summary
+	if err := json.Unmarshal(encodedSummary, &persisted); err != nil {
+		t.Fatalf("decode summary output: %v", err)
+	}
+	if persisted.RunID != regenerated.RunID || persisted.SubmittedCount != regenerated.SubmittedCount ||
+		persisted.CompletedCount != regenerated.CompletedCount || persisted.EndToEnd != regenerated.EndToEnd {
+		t.Fatalf("persisted summary = %#v, regenerated = %#v", persisted, regenerated)
 	}
 }

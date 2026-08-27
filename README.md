@@ -156,6 +156,14 @@ pwsh ./scripts/dev.ps1 check
 
 This checks formatting, dependencies, pinned tools, generated code, static analysis, tests, builds, and the Compose configuration. It also runs the HTTP smoke test, distributed process test, failure suite, observability proof, and execution-semantics proof against PostgreSQL.
 
+Run the short Milestone 6 benchmark proof by itself:
+
+```powershell
+pwsh ./scripts/dev.ps1 benchmark-smoke
+```
+
+The command starts isolated PostgreSQL, API, dispatcher, and worker processes. It runs a continuous warmup, measurement, and bounded drain for both benchmark workloads through the public HTTP API. Workload A uses `demo.echo` with deterministic seed and sequence fields. Workload B uses `demo.sleep` with the same deterministic fields and an exact `duration_ms: 25` request. Each run writes compressed raw samples, reads them back to generate its JSON summary, checks the required rates and latency samples, and removes every temporary process and Docker resource. The short smoke configuration is validation only; its output is not publishable benchmark evidence.
+
 Run the Milestone 5 observability proof by itself:
 
 ```powershell

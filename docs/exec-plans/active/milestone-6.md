@@ -368,7 +368,7 @@ Add a bounded Go client that submits jobs through HTTP, observes terminal state,
 
 ## Slice 4: queue-overhead and simulated-I/O workloads
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -428,11 +428,21 @@ Implement reproducible Workloads A and B with continuous warmup, measurement, an
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- Workload selection is a typed command-boundary input. Workload A submits `demo.echo` with `{"seed":N,"sequence":N}`. Workload B submits `demo.sleep` with `{"duration_ms":25,"seed":N,"sequence":N}`. Payload bytes depend only on the workload, seed, and sequence, so concurrent slot scheduling cannot change them.
+- The load-generator command now accepts `-workload a|b` and `-seed` instead of arbitrary job-type and payload flags. This keeps the benchmark command on the two approved workloads; recovery Workload C remains deferred to Slice 6.
+- The raw sample schema advanced from version 1 to version 2. Every sample now carries its run ID and measurement window. `cmd/loadgen` closes and reopens the compressed raw file, regenerates the run summary from decoded samples, and then writes the JSON summary. Campaign manifests and cross-run verification remain deferred to Slice 5.
+- Warmup and measurement use one uninterrupted runner. Submission starts are attributed to half-open phase windows, no new job starts at or after the measurement end, and already accepted jobs drain until the configured deadline. Warmup samples remain in raw output and have separate counts but never enter measured rates or percentiles.
+- `benchmark-smoke` uses one worker process with concurrency 4, four outstanding jobs, a 750 ms warmup, a 1.5-second measurement, and a five-second drain. It runs both workloads through the public HTTP API, checks raw and generated summary artifacts, and deletes the temporary artifacts and isolated Docker resources. Its results are explicitly non-publishable.
+- No architecture deviation or new dependency was required.
 
 ### Validation evidence
 
-None yet.
+- `go test -count=1 ./internal/loadgen ./cmd/loadgen` passed against the final code. Tests cover exact Workload A and B payload bytes, seed and sequence determinism, the exact 25 ms sleep request, continuous warmup and measurement samples, boundary attribution, bounded concurrency and drain behavior, explicit incomplete samples, strict schema version 2 round trips, and summary regeneration from decoded gzip samples.
+- Native Windows reported `go: -race requires cgo`. `docker run --rm -v "${PWD}:/src" -w /src golang:1.27.0-bookworm go test -race -count=1 ./internal/loadgen` passed against the Slice 4 code.
+- Two consecutive `pwsh ./scripts/dev.ps1 benchmark-smoke` runs passed. Both ran real API, dispatcher, worker, load-generator, and PostgreSQL processes for Workloads A and B; preserved warmup and measurement samples; reported successful measured completions with no submission, terminal, or incomplete failures; and verified removal of processes, temporary files, containers, network, and volume. The temporary rates were discarded and are not publishable benchmark evidence.
+- Two `pwsh ./scripts/dev.ps1 check` runs passed. The final run validated the exact final code and included formatting, dependency and generation checks, vet, all Go tests and builds, Compose smoke, observability, distributed execution, worker-death recovery, acknowledgement loss, stale completion, shutdown semantics, and cleanup.
+- `git diff --check` passed before the tracking update; the final diff check also passed after it.
+- GitHub-hosted CI was not run and remains unverified.
 
 ## Slice 5: scaling matrix, resource samples, and campaign summaries
 

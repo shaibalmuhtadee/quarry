@@ -4,7 +4,7 @@ param(
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
         "generate", "generate-check", "format-check", "vet", "build",
-        "smoke-test", "distributed-test", "recovery-test", "ack-loss-test", "failure-test", "semantics-test",
+        "smoke-test", "distributed-test", "recovery-test", "ack-loss-test", "failure-test", "semantics-test", "benchmark-smoke",
         "observability-config-test", "observability-test", "observability-up", "observability-down"
     )]
     [string]$Command = "check"
@@ -1101,6 +1101,206 @@ function Test-DistributedProcesses {
             }
         }
     }
+}
+
+function Invoke-BenchmarkSmokeRun {
+    param(
+        [Parameter(Mandatory)]
+        [string]$LoadgenBinary,
+
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("a", "b")]
+        [string]$Workload,
+
+        [Parameter(Mandatory)]
+        [long]$Seed,
+
+        [Parameter(Mandatory)]
+        [string]$RunID,
+
+        [Parameter(Mandatory)]
+        [string]$OutputDirectory
+    )
+
+    $rawPath = Join-Path $OutputDirectory "workload-$Workload.jsonl.gz"
+    $summaryPath = Join-Path $OutputDirectory "workload-$Workload-summary.json"
+    $arguments = @(
+        "-api-url", $BaseURL,
+        "-output", $rawPath,
+        "-summary", $summaryPath,
+        "-run-id", $RunID,
+        "-workload", $Workload,
+        "-seed", [string]$Seed,
+        "-warmup", "750ms",
+        "-measurement", "1500ms",
+        "-drain-timeout", "5s",
+        "-poll-interval", "10ms",
+        "-max-outstanding", "4",
+        "-http-concurrency", "4",
+        "-max-attempts", "1",
+        "-job-timeout", "5s"
+    )
+    & $LoadgenBinary @arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Workload $Workload benchmark smoke run failed with exit code $LASTEXITCODE."
+    }
+    if (-not (Test-Path -LiteralPath $rawPath) -or (Get-Item -LiteralPath $rawPath).Length -eq 0) {
+        throw "Workload $Workload benchmark smoke run did not write raw samples."
+    }
+    if (-not (Test-Path -LiteralPath $summaryPath)) {
+        throw "Workload $Workload benchmark smoke run did not write a summary."
+    }
+
+    $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+    if ($summary.run_id -ne $RunID -or $summary.warmup_sample_count -le 0 -or
+        $summary.measurement_sample_count -le 0) {
+        throw "Workload $Workload benchmark smoke run did not preserve both continuous phases."
+    }
+    if ($summary.submitted_count -le 0 -or $summary.completed_count -le 0 -or
+        $summary.successful_count -le 0 -or $summary.submitted_per_second -le 0 -or
+        $summary.completed_per_second -le 0) {
+        throw "Workload $Workload benchmark smoke run did not measure successful asynchronous execution."
+    }
+    if ($summary.terminal_failure_count -ne 0 -or $summary.submission_failure_count -ne 0 -or
+        $summary.incomplete_count -ne 0) {
+        throw "Workload $Workload benchmark smoke run recorded failed or incomplete work."
+    }
+    if ($summary.end_to_end.count -le 0 -or $summary.scheduling.count -le 0 -or
+        $summary.attempt_duration.count -le 0) {
+        throw "Workload $Workload benchmark smoke run did not generate required duration samples."
+    }
+
+    Write-Host "Benchmark smoke workload $Workload passed: $($summary.completed_count) measured completions at $([math]::Round($summary.completed_per_second, 2)) jobs/s."
+}
+
+function Test-BenchmarkSmoke {
+    $testID = [Guid]::NewGuid().ToString("N")
+    $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "quarry-benchmark-smoke-$testID"
+    $binaryExtension = if ($IsWindows) { ".exe" } else { "" }
+    $apiBinary = Join-Path $temporaryDirectory "quarry-api$binaryExtension"
+    $dispatcherBinary = Join-Path $temporaryDirectory "quarry-dispatcher$binaryExtension"
+    $workerBinary = Join-Path $temporaryDirectory "quarry-worker$binaryExtension"
+    $loadgenBinary = Join-Path $temporaryDirectory "quarry-loadgen$binaryExtension"
+    $previousComposeProject = $env:COMPOSE_PROJECT_NAME
+    $previousPostgresPort = $env:QUARRY_POSTGRES_PORT
+    $composeProject = "quarry-m6-smoke-$testID"
+    $apiProcess = $null
+    $dispatcherProcess = $null
+    $workerProcess = $null
+    $processIDs = [System.Collections.Generic.List[int]]::new()
+
+    $env:COMPOSE_PROJECT_NAME = $composeProject
+    $env:QUARRY_POSTGRES_PORT = [string](Get-AvailableLoopbackPort)
+    $databaseURL = Get-PostgresConnectionString
+
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        Invoke-Go -Arguments @("build", "-o", $apiBinary, "./cmd/api")
+        Invoke-Go -Arguments @("build", "-o", $dispatcherBinary, "./cmd/dispatcher")
+        Invoke-Go -Arguments @("build", "-o", $workerBinary, "./cmd/worker")
+        Invoke-Go -Arguments @("build", "-o", $loadgenBinary, "./cmd/loadgen")
+        Invoke-Docker -Arguments @("compose", "up", "--detach", "--wait", "postgres")
+        Invoke-Goose -MigrationCommand "up"
+
+        $httpPort = Get-AvailableLoopbackPort
+        $dispatcherPort = Get-AvailableLoopbackPort
+        $httpAddress = "127.0.0.1:$httpPort"
+        $dispatcherAddress = "127.0.0.1:$dispatcherPort"
+        $baseURL = "http://$httpAddress"
+        $apiProcess = Start-DistributedProcess -Binary $apiBinary -Environment @{
+            QUARRY_DATABASE_URL = $databaseURL
+            QUARRY_HTTP_ADDR = $httpAddress
+        }
+        $processIDs.Add($apiProcess.Id)
+        Wait-ApiReady -Process $apiProcess -BaseURL $baseURL
+
+        $dispatcherProcess = Start-DistributedProcess -Binary $dispatcherBinary -Environment @{
+            QUARRY_DATABASE_URL = $databaseURL
+            QUARRY_DISPATCHER_ADDR = $dispatcherAddress
+            QUARRY_DISPATCHER_METRICS_ADDR = "127.0.0.1:0"
+        }
+        $processIDs.Add($dispatcherProcess.Id)
+        Wait-TcpReady `
+            -Process $dispatcherProcess `
+            -HostName "127.0.0.1" `
+            -Port $dispatcherPort `
+            -ProcessName "Dispatcher"
+
+        $workerHostName = "benchmark-smoke-worker-$testID"
+        $workerProcess = Start-DistributedProcess -Binary $workerBinary -Environment @{
+            QUARRY_DISPATCHER_ADDR = $dispatcherAddress
+            QUARRY_WORKER_CONCURRENCY = "4"
+            QUARRY_WORKER_HOSTNAME = $workerHostName
+            QUARRY_WORKER_VERSION = "benchmark-smoke"
+            QUARRY_WORKER_METRICS_ADDR = "127.0.0.1:0"
+        }
+        $processIDs.Add($workerProcess.Id)
+        $null = Wait-DistributedWorkers -HostNames @($workerHostName) -Processes @($workerProcess)
+
+        Invoke-BenchmarkSmokeRun `
+            -LoadgenBinary $loadgenBinary `
+            -BaseURL $baseURL `
+            -Workload "a" `
+            -Seed 20260827 `
+            -RunID "benchmark-smoke-a-$testID" `
+            -OutputDirectory $temporaryDirectory
+        Invoke-BenchmarkSmokeRun `
+            -LoadgenBinary $loadgenBinary `
+            -BaseURL $baseURL `
+            -Workload "b" `
+            -Seed 20260827 `
+            -RunID "benchmark-smoke-b-$testID" `
+            -OutputDirectory $temporaryDirectory
+
+        foreach ($process in @($apiProcess, $dispatcherProcess, $workerProcess)) {
+            if ($process.HasExited) {
+                throw "Benchmark-smoke service exited early with code $($process.ExitCode)."
+            }
+        }
+    }
+    finally {
+        try {
+            $stopErrors = @()
+            foreach ($process in @($workerProcess, $dispatcherProcess, $apiProcess)) {
+                if ($null -eq $process) {
+                    continue
+                }
+                try {
+                    Stop-DistributedProcess -Process $process
+                }
+                catch {
+                    $stopErrors += $_
+                }
+            }
+            if ($stopErrors.Count -gt 0) {
+                throw "Failed to stop $($stopErrors.Count) benchmark-smoke processes."
+            }
+        }
+        finally {
+            try {
+                Invoke-Docker -Arguments @("compose", "down", "--volumes")
+            }
+            finally {
+                try {
+                    Remove-DistributedTestDirectory -Directory $temporaryDirectory
+                }
+                finally {
+                    $env:COMPOSE_PROJECT_NAME = $previousComposeProject
+                    $env:QUARRY_POSTGRES_PORT = $previousPostgresPort
+                }
+            }
+        }
+    }
+
+    Assert-ProcessTestCleanup `
+        -TestName "Benchmark-smoke" `
+        -ComposeProject $composeProject `
+        -TemporaryDirectory $temporaryDirectory `
+        -ProcessIDs $processIDs.ToArray()
+    Write-Host "Benchmark smoke passed for Workloads A and B. Output was temporary and is not publishable evidence."
 }
 
 function Build-LinuxWorkerBinary {
@@ -3060,6 +3260,9 @@ try {
         }
         "semantics-test" {
             Test-Semantics
+        }
+        "benchmark-smoke" {
+            Test-BenchmarkSmoke
         }
         "observability-config-test" {
             Test-ObservabilityConfiguration

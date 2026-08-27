@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,9 +35,13 @@ const (
 type config struct {
 	apiURL         string
 	outputPath     string
+	summaryPath    string
 	requestTimeout time.Duration
 	run            loadgen.Config
-	submission     loadgen.Submission
+	workload       loadgen.Workload
+	seed           int64
+	maxAttempts    int32
+	jobTimeout     time.Duration
 }
 
 func main() {
@@ -59,14 +65,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	runner, err := loadgen.NewRunner(client, cfg.run, func(uint64) loadgen.Submission {
-		return loadgen.Submission{
-			JobType:     cfg.submission.JobType,
-			Payload:     append(json.RawMessage(nil), cfg.submission.Payload...),
-			MaxAttempts: cfg.submission.MaxAttempts,
-			Timeout:     cfg.submission.Timeout,
-		}
-	})
+	factory, err := loadgen.NewWorkloadFactory(cfg.workload, cfg.seed, cfg.maxAttempts, cfg.jobTimeout)
+	if err != nil {
+		return err
+	}
+	runner, err := loadgen.NewRunner(client, cfg.run, factory)
 	if err != nil {
 		return err
 	}
@@ -76,23 +79,31 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if writeErr != nil {
 		return errors.Join(runErr, writeErr)
 	}
-	summary, summaryErr := loadgen.Summarize(result)
-	if summaryErr == nil {
-		encoder := json.NewEncoder(stdout)
-		encoder.SetIndent("", "  ")
-		summaryErr = encoder.Encode(summary)
+	persistedSamples, readErr := readSamples(cfg.outputPath)
+	if readErr != nil {
+		return errors.Join(runErr, readErr)
 	}
-	return errors.Join(runErr, summaryErr)
+	summary, summaryErr := loadgen.SummarizeSamples(persistedSamples)
+	if summaryErr != nil {
+		return errors.Join(runErr, summaryErr)
+	}
+	if summaryErr = writeSummary(cfg.summaryPath, summary); summaryErr != nil {
+		return errors.Join(runErr, summaryErr)
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	return errors.Join(runErr, encoder.Encode(summary))
 }
 
 func parseConfig(args []string, stderr io.Writer, now time.Time) (config, error) {
 	flags := flag.NewFlagSet("loadgen", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var cfg config
-	var payload string
+	var workload string
 	var maxAttempts int
 	flags.StringVar(&cfg.apiURL, "api-url", defaultAPIURL, "Quarry API base URL")
 	flags.StringVar(&cfg.outputPath, "output", "", "compressed JSON Lines sample path")
+	flags.StringVar(&cfg.summaryPath, "summary", "", "generated JSON summary path")
 	flags.DurationVar(&cfg.requestTimeout, "request-timeout", defaultRequestTimeout, "per-request timeout")
 	flags.StringVar(&cfg.run.RunID, "run-id", "loadgen-"+now.Format("20060102T150405.000000000Z"), "stable run identifier")
 	flags.DurationVar(&cfg.run.WarmupDuration, "warmup", defaultWarmupDuration, "warmup duration")
@@ -101,10 +112,10 @@ func parseConfig(args []string, stderr io.Writer, now time.Time) (config, error)
 	flags.DurationVar(&cfg.run.PollInterval, "poll-interval", defaultPollInterval, "job polling interval")
 	flags.IntVar(&cfg.run.MaxOutstanding, "max-outstanding", defaultMaxOutstanding, "maximum outstanding jobs")
 	flags.IntVar(&cfg.run.MaxHTTPConcurrency, "http-concurrency", defaultHTTPConcurrency, "maximum concurrent HTTP requests")
-	flags.StringVar(&cfg.submission.JobType, "job-type", "", "job type to submit")
-	flags.StringVar(&payload, "payload", "", "job payload as one JSON value")
+	flags.StringVar(&workload, "workload", "", "benchmark workload: a or b")
+	flags.Int64Var(&cfg.seed, "seed", 1, "deterministic payload seed")
 	flags.IntVar(&maxAttempts, "max-attempts", int(defaultMaxAttempts), "maximum attempts per job")
-	flags.DurationVar(&cfg.submission.Timeout, "job-timeout", defaultJobTimeout, "job execution timeout")
+	flags.DurationVar(&cfg.jobTimeout, "job-timeout", defaultJobTimeout, "job execution timeout")
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
 	}
@@ -114,31 +125,79 @@ func parseConfig(args []string, stderr io.Writer, now time.Time) (config, error)
 	if cfg.outputPath == "" {
 		return config{}, errors.New("-output is required")
 	}
-	parent, err := os.Stat(filepath.Dir(cfg.outputPath))
-	if err != nil || !parent.IsDir() {
-		return config{}, errors.New("-output parent directory must exist")
+	if cfg.summaryPath == "" {
+		return config{}, errors.New("-summary is required")
+	}
+	for name, path := range map[string]string{"output": cfg.outputPath, "summary": cfg.summaryPath} {
+		parent, err := os.Stat(filepath.Dir(path))
+		if err != nil || !parent.IsDir() {
+			return config{}, fmt.Errorf("-%s parent directory must exist", name)
+		}
+	}
+	outputAbsolute, err := filepath.Abs(cfg.outputPath)
+	if err != nil {
+		return config{}, fmt.Errorf("resolve -output: %w", err)
+	}
+	summaryAbsolute, err := filepath.Abs(cfg.summaryPath)
+	if err != nil {
+		return config{}, fmt.Errorf("resolve -summary: %w", err)
+	}
+	samePath := filepath.Clean(outputAbsolute) == filepath.Clean(summaryAbsolute)
+	if runtime.GOOS == "windows" {
+		samePath = strings.EqualFold(filepath.Clean(outputAbsolute), filepath.Clean(summaryAbsolute))
+	}
+	if samePath {
+		return config{}, errors.New("-output and -summary must be different paths")
 	}
 	if cfg.requestTimeout <= 0 {
 		return config{}, errors.New("-request-timeout must be positive")
 	}
-	if cfg.submission.JobType == "" {
-		return config{}, errors.New("-job-type is required")
-	}
-	if payload == "" || !json.Valid([]byte(payload)) {
-		return config{}, errors.New("-payload must contain one JSON value")
+	cfg.workload, err = loadgen.ParseWorkload(workload)
+	if err != nil {
+		return config{}, err
 	}
 	if maxAttempts <= 0 || int64(maxAttempts) > int64(^uint32(0)>>1) {
 		return config{}, errors.New("-max-attempts must be a positive int32")
 	}
-	if cfg.submission.Timeout <= 0 || cfg.submission.Timeout%time.Millisecond != 0 {
+	if cfg.jobTimeout <= 0 || cfg.jobTimeout%time.Millisecond != 0 {
 		return config{}, errors.New("-job-timeout must be a positive whole number of milliseconds")
 	}
-	cfg.submission.Payload = json.RawMessage(payload)
-	cfg.submission.MaxAttempts = int32(maxAttempts)
+	cfg.maxAttempts = int32(maxAttempts)
 	if err := loadgen.ValidateConfig(cfg.run); err != nil {
 		return config{}, err
 	}
 	return cfg, nil
+}
+
+func readSamples(path string) (samples []loadgen.Sample, readErr error) {
+	input, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open sample output: %w", err)
+	}
+	defer func() {
+		readErr = errors.Join(readErr, input.Close())
+	}()
+	samples, err = loadgen.ReadGzipJSONLines(input)
+	if err != nil {
+		return nil, fmt.Errorf("read sample output: %w", err)
+	}
+	return samples, nil
+}
+
+func writeSummary(path string, summary loadgen.Summary) (writeErr error) {
+	output, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("create summary output: %w", err)
+	}
+	defer func() {
+		writeErr = errors.Join(writeErr, output.Close())
+	}()
+	encoder := json.NewEncoder(output)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(summary); err != nil {
+		return fmt.Errorf("write summary output: %w", err)
+	}
+	return nil
 }
 
 func writeSamples(path string, samples []loadgen.Sample) (writeErr error) {

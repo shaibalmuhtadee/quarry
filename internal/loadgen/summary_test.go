@@ -1,6 +1,7 @@
 package loadgen
 
 import (
+	"bytes"
 	"testing"
 	"time"
 )
@@ -40,32 +41,39 @@ func TestSummaryUsesSeparateSubmissionAndCompletionCounters(t *testing.T) {
 	finishedAt := createdAt.Add(5 * time.Millisecond)
 	observedAt := finishedAt.Add(time.Millisecond)
 	attemptFinishedAt := finishedAt
+	header := func(sequence uint64, phase Phase, submissionStartedAt time.Time) SampleHeader {
+		return SampleHeader{
+			RunID: "summary-test", Sequence: sequence, Phase: phase, JobType: "demo.echo", SubmissionStartedAt: submissionStartedAt,
+			MeasurementStartedAt: start, MeasurementEndedAt: end,
+		}
+	}
 	result := RunResult{
+		RunID:                "summary-test",
 		MeasurementStartedAt: start,
 		MeasurementEndedAt:   end,
 		Samples: []Sample{
 			TerminalJobSample{
-				Base:  SampleHeader{Sequence: 1, Phase: PhaseMeasurement, JobType: "demo.echo", SubmissionStartedAt: createdAt},
+				Base:  header(1, PhaseMeasurement, createdAt),
 				JobID: "one", CreatedAt: createdAt, SubmissionCompletedAt: submittedAt,
 				Status: JobStatusSucceeded, FinishedAt: finishedAt, TerminalObservedAt: observedAt,
 				Attempts: []AttemptSample{{Number: 1, WorkerID: "worker", Status: AttemptStatusSucceeded, StartedAt: createdAt.Add(2 * time.Millisecond), FinishedAt: &attemptFinishedAt}},
 			},
 			IncompleteJobSample{
-				Base:  SampleHeader{Sequence: 2, Phase: PhaseMeasurement, JobType: "demo.echo", SubmissionStartedAt: createdAt},
+				Base:  header(2, PhaseMeasurement, createdAt),
 				JobID: "two", CreatedAt: createdAt, SubmissionCompletedAt: submittedAt,
 				LastStatus: JobStatusRunning, DrainEndedAt: end.Add(time.Second),
 			},
 			TerminalJobSample{
-				Base:  SampleHeader{Sequence: 3, Phase: PhaseMeasurement, JobType: "demo.echo", SubmissionStartedAt: createdAt},
+				Base:  header(3, PhaseMeasurement, createdAt),
 				JobID: "three", CreatedAt: createdAt, SubmissionCompletedAt: submittedAt,
 				Status: JobStatusCancelled, FinishedAt: end.Add(time.Second), TerminalObservedAt: end.Add(2 * time.Second),
 			},
 			SubmissionFailureSample{
-				Base:   SampleHeader{Sequence: 4, Phase: PhaseMeasurement, JobType: "demo.echo", SubmissionStartedAt: createdAt},
+				Base:   header(4, PhaseMeasurement, createdAt),
 				Errors: []RequestError{{Operation: OperationSubmit, ObservedAt: createdAt, Message: "bad request"}},
 			},
 			TerminalJobSample{
-				Base:  SampleHeader{Sequence: 5, Phase: PhaseWarmup, JobType: "demo.echo", SubmissionStartedAt: start.Add(-time.Second)},
+				Base:  header(5, PhaseWarmup, start.Add(-time.Second)),
 				JobID: "warmup", CreatedAt: start.Add(-time.Second), SubmissionCompletedAt: start.Add(-time.Second),
 				Status: JobStatusSucceeded, FinishedAt: createdAt, TerminalObservedAt: observedAt,
 			},
@@ -85,8 +93,30 @@ func TestSummaryUsesSeparateSubmissionAndCompletionCounters(t *testing.T) {
 	if summary.SuccessfulCount != 1 || summary.IncompleteCount != 1 || summary.SubmissionFailureCount != 1 {
 		t.Fatalf("summary counts = %#v", summary)
 	}
+	if summary.RunID != result.RunID || summary.WarmupSampleCount != 1 || summary.MeasurementSampleCount != 4 {
+		t.Fatalf("run metadata = %#v", summary)
+	}
 	if summary.EndToEnd.P50 != 5*time.Millisecond || summary.Scheduling.P50 != 2*time.Millisecond ||
 		summary.AttemptDuration.P50 != 3*time.Millisecond || summary.ClientObserved.P50 != 6*time.Millisecond {
 		t.Fatalf("latencies = %#v", summary)
+	}
+}
+
+func TestSummaryRegeneratesFromCompressedRawSamples(t *testing.T) {
+	samples := testSamples()
+	var raw bytes.Buffer
+	if err := WriteGzipJSONLines(&raw, samples); err != nil {
+		t.Fatalf("write raw samples: %v", err)
+	}
+	decoded, err := ReadGzipJSONLines(&raw)
+	if err != nil {
+		t.Fatalf("read raw samples: %v", err)
+	}
+	summary, err := SummarizeSamples(decoded)
+	if err != nil {
+		t.Fatalf("regenerate summary: %v", err)
+	}
+	if summary.RunID != "sample-test" || summary.WarmupSampleCount != 1 || summary.MeasurementSampleCount != 3 {
+		t.Fatalf("regenerated summary = %#v", summary)
 	}
 }

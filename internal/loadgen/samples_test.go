@@ -42,9 +42,9 @@ func TestCompressedJSONLinesRoundTrip(t *testing.T) {
 
 func TestReadJSONLinesRejectsUnknownSchemaAndContradictoryFields(t *testing.T) {
 	for _, input := range []string{
-		`{"schema_version":2,"kind":"submission_failed","sequence":1,"phase":"measurement","job_type":"demo.echo","submission_started_at":"2026-08-27T12:00:00Z","may_have_committed":false,"errors":[{"operation":"submit","observed_at":"2026-08-27T12:00:01Z","retryable":false,"ambiguous":false,"message":"bad"}]}` + "\n",
-		`{"schema_version":1,"kind":"terminal","sequence":1,"phase":"measurement","job_type":"demo.echo","submission_started_at":"2026-08-27T12:00:00Z","submission_completed_at":"2026-08-27T12:00:00Z","job_id":"job","created_at":"2026-08-27T12:00:00Z","status":"running","finished_at":"2026-08-27T12:00:01Z","terminal_observed_at":"2026-08-27T12:00:01Z"}` + "\n",
-		`{"schema_version":1,"kind":"submission_failed","sequence":1,"phase":"measurement","job_type":"demo.echo","submission_started_at":"2026-08-27T12:00:00Z","may_have_committed":false,"errors":[{"operation":"submit","observed_at":"2026-08-27T12:00:01Z","retryable":false,"ambiguous":false,"message":"bad"}],"unknown":true}` + "\n",
+		`{"schema_version":3,"kind":"submission_failed","run_id":"test","sequence":1,"phase":"measurement","job_type":"demo.echo","submission_started_at":"2026-08-27T12:00:00Z","measurement_started_at":"2026-08-27T12:00:00Z","measurement_ended_at":"2026-08-27T12:00:10Z","may_have_committed":false,"errors":[{"operation":"submit","observed_at":"2026-08-27T12:00:01Z","retryable":false,"ambiguous":false,"message":"bad"}]}` + "\n",
+		`{"schema_version":2,"kind":"terminal","run_id":"test","sequence":1,"phase":"measurement","job_type":"demo.echo","submission_started_at":"2026-08-27T12:00:00Z","measurement_started_at":"2026-08-27T12:00:00Z","measurement_ended_at":"2026-08-27T12:00:10Z","submission_completed_at":"2026-08-27T12:00:00Z","job_id":"job","created_at":"2026-08-27T12:00:00Z","status":"running","finished_at":"2026-08-27T12:00:01Z","terminal_observed_at":"2026-08-27T12:00:01Z"}` + "\n",
+		`{"schema_version":2,"kind":"submission_failed","run_id":"test","sequence":1,"phase":"measurement","job_type":"demo.echo","submission_started_at":"2026-08-27T12:00:00Z","measurement_started_at":"2026-08-27T12:00:00Z","measurement_ended_at":"2026-08-27T12:00:10Z","may_have_committed":false,"errors":[{"operation":"submit","observed_at":"2026-08-27T12:00:01Z","retryable":false,"ambiguous":false,"message":"bad"}],"unknown":true}` + "\n",
 	} {
 		if _, err := ReadJSONLines(bytes.NewBufferString(input)); err == nil {
 			t.Fatalf("ReadJSONLines accepted %s", input)
@@ -53,20 +53,28 @@ func TestReadJSONLinesRejectsUnknownSchemaAndContradictoryFields(t *testing.T) {
 }
 
 func testSamples() []Sample {
-	startedAt := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
-	submittedAt := startedAt.Add(time.Millisecond)
+	warmupStartedAt := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	measurementStartedAt := warmupStartedAt.Add(time.Second)
+	measurementEndedAt := measurementStartedAt.Add(10 * time.Second)
+	submittedAt := measurementStartedAt.Add(time.Millisecond)
 	finishedAt := submittedAt.Add(2 * time.Millisecond)
+	header := func(sequence uint64, phase Phase, startedAt time.Time) SampleHeader {
+		return SampleHeader{
+			RunID: "sample-test", Sequence: sequence, Phase: phase, JobType: "demo.echo", SubmissionStartedAt: startedAt,
+			MeasurementStartedAt: measurementStartedAt, MeasurementEndedAt: measurementEndedAt,
+		}
+	}
 	code := "invalid_input"
 	message := "handler rejected input"
 	return []Sample{
 		SubmissionFailureSample{
-			Base:             SampleHeader{Sequence: 1, Phase: PhaseWarmup, JobType: "demo.echo", SubmissionStartedAt: startedAt},
+			Base:             header(1, PhaseWarmup, warmupStartedAt),
 			MayHaveCommitted: true,
 			Errors:           []RequestError{{Operation: OperationSubmit, ObservedAt: submittedAt, Retryable: false, Ambiguous: true, Message: "malformed response"}},
 		},
 		TerminalJobSample{
-			Base:  SampleHeader{Sequence: 2, Phase: PhaseMeasurement, JobType: "demo.echo", SubmissionStartedAt: startedAt},
-			JobID: "job-2", CreatedAt: startedAt, SubmissionCompletedAt: submittedAt,
+			Base:  header(2, PhaseMeasurement, measurementStartedAt),
+			JobID: "job-2", CreatedAt: measurementStartedAt, SubmissionCompletedAt: submittedAt,
 			Status: JobStatusDeadLettered, FinishedAt: finishedAt, TerminalObservedAt: finishedAt.Add(time.Millisecond),
 			Attempts: []AttemptSample{{
 				Number: 1, WorkerID: "worker", Status: AttemptStatusPermanentFailed,
@@ -74,15 +82,15 @@ func testSamples() []Sample {
 			}},
 		},
 		TerminalJobSample{
-			Base:      SampleHeader{Sequence: 3, Phase: PhaseMeasurement, JobType: "demo.echo", SubmissionStartedAt: startedAt},
+			Base:      header(3, PhaseMeasurement, measurementStartedAt),
 			JobID:     "job-3",
-			CreatedAt: startedAt, SubmissionCompletedAt: submittedAt,
+			CreatedAt: measurementStartedAt, SubmissionCompletedAt: submittedAt,
 			Status: JobStatusCancelled, FinishedAt: finishedAt, TerminalObservedAt: finishedAt.Add(time.Millisecond),
 			Attempts: []AttemptSample{},
 		},
 		IncompleteJobSample{
-			Base:  SampleHeader{Sequence: 4, Phase: PhaseMeasurement, JobType: "demo.echo", SubmissionStartedAt: startedAt},
-			JobID: "job-4", CreatedAt: startedAt, SubmissionCompletedAt: submittedAt,
+			Base:  header(4, PhaseMeasurement, measurementStartedAt),
+			JobID: "job-4", CreatedAt: measurementStartedAt, SubmissionCompletedAt: submittedAt,
 			LastStatus: JobStatusRunning, DrainEndedAt: finishedAt,
 			Errors: []RequestError{{Operation: OperationPoll, ObservedAt: finishedAt, Message: "context deadline exceeded"}},
 		},

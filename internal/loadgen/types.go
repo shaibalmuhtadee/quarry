@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const SampleSchemaVersion = 1
+const SampleSchemaVersion = 2
 
 type Phase string
 
@@ -203,10 +203,13 @@ const (
 )
 
 type SampleHeader struct {
-	Sequence            uint64
-	Phase               Phase
-	JobType             string
-	SubmissionStartedAt time.Time
+	RunID                string
+	Sequence             uint64
+	Phase                Phase
+	JobType              string
+	SubmissionStartedAt  time.Time
+	MeasurementStartedAt time.Time
+	MeasurementEndedAt   time.Time
 }
 
 type Sample interface {
