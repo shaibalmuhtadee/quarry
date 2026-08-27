@@ -105,8 +105,46 @@ The processes accept these environment variables:
 - `QUARRY_WORKER_SHUTDOWN_TIMEOUT`: time allowed for active attempts to drain after SIGTERM. The default is `10s`.
 - `QUARRY_RETRY_BASE_DELAY`: dispatcher retry backoff base. The default is `1s`.
 - `QUARRY_RETRY_MAX_DELAY`: dispatcher retry backoff maximum. The default is `60s`.
+- `QUARRY_DISPATCHER_METRICS_ADDR`: dispatcher metrics listen address. The default is `:9464`.
+- `QUARRY_WORKER_METRICS_ADDR`: worker metrics listen address. The default is an available local port.
+- `OTEL_SERVICE_NAME`: OpenTelemetry service name. Each process has a `quarry-*` default.
+- `OTEL_EXPORTER_OTLP_ENDPOINT`: base HTTP endpoint for OTLP traces. Quarry appends `/v1/traces`. The default is `http://localhost:4318`.
+- `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`: complete HTTP endpoint for OTLP traces. This value overrides `OTEL_EXPORTER_OTLP_ENDPOINT`.
 
 The development script also accepts `QUARRY_POSTGRES_PORT` to change the host port used by Docker Compose and migration commands. Set `QUARRY_DATABASE_URL` to the matching port when you run the API.
+
+## Inspect metrics and traces
+
+Start the observability services before you start the Quarry processes:
+
+```powershell
+pwsh ./scripts/dev.ps1 observability-up
+```
+
+Start one worker on the port in the committed Prometheus configuration:
+
+```powershell
+$env:QUARRY_WORKER_METRICS_ADDR = ":9465"
+go run ./cmd/worker
+```
+
+Open these local pages:
+
+- Grafana: `http://localhost:3000/d/quarry-overview/quarry`
+- Jaeger: `http://localhost:16686`
+- Prometheus: `http://localhost:9091`
+
+The API exposes metrics at `http://localhost:8080/metrics`. The dispatcher exposes metrics on port `9464`, and the worker command above exposes metrics on port `9465`.
+
+Use the Quarry dashboard to inspect queue depth, the oldest eligible job, active jobs, active workers, attempt outcomes, and timing data. To inspect one job, get its state and attempts through the API, search JSON logs for its `job_id`, then search Jaeger for the `job.id` tag. Jaeger shows the HTTP submission, PostgreSQL persistence, dispatcher claim, worker and handler execution, attempt report, and PostgreSQL completion in one trace.
+
+Stop only the observability services with:
+
+```powershell
+pwsh ./scripts/dev.ps1 observability-down
+```
+
+Docker Compose accepts these host-port overrides: `QUARRY_PROMETHEUS_PORT`, `QUARRY_GRAFANA_PORT`, `QUARRY_OTEL_GRPC_PORT`, `QUARRY_OTEL_HTTP_PORT`, `QUARRY_OTEL_HEALTH_PORT`, and `QUARRY_JAEGER_PORT`. Prometheus still scrapes the committed application ports `8080`, `9464`, and `9465`.
 
 ## Validate the repository
 
@@ -117,6 +155,14 @@ pwsh ./scripts/dev.ps1 check
 ```
 
 This checks formatting, dependencies, pinned tools, generated code, static analysis, tests, builds, and the Compose configuration. It runs both the HTTP smoke test and the distributed process test against PostgreSQL.
+
+Run the Milestone 5 observability proof by itself:
+
+```powershell
+pwsh ./scripts/dev.ps1 observability-test
+```
+
+The observability test starts isolated PostgreSQL, Prometheus, Grafana, an OpenTelemetry Collector, Jaeger, and real Quarry processes. It submits one `demo.echo` job through HTTP and verifies the result and attempt through the public API. It also checks the three Prometheus targets, success-path metrics, queue-health values, the provisioned Grafana dashboard, structured lifecycle logs, and the complete job trace in Jaeger. The test removes its processes, temporary binaries, containers, network, and volume before it exits.
 
 Run the Milestone 4 execution-semantics proof by itself:
 
@@ -169,4 +215,4 @@ pwsh ./scripts/dev.ps1 generate-check
 
 ## Current limits
 
-Cancellation and timeout are cooperative; Quarry cannot stop a handler that ignores its context. A forced worker shutdown leaves unfinished attempts for lease recovery, so duplicate execution remains possible under the at-least-once guarantee. Metrics and tracing remain deferred to Milestone 5.
+Cancellation and timeout are cooperative; Quarry cannot stop a handler that ignores its context. A forced worker shutdown leaves unfinished attempts for lease recovery, so duplicate execution remains possible under the at-least-once guarantee. The local Jaeger service stores traces in memory and loses them when the container stops.

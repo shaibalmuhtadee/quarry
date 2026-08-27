@@ -624,7 +624,7 @@ Run the local observability infrastructure and provision a useful Quarry Grafana
 
 ## Slice 7: observability demonstration and documentation
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -681,11 +681,22 @@ Add one rerunnable command that proves the Milestone 5 workflow without manual P
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- `observability-test` uses a unique Compose project, an isolated PostgreSQL volume, and random host ports for PostgreSQL and the observability services. The API, dispatcher, and worker use ports 8080, 9090, 9464, and 9465 because the committed Prometheus configuration must scrape stable host targets. The command checks those ports before startup and fails with the conflicting port number.
+- The command captures the three process log streams in memory. It verifies the job ID in submission, claim, start, completion, and report-acknowledgement records, then connects those records to the Jaeger trace ID and succeeded outcome. It does not persist payloads or temporary logs.
+- The successful job exposes the metric families that the command verifies through Prometheus. Retry, lease-expiry, and worker-poll-error vectors do not produce Prometheus metadata until those events occur, so their definition and labels remain covered by the existing metric and configuration tests rather than synthetic failure events in this one-job demonstration.
+- The live OpenTelemetry HTTP server span is named `POST`; `http.request` is the instrumentation operation passed by the API before HTTP route-method naming. The Jaeger assertion follows the exported live span and still requires the full persistence, claim, worker, handler, report, and completion path.
+- After two consecutive standalone passes, `observability-test` was added to the canonical `check` command. No database inspection, benchmark, load generator, recovery measurement, or later-milestone behavior was added.
 
 ### Validation evidence
 
-Not run.
+- `pwsh ./scripts/dev.ps1 observability-test` passed twice consecutively after the final test corrections. The runs verified jobs `f0736306-a3ae-44f2-abbf-e47ac1ea7b3f` and `83d446a7-ba10-4e96-9996-a30661731367`, with complete Jaeger traces `8ee81d33bc1d8901959a380dcd1a101c` and `efa644c114d20adebfda6bb74c571919`.
+- Both standalone runs verified one succeeded `demo.echo` job and attempt through the public API, all three Prometheus targets, the success-path metric families, zero pending and active jobs, one active worker, a healthy queue snapshot, the 13-panel Grafana dashboard, the required structured lifecycle logs, and the complete job trace in Jaeger.
+- Both standalone runs removed their host processes, temporary binaries, five containers, Compose network, and PostgreSQL volume. The cleanup assertions found no remaining resource labeled with the unique Compose project.
+- `pwsh ./scripts/dev.ps1 check` passed with `observability-test` included. Its observability run verified job `05bcdebc-1e3d-4250-b5ed-53d4a0416e2a` and trace `3f24e6dfcf6498f8976c2ee4606a1491`, then the full check passed package tests, builds, static and generated-code checks, observability configuration, migrations, the API smoke path, multi-worker distributed execution, crash recovery, and shutdown semantics.
+- `docker run --rm -v "${PWD}:/src" -w /src golang:1.27.0-bookworm go test -race -count=1 ./internal/telemetry ./internal/worker ./internal/dispatcher -run "Test(AcquireJobsContinuesEachPersistedTraceIndependently|ReportAttemptLogsSafeCommittedLifecycleIdentifiers|ReaperRecordsCommittedRecoveryOutcomes|HTTPAndGRPCInstrumentationPreserveContext|WorkerContinuesAcquiredTraceThroughHandlerAndReport|WorkerRecoversPanicLogsSafeIdentifiersAndContinues)$"` passed on Linux.
+- `git diff --check` passed after the implementation and documentation changes.
+- `git status --short` showed only the four expected Slice 7 files: `scripts/dev.ps1`, `README.md`, this execution plan, and `docs/current-status.md`.
+- GitHub-hosted CI was not run.
 
 ## Milestone audit
 
