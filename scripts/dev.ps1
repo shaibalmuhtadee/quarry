@@ -1950,6 +1950,7 @@ function Wait-PrometheusMetricFamilies {
         "quarry_oldest_queued_job_age_seconds",
         "quarry_active_jobs",
         "quarry_active_workers",
+        "quarry_retries_scheduled_total",
         "quarry_stale_reports_total",
         "quarry_dispatch_claim_size"
     )
@@ -2033,13 +2034,91 @@ function Assert-GrafanaDashboard {
     }
 }
 
-function Wait-JaegerJobTrace {
+function Submit-ObservabilityJob {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$Type,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Payload,
+
+        [Parameter(Mandatory)]
+        [int]$MaxAttempts,
+
+        [Parameter(Mandatory)]
+        [int]$TimeoutMilliseconds
+    )
+
+    $body = @{
+        type = $Type
+        payload = $Payload
+        max_attempts = $MaxAttempts
+        timeout_ms = $TimeoutMilliseconds
+    } | ConvertTo-Json -Compress -Depth 4
+    $submitted = Invoke-RestMethod `
+        -Method Post `
+        -Uri "$BaseURL/v1/jobs" `
+        -ContentType "application/json" `
+        -Body $body `
+        -TimeoutSec 10
+    if ([string]::IsNullOrWhiteSpace($submitted.id) -or $submitted.status -ne "queued") {
+        throw "Observability-test submission did not return a queued job with an ID."
+    }
+    return $submitted
+}
+
+function Wait-ObservabilityJobStatus {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedStatus
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    $jobState = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $jobState = Invoke-RestMethod -Uri "$BaseURL/v1/jobs/$JobID" -TimeoutSec 5
+        if ($jobState.status -eq $ExpectedStatus) {
+            return $jobState
+        }
+        if ($jobState.status -in @("succeeded", "dead_lettered", "cancelled")) {
+            throw "Observability-test job $JobID reached '$($jobState.status)', expected '$ExpectedStatus'."
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    throw "Observability-test job $JobID did not reach '$ExpectedStatus' within 30 seconds. Last status: $($jobState.status)"
+}
+
+function Get-ObservabilityJobAttempts {
     param(
         [Parameter(Mandatory)]
         [string]$BaseURL,
 
         [Parameter(Mandatory)]
         [string]$JobID
+    )
+
+    return @((Invoke-RestMethod -Uri "$BaseURL/v1/jobs/$JobID/attempts" -TimeoutSec 5).attempts)
+}
+
+function Wait-JaegerJobTrace {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID,
+
+        [int]$MinimumAttemptSpans = 1
     )
 
     $tags = [Uri]::EscapeDataString((@{ "job.id" = $JobID } | ConvertTo-Json -Compress))
@@ -2063,8 +2142,15 @@ function Wait-JaegerJobTrace {
                 $operations = @($trace.spans | ForEach-Object { $_.operationName })
                 $lastOperations = $operations
                 $missing = @($requiredOperations | Where-Object { $_ -notin $operations })
-                $hasReport = @($operations | Where-Object { $_ -like "*ReportAttempt*" }).Count -gt 0
-                if ($missing.Count -eq 0 -and $hasReport) {
+                $attemptOperations = @("dispatcher.claim", "db.claim_job", "worker.execute", "handler", "db.complete_attempt")
+                $hasEveryAttempt = $true
+                foreach ($operation in $attemptOperations) {
+                    if (@($operations | Where-Object { $_ -eq $operation }).Count -lt $MinimumAttemptSpans) {
+                        $hasEveryAttempt = $false
+                    }
+                }
+                $reportCount = @($operations | Where-Object { $_ -like "*ReportAttempt*" }).Count
+                if ($missing.Count -eq 0 -and $hasEveryAttempt -and $reportCount -ge $MinimumAttemptSpans) {
                     return [string]$trace.traceID
                 }
             }
@@ -2075,6 +2161,35 @@ function Wait-JaegerJobTrace {
     }
 
     throw "Jaeger did not return the complete job trace within 45 seconds. Last operations: $($lastOperations -join ', ')."
+}
+
+function Assert-ObservabilityRetryLogs {
+    param(
+        [Parameter(Mandatory)]
+        [string]$JobID,
+
+        [Parameter(Mandatory)]
+        [string]$TraceID,
+
+        [Parameter(Mandatory)]
+        [string]$DispatcherOutput,
+
+        [Parameter(Mandatory)]
+        [string]$WorkerOutput
+    )
+
+    $combined = "$DispatcherOutput`n$WorkerOutput"
+    foreach ($value in @(
+        $JobID,
+        $TraceID,
+        '"msg":"retry scheduled"',
+        '"job_outcome":"timed_out"',
+        '"error_code":"execution_timeout"'
+    )) {
+        if (-not $combined.Contains($value)) {
+            throw "Observability-test retry logs do not contain '$value'."
+        }
+    }
 }
 
 function Assert-ObservabilityLogs {
@@ -2206,6 +2321,8 @@ function Test-ObservabilityWorkflow {
             QUARRY_DATABASE_URL = $databaseURL
             QUARRY_DISPATCHER_ADDR = "127.0.0.1:9090"
             QUARRY_DISPATCHER_METRICS_ADDR = "127.0.0.1:9464"
+            QUARRY_RETRY_BASE_DELAY = "10ms"
+            QUARRY_RETRY_MAX_DELAY = "10ms"
             OTEL_EXPORTER_OTLP_ENDPOINT = $collectorEndpoint
         }
         $processIDs.Add($dispatcherHandle.Process.Id)
@@ -2225,41 +2342,28 @@ function Test-ObservabilityWorkflow {
 
         Wait-PrometheusTargets -BaseURL $prometheusURL
 
-        $body = @{
-            type = "demo.echo"
-            payload = @{ message = "observability-test" }
-            max_attempts = 1
-            timeout_ms = 30000
-        } | ConvertTo-Json -Compress -Depth 4
-        $submitted = Invoke-RestMethod `
-            -Method Post `
-            -Uri "http://127.0.0.1:8080/v1/jobs" `
-            -ContentType "application/json" `
-            -Body $body `
-            -TimeoutSec 10
-        if ([string]::IsNullOrWhiteSpace($submitted.id) -or $submitted.status -ne "queued") {
-            throw "Observability-test submission did not return a queued job with an ID."
-        }
-
-        $deadline = [DateTime]::UtcNow.AddSeconds(30)
-        $jobState = $null
-        while ([DateTime]::UtcNow -lt $deadline) {
-            $jobState = Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/jobs/$($submitted.id)" -TimeoutSec 5
-            if ($jobState.status -eq "succeeded") {
-                break
-            }
-            if ($jobState.status -in @("failed", "dead_lettered", "cancelled")) {
-                throw "Observability-test job reached unexpected terminal status '$($jobState.status)'."
-            }
-            Start-Sleep -Milliseconds 100
-        }
-        if ($null -eq $jobState -or $jobState.status -ne "succeeded" -or
-            $jobState.result.message -ne "observability-test") {
+        $baseURL = "http://127.0.0.1:8080"
+        $submitted = Submit-ObservabilityJob -BaseURL $baseURL -Type "demo.echo" `
+            -Payload @{ message = "observability-test" } -MaxAttempts 1 -TimeoutMilliseconds 30000
+        $jobState = Wait-ObservabilityJobStatus -BaseURL $baseURL -JobID $submitted.id -ExpectedStatus "succeeded"
+        if ($jobState.result.message -ne "observability-test") {
             throw "Observability-test job did not complete with the expected public API result."
         }
-        $attempts = @((Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/jobs/$($submitted.id)/attempts" -TimeoutSec 5).attempts)
+        $attempts = Get-ObservabilityJobAttempts -BaseURL $baseURL -JobID $submitted.id
         if ($attempts.Count -ne 1 -or $attempts[0].status -ne "succeeded") {
             throw "Observability-test public API did not return one succeeded attempt."
+        }
+
+        $retryJob = Submit-ObservabilityJob -BaseURL $baseURL -Type "demo.sleep" `
+            -Payload @{ duration_ms = 200 } -MaxAttempts 2 -TimeoutMilliseconds 25
+        $retryState = Wait-ObservabilityJobStatus -BaseURL $baseURL -JobID $retryJob.id -ExpectedStatus "dead_lettered"
+        if ($retryState.attempt_count -ne 2 -or $retryState.latest_failure.error_code -ne "execution_timeout") {
+            throw "Observability-test retry job did not dead-letter after two timed-out attempts."
+        }
+        $retryAttempts = Get-ObservabilityJobAttempts -BaseURL $baseURL -JobID $retryJob.id
+        if ($retryAttempts.Count -ne 2 -or
+            @($retryAttempts | Where-Object { $_.status -eq "timed_out" }).Count -ne 2) {
+            throw "Observability-test public API did not return two timed-out retry attempts."
         }
 
         Wait-PrometheusMetricFamilies -BaseURL $prometheusURL
@@ -2272,6 +2376,15 @@ function Test-ObservabilityWorkflow {
         $null = Wait-PrometheusValue -BaseURL $prometheusURL `
             -Expression 'sum(quarry_job_execution_duration_seconds_count{outcome="succeeded"})' -Accept { param($value) $value -ge 1 } `
             -Description "at least one measured successful execution"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression 'sum(quarry_job_attempts_total{outcome="timed_out"})' -Accept { param($value) $value -ge 2 } `
+            -Description "two committed timed-out attempts"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression 'sum(quarry_job_execution_duration_seconds_count{outcome="timed_out"})' -Accept { param($value) $value -ge 2 } `
+            -Description "two measured timed-out executions"
+        $null = Wait-PrometheusValue -BaseURL $prometheusURL `
+            -Expression 'sum(quarry_retries_scheduled_total{reason="timed_out"})' -Accept { param($value) $value -ge 1 } `
+            -Description "one committed timeout retry"
         $null = Wait-PrometheusValue -BaseURL $prometheusURL `
             -Expression "sum(quarry_job_scheduling_delay_seconds_count)" -Accept { param($value) $value -ge 1 } `
             -Description "at least one measured scheduling delay"
@@ -2296,14 +2409,33 @@ function Test-ObservabilityWorkflow {
 
         Assert-GrafanaDashboard -BaseURL $grafanaURL
         $traceID = Wait-JaegerJobTrace -BaseURL $jaegerURL -JobID $submitted.id
+        $retryTraceID = Wait-JaegerJobTrace -BaseURL $jaegerURL -JobID $retryJob.id -MinimumAttemptSpans 2
+
+        Invoke-Docker -Arguments @("compose", "stop", "otel-collector")
+        $isolationJob = Submit-ObservabilityJob -BaseURL $baseURL -Type "demo.echo" `
+            -Payload @{ message = "collector-unavailable" } -MaxAttempts 1 -TimeoutMilliseconds 30000
+        $isolationState = Wait-ObservabilityJobStatus `
+            -BaseURL $baseURL -JobID $isolationJob.id -ExpectedStatus "succeeded"
+        $isolationAttempts = Get-ObservabilityJobAttempts -BaseURL $baseURL -JobID $isolationJob.id
+        if ($isolationState.result.message -ne "collector-unavailable" -or
+            $isolationAttempts.Count -ne 1 -or $isolationAttempts[0].status -ne "succeeded") {
+            throw "Job state changed when the OpenTelemetry Collector was unavailable."
+        }
 
         $workerOutput = Stop-ObservabilityProcess -Handle $workerHandle
         $dispatcherOutput = Stop-ObservabilityProcess -Handle $dispatcherHandle
         $apiOutput = Stop-ObservabilityProcess -Handle $apiHandle
         Assert-ObservabilityLogs -JobID $submitted.id -TraceID $traceID `
             -ApiOutput $apiOutput -DispatcherOutput $dispatcherOutput -WorkerOutput $workerOutput
+        Assert-ObservabilityRetryLogs -JobID $retryJob.id -TraceID $retryTraceID `
+            -DispatcherOutput $dispatcherOutput -WorkerOutput $workerOutput
+        foreach ($output in @($apiOutput, $dispatcherOutput, $workerOutput)) {
+            if (-not $output.Contains($isolationJob.id)) {
+                throw "Observability-test logs do not contain Collector-unavailable job $($isolationJob.id)."
+            }
+        }
 
-        Write-Host "Observability test passed: job $($submitted.id), trace $traceID, API, logs, Prometheus, Grafana, and Jaeger verified."
+        Write-Host "Observability test passed: success trace $traceID, retry trace $retryTraceID, Collector failure isolation, API, logs, Prometheus, Grafana, and Jaeger verified."
     }
     finally {
         foreach ($handle in @($workerHandle, $dispatcherHandle, $apiHandle)) {

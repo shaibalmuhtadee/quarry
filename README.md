@@ -162,7 +162,7 @@ Run the Milestone 5 observability proof by itself:
 pwsh ./scripts/dev.ps1 observability-test
 ```
 
-The observability test starts isolated PostgreSQL, Prometheus, Grafana, an OpenTelemetry Collector, Jaeger, and real Quarry processes. It submits one `demo.echo` job through HTTP and verifies the result and attempt through the public API. It also checks the three Prometheus targets, success-path metrics, queue-health values, the provisioned Grafana dashboard, structured lifecycle logs, and the complete job trace in Jaeger. The test removes its processes, temporary binaries, containers, network, and volume before it exits.
+The observability test starts isolated PostgreSQL, Prometheus, Grafana, an OpenTelemetry Collector, Jaeger, and real Quarry processes. It verifies a successful job and a two-attempt timeout retry through the public API, metrics, logs, and Jaeger. The test then stops the Collector and proves that another job still completes. It also checks queue-health values, the three Prometheus targets, and the provisioned Grafana dashboard. The test removes its processes, temporary binaries, containers, network, and volume before it exits.
 
 Run the Milestone 4 execution-semantics proof by itself:
 

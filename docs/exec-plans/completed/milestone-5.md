@@ -700,7 +700,30 @@ Add one rerunnable command that proves the Milestone 5 workflow without manual P
 
 ## Milestone audit
 
-Status: not started
+Status: complete
+
+### Findings
+
+- All Milestone 5 build requirements are present in the implementation: 13 Prometheus metric families, PostgreSQL queue-health gauges, OpenTelemetry HTTP and gRPC tracing, persisted W3C `traceparent`, structured lifecycle identifiers, pinned local observability services, a provisioned Grafana dashboard, and documented telemetry configuration.
+- Metric inspection found bounded labels only. Submission and queue metrics omit job type. Attempt and execution job types come from a worker's finite handler registry. Error labels use stable codes. Job IDs, worker IDs, idempotency keys, messages, payloads, URLs, and arbitrary input do not appear as metric labels.
+- Submission, claim, attempt, retry, lease-expiry, and stale-report metrics run only after the owning operation commits or completes. Repeated identical reports return `Applied: false` and do not increment terminal-attempt or retry counters. The worker records handler duration once before any report retry.
+- `GetQueueSnapshot` uses one PostgreSQL statement timestamp. It separates `queued` and `retry_wait`, excludes future work from oldest-eligible age, reports zero for an empty eligible queue, and reads running jobs and active workers from durable state. Collector failure emits only `quarry_queue_snapshot_up 0`; it does not return cached gauges.
+- Trace inspection found one parent chain across HTTP submission, `db.insert_job`, each post-commit `dispatcher.claim`, `db.claim_job`, `worker.execute`, `handler`, the report RPC, and `db.complete_attempt`. Mixed acquisition batches continue each stored trace separately. An idempotent replay preserves the first trace parent.
+- Lifecycle logs contain job, attempt, worker, trace, outcome, and safe failure identifiers where available. Tests and live output show that payloads, idempotency keys, raw trace headers, handler-controlled error details, and panic values do not appear.
+- Prometheus scrapes the API, dispatcher, and demonstration worker. Grafana provisions the Prometheus datasource and 13-panel dashboard. Shared PostgreSQL gauges use `max`. The Collector exports OTLP traces to Jaeger.
+- The audit found two missing process-level proofs. `observability-test` inspected only a successful trace and did not stop the Collector during application work. The audit extended the command with a two-attempt timeout trace and a successful job after Collector shutdown. No runtime architecture or database behavior changed.
+- No Milestone 6 load generator, benchmark, benchmark data, benchmark documentation, acknowledgement-loss injection, application image, or Kubernetes resource exists.
+
+### Validation evidence
+
+- `pwsh ./scripts/dev.ps1 observability-test` passed after the audit fix. It verified success trace `180375e0c9bb79e8a25a493f43d6aac6`, two-attempt timeout trace `9bbc97e6f87944b234aee7b03619cff9`, public job and attempt state, structured logs, success and retry metrics, queue-health gauges, three healthy Prometheus targets, the provisioned Grafana dashboard, and Jaeger spans. It then stopped the Collector and proved that another job still succeeded. Cleanup removed every temporary process, binary, container, network, and volume.
+- `go test -count=1 ./internal/telemetry ./internal/api ./internal/dispatcher ./internal/store/postgres/... ./internal/worker/... ./cmd/api ./cmd/dispatcher ./cmd/worker ./deploy/observability` passed, including real PostgreSQL tests.
+- `pwsh ./scripts/dev.ps1 generate-check` passed.
+- `pwsh ./scripts/dev.ps1 migration-test` passed against real PostgreSQL.
+- `docker run --rm -v "${PWD}:/src" -w /src golang:1.27.0-bookworm go test -race -count=1 ./internal/telemetry ./internal/worker ./internal/dispatcher -run "Test(AcquireJobsContinuesEachPersistedTraceIndependently|ReportAttemptLogsSafeCommittedLifecycleIdentifiers|ReaperRecordsCommittedRecoveryOutcomes|HTTPAndGRPCInstrumentationPreserveContext|WorkerContinuesAcquiredTraceThroughHandlerAndReport|WorkerRecoversPanicLogsSafeIdentifiersAndContinues)$"` passed on Linux.
+- `pwsh ./scripts/dev.ps1 check` passed with the expanded process proof. Its live observability run verified success trace `8f7dc26ce5b148a1777d503abaa0ace6`, two-attempt timeout trace `37530487a0a7690b146145c91307ff72`, and Collector failure isolation. The command also passed package tests, builds, static and generated-code checks, observability configuration validation, migrations, API smoke behavior, distributed execution, crash recovery, shutdown semantics, and cleanup.
+- `git diff --check` passed after the implementation, documentation, status, and execution-plan changes.
+- GitHub-hosted CI was not run.
 
 After every slice is complete, perform a separate audit against `docs/project-plan.md`. Completed slice statuses are not proof that the milestone is complete.
 
