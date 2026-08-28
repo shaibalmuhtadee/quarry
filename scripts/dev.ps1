@@ -1355,46 +1355,58 @@ function New-BenchmarkRunRecord {
 function Wait-BenchmarkRecoveryAttemptBatch {
     param(
         [Parameter(Mandatory)][string]$RunID,
-        [Parameter(Mandatory)][string]$TargetWorkerID,
+        [Parameter(Mandatory)][object[]]$Workers,
         [Parameter(Mandatory)][int]$ExpectedCount,
         [Parameter(Mandatory)][System.Diagnostics.Process]$LoadgenProcess
     )
 
-    if ($RunID -notmatch '^[a-zA-Z0-9-]+$' -or $TargetWorkerID -notmatch '^[0-9a-f-]{36}$') {
-        throw "Recovery benchmark received an invalid run or worker ID."
+    if ($RunID -notmatch '^[a-zA-Z0-9-]+$' -or $Workers.Count -ne 2 -or $ExpectedCount -le 0) {
+        throw "Recovery benchmark received an invalid run, worker set, or expected count."
+    }
+    $workerIDs = @($Workers | ForEach-Object { $_.ID })
+    if (@($workerIDs | Where-Object { $_ -notmatch '^[0-9a-f-]{36}$' }).Count -ne 0 -or
+        @($workerIDs | Select-Object -Unique).Count -ne 2) {
+        throw "Recovery benchmark workers require two distinct UUIDs."
     }
     $query = @"
 SELECT
-    count(*) FILTER (WHERE job_attempts.worker_id = '$TargetWorkerID'::uuid),
-    count(*) FILTER (WHERE job_attempts.worker_id <> '$TargetWorkerID'::uuid)
+    job_attempts.worker_id::text,
+    count(*)
 FROM jobs
 JOIN job_attempts ON job_attempts.job_id = jobs.id
 WHERE jobs.idempotency_key LIKE '$RunID-%'
   AND jobs.status = 'running'
   AND job_attempts.attempt_no = 1
-  AND job_attempts.status = 'running';
+  AND job_attempts.status = 'running'
+GROUP BY job_attempts.worker_id
+ORDER BY job_attempts.worker_id;
 "@
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($LoadgenProcess.HasExited) {
             throw (Get-DistributedProcessFailure `
                 -Process $LoadgenProcess `
-                -Label "Recovery load generator before the target worker owned the measured batch")
+                -Label "Recovery load generator before a ready worker owned the measured batch")
         }
-        $row = @(
+        foreach ($worker in $Workers) {
+            if ($worker.Process.HasExited) {
+                throw "Recovery benchmark worker $($worker.ID) exited before crash injection with code $($worker.Process.ExitCode)."
+            }
+        }
+        $rows = @(
             Invoke-PostgresRows -Query $query |
                 ForEach-Object { $_.Trim() } |
-                Where-Object { $_ -match '^\d+\|\d+$' }
-        ) | Select-Object -Last 1
-        if ($null -ne $row) {
-            $counts = $row.Split('|')
-            if ([int]$counts[0] -eq $ExpectedCount -and [int]$counts[1] -eq 0) {
-                return
+                Where-Object { $_ -match '^[0-9a-f-]{36}\|\d+$' }
+        )
+        if ($rows.Count -eq 1) {
+            $columns = $rows[0].Split('|')
+            if ($columns[0] -in $workerIDs -and [int]$columns[1] -eq $ExpectedCount) {
+                return $columns[0]
             }
         }
         Start-Sleep -Milliseconds 100
     }
-    throw "The target worker did not own $ExpectedCount running attempt-1 jobs within 30 seconds."
+    throw "Neither ready worker owned all $ExpectedCount running attempt-1 jobs within 30 seconds."
 }
 
 function Stop-BenchmarkTargetWorker {
@@ -1562,23 +1574,23 @@ function Invoke-BenchmarkRecoveryConfiguration {
 
     $manifestPath = Join-Path $CampaignRoot "manifest.json"
     $runDirectory = Join-Path $CampaignRoot ($RunRecord.directory -replace '/', [IO.Path]::DirectorySeparatorChar)
-    $targetWorkerProcess = $null
-    $replacementWorkerProcess = $null
+    $firstWorkerProcess = $null
+    $secondWorkerProcess = $null
     $loadgenProcess = $null
     try {
         New-Item -ItemType Directory -Path $runDirectory | Out-Null
-        $targetMetricsPort = Get-AvailableLoopbackPort
-        $targetHostName = "$($RunRecord.run_id)-target"
-        $targetWorkerProcess = Start-DistributedProcess -Binary $WorkerBinary -Environment @{
+        $firstMetricsPort = Get-AvailableLoopbackPort
+        $firstHostName = "$($RunRecord.run_id)-worker-01"
+        $firstWorkerProcess = Start-DistributedProcess -Binary $WorkerBinary -Environment @{
             QUARRY_DISPATCHER_ADDR = $DispatcherAddress
             QUARRY_WORKER_CONCURRENCY = "8"
-            QUARRY_WORKER_HOSTNAME = $targetHostName
-            QUARRY_WORKER_VERSION = "benchmark-recovery-target"
-            QUARRY_WORKER_METRICS_ADDR = "127.0.0.1:$targetMetricsPort"
+            QUARRY_WORKER_HOSTNAME = $firstHostName
+            QUARRY_WORKER_VERSION = "benchmark-recovery"
+            QUARRY_WORKER_METRICS_ADDR = "127.0.0.1:$firstMetricsPort"
             QUARRY_HEARTBEAT_INTERVAL = $HeartbeatInterval
         }
-        $ProcessIDs.Add($targetWorkerProcess.Id)
-        $targetWorkerID = @(Wait-DistributedWorkers -HostNames @($targetHostName) -Processes @($targetWorkerProcess))[0]
+        $ProcessIDs.Add($firstWorkerProcess.Id)
+        $firstWorkerID = @(Wait-DistributedWorkers -HostNames @($firstHostName) -Processes @($firstWorkerProcess))[0]
 
         $jobPath = Join-Path $runDirectory "jobs.jsonl.gz"
         $jobSummaryPath = Join-Path $runDirectory "job-summary.json"
@@ -1613,33 +1625,48 @@ function Invoke-BenchmarkRecoveryConfiguration {
                 throw (Get-DistributedProcessFailure -Process $loadgenProcess -Label "Recovery load generator during warmup")
             }
         }
-        Wait-BenchmarkRecoveryAttemptBatch `
-            -RunID $RunRecord.run_id `
-            -TargetWorkerID $targetWorkerID `
-            -ExpectedCount $RunRecord.config.max_outstanding `
-            -LoadgenProcess $loadgenProcess
-
-        $replacementMetricsPort = Get-AvailableLoopbackPort
-        $replacementHostName = "$($RunRecord.run_id)-replacement"
-        $replacementWorkerProcess = Start-DistributedProcess -Binary $WorkerBinary -Environment @{
+        $secondMetricsPort = Get-AvailableLoopbackPort
+        $secondHostName = "$($RunRecord.run_id)-worker-02"
+        $secondWorkerProcess = Start-DistributedProcess -Binary $WorkerBinary -Environment @{
             QUARRY_DISPATCHER_ADDR = $DispatcherAddress
             QUARRY_WORKER_CONCURRENCY = "8"
-            QUARRY_WORKER_HOSTNAME = $replacementHostName
-            QUARRY_WORKER_VERSION = "benchmark-recovery-replacement"
-            QUARRY_WORKER_METRICS_ADDR = "127.0.0.1:$replacementMetricsPort"
+            QUARRY_WORKER_HOSTNAME = $secondHostName
+            QUARRY_WORKER_VERSION = "benchmark-recovery"
+            QUARRY_WORKER_METRICS_ADDR = "127.0.0.1:$secondMetricsPort"
             QUARRY_HEARTBEAT_INTERVAL = $HeartbeatInterval
         }
-        $ProcessIDs.Add($replacementWorkerProcess.Id)
-        $replacementWorkerID = @(Wait-DistributedWorkers -HostNames @($replacementHostName) -Processes @($replacementWorkerProcess))[0]
-        if ($replacementWorkerID -eq $targetWorkerID) {
-            throw "Recovery benchmark replacement worker reused the target worker ID."
+        $ProcessIDs.Add($secondWorkerProcess.Id)
+        $secondWorkerID = @(Wait-DistributedWorkers -HostNames @($secondHostName) -Processes @($secondWorkerProcess))[0]
+        if ($secondWorkerID -eq $firstWorkerID) {
+            throw "Recovery benchmark workers reused one worker ID."
         }
+
+        $workers = @(
+            [pscustomobject]@{
+                ID = $firstWorkerID
+                Process = $firstWorkerProcess
+                MetricsURL = "http://127.0.0.1:$firstMetricsPort/metrics"
+            },
+            [pscustomobject]@{
+                ID = $secondWorkerID
+                Process = $secondWorkerProcess
+                MetricsURL = "http://127.0.0.1:$secondMetricsPort/metrics"
+            }
+        )
+        $targetWorkerID = Wait-BenchmarkRecoveryAttemptBatch `
+            -RunID $RunRecord.run_id `
+            -Workers $workers `
+            -ExpectedCount $RunRecord.config.max_outstanding `
+            -LoadgenProcess $loadgenProcess
+        $targetWorker = $workers | Where-Object ID -eq $targetWorkerID | Select-Object -First 1
+        $replacementWorker = $workers | Where-Object ID -ne $targetWorkerID | Select-Object -First 1
+        $replacementWorkerID = $replacementWorker.ID
 
         $processMetrics = @(
             [pscustomobject]@{ Name = "api"; ProcessID = $APIProcess.Id; MetricsURL = "$BaseURL/metrics" },
             [pscustomobject]@{ Name = "dispatcher"; ProcessID = $DispatcherProcess.Id; MetricsURL = $DispatcherMetricsURL },
-            [pscustomobject]@{ Name = "worker-target"; ProcessID = $targetWorkerProcess.Id; MetricsURL = "http://127.0.0.1:$targetMetricsPort/metrics" },
-            [pscustomobject]@{ Name = "worker-replacement"; ProcessID = $replacementWorkerProcess.Id; MetricsURL = "http://127.0.0.1:$replacementMetricsPort/metrics" }
+            [pscustomobject]@{ Name = "worker-target"; ProcessID = $targetWorker.Process.Id; MetricsURL = $targetWorker.MetricsURL },
+            [pscustomobject]@{ Name = "worker-replacement"; ProcessID = $replacementWorker.Process.Id; MetricsURL = $replacementWorker.MetricsURL }
         )
         Write-BenchmarkResourceSample `
             -RunID $RunRecord.run_id `
@@ -1647,8 +1674,13 @@ function Invoke-BenchmarkRecoveryConfiguration {
             -PostgresContainer $PostgresContainer `
             -OutputPath $resourcePath
 
-        $workerTerminatedAt = Stop-BenchmarkTargetWorker -Process $targetWorkerProcess
-        $targetWorkerProcess = $null
+        $workerTerminatedAt = Stop-BenchmarkTargetWorker -Process $targetWorker.Process
+        if ($targetWorkerID -eq $firstWorkerID) {
+            $firstWorkerProcess = $null
+        }
+        else {
+            $secondWorkerProcess = $null
+        }
         $recoveryEvent = [ordered]@{
             killed_worker_id = $targetWorkerID
             worker_terminated_at = $workerTerminatedAt.ToString("o")
@@ -1697,7 +1729,7 @@ function Invoke-BenchmarkRecoveryConfiguration {
     }
     finally {
         $stopErrors = @()
-        foreach ($process in @($loadgenProcess, $replacementWorkerProcess, $targetWorkerProcess)) {
+        foreach ($process in @($loadgenProcess, $secondWorkerProcess, $firstWorkerProcess)) {
             if ($null -eq $process) {
                 continue
             }
