@@ -625,7 +625,7 @@ Implement Workload C and measure recovery after terminating a real worker during
 
 ## Slice 7: full measurement campaign and benchmark documentation
 
-Status: not started
+Status: in progress
 
 ### Goal
 
@@ -690,11 +690,16 @@ Run the approved benchmark procedure from one clean revision. Preserve the raw d
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- The first publishable attempt started from clean commit `57bfff19343a42843500206e976b251a795998f85`. All 24 Workload A and B runs completed, but Workload C repetition 1 ended when the load generator exited with code 1. The original process runner did not capture stderr, and recovery filtering occurred before raw samples were written, so that attempt did not preserve enough evidence to diagnose the load-generator failure. The incomplete campaign remains under `benchmarks/invalid/quarry-20260828T163357Z/` and is excluded from published medians.
+- A subsequent unchanged smoke run exposed a separate timing defect: Workload C completed, but fewer than two resource samples fell inside its six-second measurement window. The recovery smoke measurement is now 20 seconds. The publishable 30-second warmup and 120-second measurement remain unchanged.
+- Every benchmark load-generator process now writes stdout and stderr beside its other run artifacts. Workload C also writes its unfiltered compressed samples before attaching recovery metadata, so an invalid recovery run preserves the data and exact error needed for diagnosis.
+- The recovery evidence repair changes only the benchmark command, load-generator artifact ordering, and focused tests. Runtime worker, dispatcher, API, PostgreSQL, workload, lease, metric, and percentile behavior did not change.
 
 ### Validation evidence
 
-None yet.
+- `go test -count=1 ./cmd/loadgen ./internal/loadgen ./cmd/benchmarkctl` passed after the recovery evidence repair. `TestRunPreservesUnfilteredRecoverySamplesWhenEventAttachmentFails` directly verified that an invalid recovery attachment still leaves readable compressed job samples and does not write a success summary.
+- Two consecutive repaired `pwsh ./scripts/dev.ps1 benchmark-smoke` runs passed. Each completed Workloads A and B at one and two workers, preserved two measurement-window resource samples per throughput run, recovered eight Workload C jobs after killing the target worker, regenerated all five valid summaries, and removed its processes, temporary directory, container, network, and volume.
+- PowerShell parsing and `git diff --check` passed after the repair.
 
 ## Milestone audit
 

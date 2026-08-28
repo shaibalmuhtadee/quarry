@@ -77,6 +77,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 	result, runErr := runner.Run(ctx)
 	if cfg.workload == loadgen.WorkloadRecovery {
+		// Preserve the unfiltered samples before recovery validation so an invalid
+		// process run still has enough evidence to diagnose and reproduce.
+		if err := writeSamples(cfg.outputPath, result.Samples); err != nil {
+			return errors.Join(runErr, err)
+		}
 		event, err := readRecoveryEvent(cfg.recoveryEventPath)
 		if err != nil {
 			return errors.Join(runErr, err)

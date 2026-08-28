@@ -177,3 +177,89 @@ func TestRunWritesCompressedSamplesFromPublicHTTPFlow(t *testing.T) {
 		t.Fatalf("persisted summary = %#v, regenerated = %#v", persisted, regenerated)
 	}
 }
+
+func TestRunPreservesUnfilteredRecoverySamplesWhenEventAttachmentFails(t *testing.T) {
+	jobID := uuid.NewString()
+	workerID := uuid.NewString()
+	killedWorkerID := uuid.NewString()
+	createdAt := time.Now().UTC()
+	finishedAt := createdAt.Add(time.Millisecond)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/jobs":
+			writer.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(writer).Encode(submitJobResponse{ID: jobID, Status: "queued", CreatedAt: createdAt})
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/jobs/"+jobID:
+			_ = json.NewEncoder(writer).Encode(map[string]any{
+				"id": jobID, "type": "demo.sleep", "status": "succeeded", "attempt_count": 1,
+				"max_attempts": 3, "timeout_ms": 30000, "result": map[string]any{"ok": true},
+				"created_at": createdAt, "updated_at": finishedAt, "finished_at": finishedAt,
+				"cancel_requested_at": nil,
+			})
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/jobs/"+jobID+"/attempts":
+			_ = json.NewEncoder(writer).Encode(map[string]any{"attempts": []map[string]any{{
+				"attempt_no": 1, "worker_id": workerID, "status": "succeeded",
+				"error_code": nil, "error_message": nil, "started_at": createdAt, "finished_at": finishedAt,
+			}}})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	directory := t.TempDir()
+	outputPath := filepath.Join(directory, "samples.jsonl.gz")
+	summaryPath := filepath.Join(directory, "summary.json")
+	eventPath := filepath.Join(directory, "recovery-event.json")
+	event := map[string]any{
+		"killed_worker_id":     killedWorkerID,
+		"worker_terminated_at": createdAt.Add(time.Microsecond),
+	}
+	encodedEvent, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("encode recovery event: %v", err)
+	}
+	if err := os.WriteFile(eventPath, encodedEvent, 0o600); err != nil {
+		t.Fatalf("write recovery event: %v", err)
+	}
+
+	err = run(context.Background(), []string{
+		"-api-url", server.URL,
+		"-output", outputPath,
+		"-summary", summaryPath,
+		"-recovery-event", eventPath,
+		"-run-id", "recovery-evidence-test",
+		"-workload", "c",
+		"-warmup", "0s",
+		"-measurement", "5ms",
+		"-drain-timeout", "50ms",
+		"-poll-interval", "1ms",
+		"-max-outstanding", "1",
+		"-http-concurrency", "1",
+		"-max-attempts", "3",
+		"-job-timeout", "30s",
+	}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "no terminal jobs from the killed worker") {
+		t.Fatalf("run error = %v, want recovery attachment failure", err)
+	}
+
+	output, err := os.Open(outputPath)
+	if err != nil {
+		t.Fatalf("open preserved samples: %v", err)
+	}
+	defer output.Close()
+	samples, err := loadgen.ReadGzipJSONLines(output)
+	if err != nil {
+		t.Fatalf("read preserved samples: %v", err)
+	}
+	if len(samples) == 0 {
+		t.Fatal("invalid recovery run preserved no samples")
+	}
+	if terminal, ok := samples[0].(loadgen.TerminalJobSample); !ok || terminal.JobID != jobID || terminal.Recovery != nil {
+		t.Fatalf("preserved sample = %#v", samples[0])
+	}
+	if _, err := os.Stat(summaryPath); !os.IsNotExist(err) {
+		t.Fatalf("summary exists for invalid recovery run: %v", err)
+	}
+}

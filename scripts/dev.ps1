@@ -384,14 +384,27 @@ function Start-DistributedProcess {
         [Parameter(Mandatory)]
         [hashtable]$Environment,
 
-        [string[]]$Arguments = @()
+        [string[]]$Arguments = @(),
+
+        [string]$StandardOutputPath,
+
+        [string]$StandardErrorPath
     )
+
+    $captureOutput = -not [string]::IsNullOrWhiteSpace($StandardOutputPath) -or
+        -not [string]::IsNullOrWhiteSpace($StandardErrorPath)
+    if ($captureOutput -and
+        ([string]::IsNullOrWhiteSpace($StandardOutputPath) -or [string]::IsNullOrWhiteSpace($StandardErrorPath))) {
+        throw "Distributed process output capture requires both output paths."
+    }
 
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $Binary
     $startInfo.WorkingDirectory = $repositoryRoot
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $captureOutput
+    $startInfo.RedirectStandardError = $captureOutput
     foreach ($argument in $Arguments) {
         $startInfo.ArgumentList.Add($argument)
     }
@@ -406,7 +419,46 @@ function Start-DistributedProcess {
         throw "Failed to start distributed-test process '$Binary'."
     }
 
+    if ($captureOutput) {
+        $process | Add-Member -NotePropertyName QuarryStandardOutputPath -NotePropertyValue $StandardOutputPath
+        $process | Add-Member -NotePropertyName QuarryStandardErrorPath -NotePropertyValue $StandardErrorPath
+        $process | Add-Member -NotePropertyName QuarryStandardOutputTask -NotePropertyValue $process.StandardOutput.ReadToEndAsync()
+        $process | Add-Member -NotePropertyName QuarryStandardErrorTask -NotePropertyValue $process.StandardError.ReadToEndAsync()
+        $process | Add-Member -NotePropertyName QuarryCaptureCompleted -NotePropertyValue $false
+    }
+
     return $process
+}
+
+function Complete-DistributedProcessCapture {
+    param([Parameter(Mandatory)][System.Diagnostics.Process]$Process)
+
+    if ($null -eq $Process.PSObject.Properties["QuarryCaptureCompleted"] -or $Process.QuarryCaptureCompleted) {
+        return
+    }
+    if (-not $Process.HasExited) {
+        throw "Cannot complete output capture before process $($Process.Id) exits."
+    }
+
+    Set-Content -LiteralPath $Process.QuarryStandardOutputPath -Encoding utf8 `
+        -Value $Process.QuarryStandardOutputTask.GetAwaiter().GetResult()
+    Set-Content -LiteralPath $Process.QuarryStandardErrorPath -Encoding utf8 `
+        -Value $Process.QuarryStandardErrorTask.GetAwaiter().GetResult()
+    $Process.QuarryCaptureCompleted = $true
+}
+
+function Get-DistributedProcessFailure {
+    param(
+        [Parameter(Mandatory)][System.Diagnostics.Process]$Process,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    Complete-DistributedProcessCapture -Process $Process
+    $detail = (Get-Content -LiteralPath $Process.QuarryStandardErrorPath -Raw).Trim()
+    if ([string]::IsNullOrWhiteSpace($detail)) {
+        return "$Label exited with code $($Process.ExitCode)."
+    }
+    return "$Label exited with code $($Process.ExitCode): $detail"
 }
 
 function Stop-DistributedProcess {
@@ -1325,7 +1377,9 @@ WHERE jobs.idempotency_key LIKE '$RunID-%'
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($LoadgenProcess.HasExited) {
-            throw "Recovery load generator exited before the target worker owned the measured batch with code $($LoadgenProcess.ExitCode)."
+            throw (Get-DistributedProcessFailure `
+                -Process $LoadgenProcess `
+                -Label "Recovery load generator before the target worker owned the measured batch")
         }
         $row = @(
             Invoke-PostgresRows -Query $query |
@@ -1415,6 +1469,8 @@ function Invoke-BenchmarkConfiguration {
         $jobPath = Join-Path $runDirectory "jobs.jsonl.gz"
         $jobSummaryPath = Join-Path $runDirectory "job-summary.json"
         $resourcePath = Join-Path $runDirectory "resources.jsonl"
+        $loadgenOutputPath = Join-Path $runDirectory "loadgen.stdout.log"
+        $loadgenErrorPath = Join-Path $runDirectory "loadgen.stderr.log"
         $arguments = @(
             "-api-url", $BaseURL,
             "-output", $jobPath,
@@ -1431,7 +1487,8 @@ function Invoke-BenchmarkConfiguration {
             "-max-attempts", [string]$RunRecord.config.max_attempts,
             "-job-timeout", "$($RunRecord.config.job_timeout)ns"
         )
-        $loadgenProcess = Start-DistributedProcess -Binary $LoadgenBinary -Environment @{} -Arguments $arguments
+        $loadgenProcess = Start-DistributedProcess -Binary $LoadgenBinary -Environment @{} -Arguments $arguments `
+            -StandardOutputPath $loadgenOutputPath -StandardErrorPath $loadgenErrorPath
         $ProcessIDs.Add($loadgenProcess.Id)
         do {
             Write-BenchmarkResourceSample `
@@ -1440,8 +1497,9 @@ function Invoke-BenchmarkConfiguration {
                 -PostgresContainer $PostgresContainer `
                 -OutputPath $resourcePath
         } while (-not $loadgenProcess.WaitForExit(100))
+        Complete-DistributedProcessCapture -Process $loadgenProcess
         if ($loadgenProcess.ExitCode -ne 0) {
-            throw "Load generator exited with code $($loadgenProcess.ExitCode)."
+            throw (Get-DistributedProcessFailure -Process $loadgenProcess -Label "Load generator")
         }
 
         $RunRecord.status = "valid"
@@ -1526,6 +1584,8 @@ function Invoke-BenchmarkRecoveryConfiguration {
         $jobSummaryPath = Join-Path $runDirectory "job-summary.json"
         $resourcePath = Join-Path $runDirectory "resources.jsonl"
         $recoveryEventPath = Join-Path $runDirectory "recovery-event.json"
+        $loadgenOutputPath = Join-Path $runDirectory "loadgen.stdout.log"
+        $loadgenErrorPath = Join-Path $runDirectory "loadgen.stderr.log"
         $arguments = @(
             "-api-url", $BaseURL,
             "-output", $jobPath,
@@ -1543,13 +1603,14 @@ function Invoke-BenchmarkRecoveryConfiguration {
             "-max-attempts", [string]$RunRecord.config.max_attempts,
             "-job-timeout", "$($RunRecord.config.job_timeout)ns"
         )
-        $loadgenProcess = Start-DistributedProcess -Binary $LoadgenBinary -Environment @{} -Arguments $arguments
+        $loadgenProcess = Start-DistributedProcess -Binary $LoadgenBinary -Environment @{} -Arguments $arguments `
+            -StandardOutputPath $loadgenOutputPath -StandardErrorPath $loadgenErrorPath
         $ProcessIDs.Add($loadgenProcess.Id)
 
         if ($RunRecord.config.warmup_duration -gt 0) {
             $warmupMilliseconds = [math]::Ceiling([double]$RunRecord.config.warmup_duration / 1000000) + 6500
             if ($loadgenProcess.WaitForExit([int]$warmupMilliseconds)) {
-                throw "Recovery load generator exited during warmup with code $($loadgenProcess.ExitCode)."
+                throw (Get-DistributedProcessFailure -Process $loadgenProcess -Label "Recovery load generator during warmup")
             }
         }
         Wait-BenchmarkRecoveryAttemptBatch `
@@ -1602,8 +1663,9 @@ function Invoke-BenchmarkRecoveryConfiguration {
                 -OutputPath $resourcePath `
                 -AllowExitedProcesses
         } while (-not $loadgenProcess.WaitForExit(100))
+        Complete-DistributedProcessCapture -Process $loadgenProcess
         if ($loadgenProcess.ExitCode -ne 0) {
-            throw "Recovery load generator exited with code $($loadgenProcess.ExitCode)."
+            throw (Get-DistributedProcessFailure -Process $loadgenProcess -Label "Recovery load generator")
         }
 
         $RunRecord.status = "valid"
@@ -1778,6 +1840,7 @@ function Invoke-BenchmarkCampaign {
         $postgresImage = @(Invoke-Docker -Arguments @("inspect", "--format", "{{.Config.Image}}", $postgresContainer))[0].Trim()
         $warmup = if ($Smoke) { [TimeSpan]::FromMilliseconds(750) } else { [TimeSpan]::FromSeconds(30) }
         $measurement = if ($Smoke) { [TimeSpan]::FromSeconds(6) } else { [TimeSpan]::FromSeconds(120) }
+        $recoveryMeasurement = if ($Smoke) { [TimeSpan]::FromSeconds(20) } else { $measurement }
         $drain = if ($Smoke) { [TimeSpan]::FromSeconds(8) } else { [TimeSpan]::FromSeconds(30) }
         $recoveryWarmup = if ($Smoke) { [TimeSpan]::Zero } else { [TimeSpan]::FromSeconds(30) }
         $recoveryDrain = if ($Smoke) { [TimeSpan]::FromSeconds(15) } else { [TimeSpan]::FromSeconds(30) }
@@ -1811,7 +1874,7 @@ function Invoke-BenchmarkCampaign {
                 -Repetition $repetition `
                 -MaxOutstanding $maxOutstanding `
                 -Warmup $recoveryWarmup `
-                -Measurement $measurement `
+                -Measurement $recoveryMeasurement `
                 -Drain $recoveryDrain `
                 -Seed 20260827))
         }
