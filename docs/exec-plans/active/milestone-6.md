@@ -623,83 +623,76 @@ Implement Workload C and measure recovery after terminating a real worker during
 - `git diff --check` passed after the final implementation and tracking updates. The worktree contains only Slice 6 source, test, command, README, execution-plan, and status changes. No benchmark result or Milestone 7 file was created.
 - GitHub-hosted CI did not run for this slice.
 
-## Slice 7: full measurement campaign and benchmark documentation
+## Slice 7: invalid campaign preservation and benchmark deferral
 
-Status: in progress
+Status: complete
 
 ### Goal
 
-Run the approved benchmark procedure from one clean revision. Preserve the raw data and document only measurements that the data supports.
+Close the full-campaign attempt without publishing partial results. Preserve both failed campaigns as invalid evidence, and defer a replacement publishable campaign, Workload C campaign debugging, and benchmark documentation.
 
 ### Expected files and areas
 
-- new `benchmarks/results/<campaign-id>/`
-- new `docs/benchmarks.md`
-- `README.md`
+- `benchmarks/invalid/quarry-20260828T163357Z/`
+- `benchmarks/invalid/quarry-20260828T175129Z/`
 - `docs/current-status.md`
 - this execution plan
 
 ### Dependencies
 
 - Slices 1 through 6
-- approved and validated campaign parameters
-- a clean committed checkpoint
-- stable Docker Desktop and local process access
+- the artifacts from both failed full campaigns
+- the user-approved decision to stop pursuing publishable results in this slice
 
 ### Important decisions
 
-- Require a clean Git revision before a publishable campaign starts.
-- Use a 30-second warmup and 120-second measured run.
-- Run Workloads A and B three times for every scaling configuration.
-- Run Workload C three times with the approved two-worker configuration.
-- Preserve invalid runs beside their replacements.
-- Publish the median of three valid runs for each configuration.
-- Generate every documented table from committed summary data.
-- Document the exact machine, software, Quarry, workload, and measurement configuration.
-- Document polling effects, local-host placement, PostgreSQL containerization, and other material limits.
-- Describe Workload A as Quarry queue and coordination overhead.
-- Never claim that submitted jobs/s equals completed jobs/s.
-- Do not claim production scalability, high availability, or exactly-once execution.
+- Do not run another full campaign in this slice.
+- Keep each failed campaign under `benchmarks/invalid/` with its original manifest and run artifacts.
+- Add one failure record per campaign without rewriting the raw evidence.
+- Treat each campaign as invalid in full. Valid A and B runs and the second campaign's one valid Workload C run do not make either incomplete campaign publishable.
+- Do not publish measurements, medians, `docs/benchmarks.md`, or resume performance claims from partial campaign data.
+- Defer Workload C campaign debugging and the next publishable campaign.
+- Keep Milestone 6 in progress because the project-plan benchmark evidence and definition of done remain unmet.
+- Leave the Milestone 6 audit not started.
 
 ### Validation required
 
-- `pwsh ./scripts/dev.ps1 benchmark` completes the full campaign
-- every A and B configuration has three valid runs
-- Workload C has three valid recovery runs
-- every run has a manifest, compressed job samples, raw resource samples, and generated summary
-- every required latency and rate appears in raw data and summaries
-- every documented value regenerates from the preserved data
-- `pwsh ./scripts/dev.ps1 benchmark-verify` passes against the campaign
-- `pwsh ./scripts/dev.ps1 failure-test`
+- both failed campaigns remain under `benchmarks/invalid/` with manifests, failure records, and produced run artifacts
+- `benchmarks/results/` contains no campaign presented as publishable
+- `pwsh ./scripts/dev.ps1 benchmark-verify`
 - `pwsh ./scripts/dev.ps1 check`
-- relevant race tests
 - `git diff --check`
 
 ### Milestone requirements satisfied
 
-- real completed jobs/s measurements
-- real end-to-end p50, p95, and p99 measurements
-- real scheduling p50, p95, and p99 measurements
-- real attempt-duration measurements
-- real worker-scaling measurements
-- real recovery-time measurements
-- real CPU, memory, and database-connection measurements
-- preserved raw data
-- benchmark documentation
+- failed and incomplete benchmark evidence remains preserved
+- benchmark summary regeneration remains verifiable
+
+### Milestone requirements deferred
+
+- one complete publishable campaign with three valid runs per configuration
+- publishable completed jobs/s, latency, scheduling, execution, scaling, resource, and recovery measurements
+- `docs/benchmarks.md`
 - repeatable evidence for resume performance and recovery claims
 
 ### Decisions and deviations discovered during implementation
 
-- The first publishable attempt started from clean commit `57bfff19343a42843500206e976b251a795998f85`. All 24 Workload A and B runs completed, but Workload C repetition 1 ended when the load generator exited with code 1. The original process runner did not capture stderr, and recovery filtering occurred before raw samples were written, so that attempt did not preserve enough evidence to diagnose the load-generator failure. The incomplete campaign remains under `benchmarks/invalid/quarry-20260828T163357Z/` and is excluded from published medians.
+- The original Slice 7 goal required a complete publishable campaign and benchmark documentation. The user revised the slice after two failed full campaigns. The replacement campaign, Workload C debugging, and benchmark documentation are now deferred.
+- The first attempt started from clean commit `57bfff19343a03c795216f75c82394aae4ed80fb`. All 24 Workload A and B runs completed. Workload C repetition 1 exited with code 1. The original runner captured neither stderr nor job samples before recovery filtering, so the preserved artifacts do not establish the cause. Workload C repetitions 2 and 3 did not run. The failure record's earlier incorrect full commit hash was corrected against the campaign manifest and Git object.
 - A subsequent unchanged smoke run exposed a separate timing defect: Workload C completed, but fewer than two resource samples fell inside its six-second measurement window. The recovery smoke measurement is now 20 seconds. The publishable 30-second warmup and 120-second measurement remain unchanged.
 - Every benchmark load-generator process now writes stdout and stderr beside its other run artifacts. Workload C also writes its unfiltered compressed samples before attaching recovery metadata, so an invalid recovery run preserves the data and exact error needed for diagnosis.
-- The recovery evidence repair changes only the benchmark command, load-generator artifact ordering, and focused tests. Runtime worker, dispatcher, API, PostgreSQL, workload, lease, metric, and percentile behavior did not change.
+- The second attempt started from clean commit `e649d16dc32f302b691fda87955fbcb6ea8b861d`. All 24 Workload A and B runs and Workload C repetition 1 completed. Workload C repetition 1 has a generated recovery summary for eight affected jobs. Repetition 2 exited with code 1 because the recovery run had no terminal jobs from the killed worker. Its compressed samples, stdout, stderr, resource samples, and recovery event remain preserved. Repetition 3 did not run.
+- Both source manifests retain `publishable: true` because the command started in publishable campaign mode. Their `benchmarks/invalid/` locations and failure records classify the incomplete outcomes. Neither campaign contributes published measurements or medians.
+- The recovery evidence repair changed only the benchmark command, load-generator artifact ordering, and focused tests. Closing this revised slice changes benchmark evidence and tracking documents only. Runtime worker, dispatcher, API, PostgreSQL, workload, lease, metric, and percentile behavior does not change.
 
 ### Validation evidence
 
 - `go test -count=1 ./cmd/loadgen ./internal/loadgen ./cmd/benchmarkctl` passed after the recovery evidence repair. `TestRunPreservesUnfilteredRecoverySamplesWhenEventAttachmentFails` directly verified that an invalid recovery attachment still leaves readable compressed job samples and does not write a success summary.
 - Two consecutive repaired `pwsh ./scripts/dev.ps1 benchmark-smoke` runs passed. Each completed Workloads A and B at one and two workers, preserved two measurement-window resource samples per throughput run, recovered eight Workload C jobs after killing the target worker, regenerated all five valid summaries, and removed its processes, temporary directory, container, network, and volume.
-- PowerShell parsing and `git diff --check` passed after the repair.
+- Direct artifact inspection found both manifests and failure records. Each failed campaign has 12 valid Workload A runs and 12 valid Workload B runs. The first has no valid Workload C run. The second has one valid and two invalid Workload C manifest entries. `benchmarks/results/` is empty.
+- `pwsh ./scripts/dev.ps1 benchmark-verify` passed against deterministic campaign fixtures and the empty committed-results set after both campaigns were placed under `benchmarks/invalid/`.
+- The first sandboxed `pwsh ./scripts/dev.ps1 check` attempt stopped at `go mod tidy -diff` because the sandbox denied access to the Windows Go build cache. The rerun with normal host access passed. It covered formatting, dependency and generation checks, vet, all Go tests and builds, PostgreSQL integration tests, observability, distributed execution, worker-death recovery, acknowledgement loss, stale completion, shutdown semantics, and cleanup.
+- `git diff --check` passed after the campaign preservation and execution-plan update.
 
 ## Milestone audit
 

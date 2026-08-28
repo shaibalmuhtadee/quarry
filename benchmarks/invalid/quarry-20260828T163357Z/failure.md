@@ -1,6 +1,6 @@
 # Invalid campaign record
 
-This campaign started from clean commit `57bfff19343a42843500206e976b251a795998f85` and stopped during Workload C repetition 1.
+This campaign started from clean commit `57bfff19343a03c795216f75c82394aae4ed80fb` and stopped during Workload C repetition 1.
 
 - All 24 Workload A and B runs completed and regenerated successfully.
 - Workload C repetition 1 stopped after the worker-kill procedure because the load generator exited with code 1.
