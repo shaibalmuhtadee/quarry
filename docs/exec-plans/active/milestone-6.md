@@ -446,7 +446,7 @@ Implement reproducible Workloads A and B with continuous warmup, measurement, an
 
 ## Slice 5: scaling matrix, resource samples, and campaign summaries
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -517,11 +517,24 @@ Drive the 1, 2, 4, and 8-worker matrix at concurrency 8. Capture machine, proces
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- Campaign, run, and resource schemas live in `internal/loadgen`. The package strictly decodes external JSON, validates the fixed worker counts and concurrency, requires one in-flight limit across the campaign, and rejects duplicate run IDs, directories, and configuration repetitions.
+- `cmd/benchmarkctl` regenerates run summaries from compressed job samples and raw resource samples. It also generates three-run configuration medians and compares persisted summaries with regenerated values. PowerShell owns process orchestration and external sampling, so the HTTP load generator remains ignorant of PostgreSQL, Docker, worker identities, and internal service state.
+- Every resource sample records each host service's Prometheus `process_cpu_seconds_total` and `process_resident_memory_bytes`, PostgreSQL container CPU and memory from `docker stats`, and Quarry database connections from `pg_stat_activity`. Run summaries report Quarry CPU-counter change divided by elapsed sample time, peak summed Quarry resident memory, average PostgreSQL CPU percentage, peak PostgreSQL memory, and peak database connections.
+- `benchmark-smoke` runs Workloads A and B once at 1 and 2 worker processes, concurrency 8, with a fixed in-flight limit of 8. It also injects an intentional failed configuration, preserves its failure reason until verification, and proves that its worker process stops.
+- `benchmark` drives the approved Workload A and B matrix at 1, 2, 4, and 8 worker processes, concurrency 8, with three repetitions, a 30-second warmup, and a 120-second measurement. It captures the Git state before creating the results directory and refuses publishable runs from a dirty worktree. Workload C remains deferred to Slice 6.
+- `benchmark-verify` exercises deterministic three-run fixtures and verifies any campaigns under `benchmarks/results/`. Invalid runs remain in the manifest and their directories remain present, but only three valid runs contribute to a configuration median.
+- No application image, Kubernetes resource, substantial dependency, architecture deviation, or Milestone 7 feature was added.
 
 ### Validation evidence
 
-None yet.
+- `go test -count=1 ./internal/loadgen ./cmd/loadgen ./cmd/benchmarkctl` passed against the final code. Tests cover strict manifest and resource parsing, exact matrix configuration, stable in-flight limits, raw resource round trips, resource aggregation, three-run median selection, command-level regeneration, tamper detection, and rejection of missing, duplicate, mixed-configuration, and malformed data.
+- `docker run --rm --volume "${PWD}:/src" --workdir /src golang:1.27.0-bookworm go test -race -count=1 ./internal/loadgen` passed. Native Windows race testing remains unavailable because the local Go toolchain has CGO disabled.
+- `go vet ./internal/loadgen ./cmd/loadgen ./cmd/benchmarkctl` and `go build ./cmd/loadgen ./cmd/benchmarkctl` passed.
+- `pwsh ./scripts/dev.ps1 benchmark-verify` passed against the deterministic three-run campaign fixtures after the final changes.
+- Two standalone `pwsh ./scripts/dev.ps1 benchmark-smoke` runs passed. The final run used the exact final harness and completed Workloads A and B at both 1 and 2 worker processes with concurrency 8 and max outstanding 8. Each of the four runs preserved two measurement-window resource samples, regenerated its summary, and reported successful measured completions with no failed or incomplete jobs. The command verified the intentional failed-configuration cleanup and removed every temporary file, host process, container, network, and volume.
+- `pwsh ./scripts/dev.ps1 check` passed against the final code. It included formatting, dependency and generation checks, vet, all Go tests and builds, Compose smoke, observability, distributed execution, worker-death recovery, acknowledgement loss, stale completion, shutdown semantics, and cleanup.
+- `git diff --check` passed after the final implementation changes and again after the tracking update.
+- GitHub-hosted CI was not run and remains unverified.
 
 ## Slice 6: controlled worker-kill recovery benchmark
 

@@ -162,7 +162,17 @@ Run the short Milestone 6 benchmark proof by itself:
 pwsh ./scripts/dev.ps1 benchmark-smoke
 ```
 
-The command starts isolated PostgreSQL, API, dispatcher, and worker processes. It runs a continuous warmup, measurement, and bounded drain for both benchmark workloads through the public HTTP API. Workload A uses `demo.echo` with deterministic seed and sequence fields. Workload B uses `demo.sleep` with the same deterministic fields and an exact `duration_ms: 25` request. Each run writes compressed raw samples, reads them back to generate its JSON summary, checks the required rates and latency samples, and removes every temporary process and Docker resource. The short smoke configuration is validation only; its output is not publishable benchmark evidence.
+The command runs Workloads A and B with one and two worker processes at concurrency 8. Every configuration uses the same in-flight limit. Workload A uses `demo.echo` with deterministic seed and sequence fields. Workload B uses `demo.sleep` with the same fields and an exact `duration_ms: 25` request.
+
+Each run preserves compressed job samples and raw resource samples. Resource samples contain Quarry process CPU and memory, PostgreSQL container CPU and memory, and PostgreSQL connection counts. The command regenerates each run summary, verifies an intentional failed-configuration cleanup, and removes all temporary files and isolated Docker resources. Smoke results are not publishable benchmark evidence.
+
+Verify the campaign aggregation and any committed benchmark results:
+
+```powershell
+pwsh ./scripts/dev.ps1 benchmark-verify
+```
+
+The command regenerates deterministic three-run fixture medians and rejects missing, duplicate, mixed-configuration, malformed, or modified data. If `benchmarks/results/` contains campaigns, it also regenerates and compares their run and campaign summaries.
 
 Run the Milestone 5 observability proof by itself:
 

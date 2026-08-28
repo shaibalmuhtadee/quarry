@@ -4,7 +4,8 @@ param(
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
         "generate", "generate-check", "format-check", "vet", "build",
-        "smoke-test", "distributed-test", "recovery-test", "ack-loss-test", "failure-test", "semantics-test", "benchmark-smoke",
+        "smoke-test", "distributed-test", "recovery-test", "ack-loss-test", "failure-test", "semantics-test",
+        "benchmark-smoke", "benchmark", "benchmark-verify",
         "observability-config-test", "observability-test", "observability-up", "observability-down"
     )]
     [string]$Command = "check"
@@ -381,7 +382,9 @@ function Start-DistributedProcess {
         [string]$Binary,
 
         [Parameter(Mandatory)]
-        [hashtable]$Environment
+        [hashtable]$Environment,
+
+        [string[]]$Arguments = @()
     )
 
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -389,6 +392,9 @@ function Start-DistributedProcess {
     $startInfo.WorkingDirectory = $repositoryRoot
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
+    foreach ($argument in $Arguments) {
+        $startInfo.ArgumentList.Add($argument)
+    }
     foreach ($entry in $Environment.GetEnumerator()) {
         $startInfo.Environment[$entry.Key] = $entry.Value
     }
@@ -1103,110 +1109,403 @@ function Test-DistributedProcesses {
     }
 }
 
-function Invoke-BenchmarkSmokeRun {
-    param(
-        [Parameter(Mandatory)]
-        [string]$LoadgenBinary,
+function ConvertTo-BenchmarkNanoseconds {
+    param([Parameter(Mandatory)][TimeSpan]$Duration)
 
-        [Parameter(Mandatory)]
-        [string]$BaseURL,
-
-        [Parameter(Mandatory)]
-        [ValidateSet("a", "b")]
-        [string]$Workload,
-
-        [Parameter(Mandatory)]
-        [long]$Seed,
-
-        [Parameter(Mandatory)]
-        [string]$RunID,
-
-        [Parameter(Mandatory)]
-        [string]$OutputDirectory
-    )
-
-    $rawPath = Join-Path $OutputDirectory "workload-$Workload.jsonl.gz"
-    $summaryPath = Join-Path $OutputDirectory "workload-$Workload-summary.json"
-    $arguments = @(
-        "-api-url", $BaseURL,
-        "-output", $rawPath,
-        "-summary", $summaryPath,
-        "-run-id", $RunID,
-        "-workload", $Workload,
-        "-seed", [string]$Seed,
-        "-warmup", "750ms",
-        "-measurement", "1500ms",
-        "-drain-timeout", "5s",
-        "-poll-interval", "10ms",
-        "-max-outstanding", "4",
-        "-http-concurrency", "4",
-        "-max-attempts", "1",
-        "-job-timeout", "5s"
-    )
-    & $LoadgenBinary @arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "Workload $Workload benchmark smoke run failed with exit code $LASTEXITCODE."
-    }
-    if (-not (Test-Path -LiteralPath $rawPath) -or (Get-Item -LiteralPath $rawPath).Length -eq 0) {
-        throw "Workload $Workload benchmark smoke run did not write raw samples."
-    }
-    if (-not (Test-Path -LiteralPath $summaryPath)) {
-        throw "Workload $Workload benchmark smoke run did not write a summary."
-    }
-
-    $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
-    if ($summary.run_id -ne $RunID -or $summary.warmup_sample_count -le 0 -or
-        $summary.measurement_sample_count -le 0) {
-        throw "Workload $Workload benchmark smoke run did not preserve both continuous phases."
-    }
-    if ($summary.submitted_count -le 0 -or $summary.completed_count -le 0 -or
-        $summary.successful_count -le 0 -or $summary.submitted_per_second -le 0 -or
-        $summary.completed_per_second -le 0) {
-        throw "Workload $Workload benchmark smoke run did not measure successful asynchronous execution."
-    }
-    if ($summary.terminal_failure_count -ne 0 -or $summary.submission_failure_count -ne 0 -or
-        $summary.incomplete_count -ne 0) {
-        throw "Workload $Workload benchmark smoke run recorded failed or incomplete work."
-    }
-    if ($summary.end_to_end.count -le 0 -or $summary.scheduling.count -le 0 -or
-        $summary.attempt_duration.count -le 0) {
-        throw "Workload $Workload benchmark smoke run did not generate required duration samples."
-    }
-
-    Write-Host "Benchmark smoke workload $Workload passed: $($summary.completed_count) measured completions at $([math]::Round($summary.completed_per_second, 2)) jobs/s."
+    return [long]($Duration.Ticks * 100)
 }
 
-function Test-BenchmarkSmoke {
+function ConvertFrom-DockerSize {
+    param([Parameter(Mandatory)][string]$Value)
+
+    if ($Value -notmatch '^\s*([0-9]+(?:\.[0-9]+)?)\s*(B|kB|KB|KiB|MB|MiB|GB|GiB)\s*$') {
+        throw "Unsupported Docker memory value '$Value'."
+    }
+    $number = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
+    $multiplier = switch ($Matches[2]) {
+        "B" { 1 }
+        { $_ -in @("kB", "KB") } { 1000 }
+        "KiB" { 1024 }
+        "MB" { 1000000 }
+        "MiB" { 1048576 }
+        "GB" { 1000000000 }
+        "GiB" { 1073741824 }
+    }
+    return [uint64][math]::Round($number * $multiplier)
+}
+
+function Get-BenchmarkMachineMetadata {
+    $cpuModel = $env:PROCESSOR_IDENTIFIER
+    $memoryBytes = [uint64]0
+    if ($IsWindows) {
+        try {
+            $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+            $computer = Get-CimInstance Win32_ComputerSystem
+            if (-not [string]::IsNullOrWhiteSpace($cpu.Name)) {
+                $cpuModel = $cpu.Name.Trim()
+            }
+            $memoryBytes = [uint64]$computer.TotalPhysicalMemory
+        }
+        catch {
+        }
+    }
+    elseif (Test-Path -LiteralPath "/proc/meminfo") {
+        $memoryLine = Get-Content -LiteralPath "/proc/meminfo" | Where-Object { $_ -match '^MemTotal:' } | Select-Object -First 1
+        if ($memoryLine -match '^MemTotal:\s+([0-9]+)\s+kB$') {
+            $memoryBytes = [uint64]$Matches[1] * 1024
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($cpuModel)) {
+        $cpuModel = "unknown CPU"
+    }
+    if ($memoryBytes -eq 0) {
+        $memoryBytes = [uint64][GC]::GetGCMemoryInfo().TotalAvailableMemoryBytes
+    }
+    return [ordered]@{
+        os = [Runtime.InteropServices.RuntimeInformation]::OSDescription
+        architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+        cpu_model = $cpuModel
+        logical_cpu_count = [Environment]::ProcessorCount
+        total_memory_bytes = $memoryBytes
+    }
+}
+
+function Get-PrometheusProcessSample {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][int]$ProcessID,
+        [Parameter(Mandatory)][string]$MetricsURL
+    )
+
+    $body = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Uri $MetricsURL).Content
+    $values = @{}
+    foreach ($metric in @("process_cpu_seconds_total", "process_resident_memory_bytes")) {
+        $match = [regex]::Match($body, "(?m)^$metric\s+([-+0-9.eE]+)\s*$")
+        if (-not $match.Success) {
+            throw "Metrics endpoint $MetricsURL omitted $metric."
+        }
+        $values[$metric] = [double]::Parse($match.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture)
+    }
+    return [ordered]@{
+        name = $Name
+        process_id = $ProcessID
+        cpu_seconds = $values.process_cpu_seconds_total
+        resident_memory_bytes = [uint64]$values.process_resident_memory_bytes
+    }
+}
+
+function Write-BenchmarkResourceSample {
+    param(
+        [Parameter(Mandatory)][string]$RunID,
+        [Parameter(Mandatory)][object[]]$ProcessMetrics,
+        [Parameter(Mandatory)][string]$PostgresContainer,
+        [Parameter(Mandatory)][string]$OutputPath
+    )
+
+    $processSamples = @()
+    foreach ($metrics in $ProcessMetrics) {
+        $processSamples += Get-PrometheusProcessSample `
+            -Name $metrics.Name `
+            -ProcessID $metrics.ProcessID `
+            -MetricsURL $metrics.MetricsURL
+    }
+    $statsLine = @(Invoke-Docker -Arguments @(
+        "stats", $PostgresContainer, "--no-stream", "--format", "{{json .}}"
+    )) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1
+    $stats = $statsLine | ConvertFrom-Json
+    $cpuPercent = [double]::Parse(
+        ([string]$stats.CPUPerc).Trim().TrimEnd('%'),
+        [Globalization.CultureInfo]::InvariantCulture
+    )
+    $memoryValue = ([string]$stats.MemUsage).Split('/')[0].Trim()
+    $connectionValue = @(
+        Invoke-PostgresRows -Query "SELECT count(*) FROM pg_stat_activity WHERE datname = 'quarry';" |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -match '^[0-9]+$' }
+    ) | Select-Object -Last 1
+    if ($null -eq $connectionValue) {
+        throw "PostgreSQL connection sampling returned no count."
+    }
+    $sample = [ordered]@{
+        schema_version = 1
+        run_id = $RunID
+        observed_at = [DateTime]::UtcNow.ToString("o")
+        processes = @($processSamples)
+        postgresql = [ordered]@{
+            cpu_percent = $cpuPercent
+            memory_bytes = ConvertFrom-DockerSize -Value $memoryValue
+        }
+        database_connections = [int]$connectionValue
+    }
+    Add-Content -LiteralPath $OutputPath -Encoding utf8 -Value ($sample | ConvertTo-Json -Depth 6 -Compress)
+}
+
+function Write-BenchmarkManifest {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Manifest,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $Manifest.runs = @($Manifest.runs)
+    Set-Content -LiteralPath $Path -Encoding utf8 -Value ($Manifest | ConvertTo-Json -Depth 8)
+}
+
+function New-BenchmarkRunRecord {
+    param(
+        [Parameter(Mandatory)][string]$RunID,
+        [Parameter(Mandatory)][string]$Workload,
+        [Parameter(Mandatory)][int]$WorkerProcesses,
+        [Parameter(Mandatory)][int]$Repetition,
+        [Parameter(Mandatory)][int]$MaxOutstanding,
+        [Parameter(Mandatory)][TimeSpan]$Warmup,
+        [Parameter(Mandatory)][TimeSpan]$Measurement,
+        [Parameter(Mandatory)][TimeSpan]$Drain,
+        [Parameter(Mandatory)][long]$Seed
+    )
+
+    return [ordered]@{
+        run_id = $RunID
+        directory = "runs/$RunID"
+        repetition = $Repetition
+        status = "invalid"
+        failure_reason = "run has not completed"
+        config = [ordered]@{
+            workload = $Workload
+            worker_processes = $WorkerProcesses
+            worker_concurrency = 8
+            max_outstanding = $MaxOutstanding
+            http_concurrency = $MaxOutstanding
+            warmup_duration = ConvertTo-BenchmarkNanoseconds -Duration $Warmup
+            measurement_duration = ConvertTo-BenchmarkNanoseconds -Duration $Measurement
+            drain_timeout = ConvertTo-BenchmarkNanoseconds -Duration $Drain
+            poll_interval = ConvertTo-BenchmarkNanoseconds -Duration ([TimeSpan]::FromMilliseconds(10))
+            seed = $Seed
+            max_attempts = 1
+            job_timeout = ConvertTo-BenchmarkNanoseconds -Duration ([TimeSpan]::FromSeconds(5))
+        }
+    }
+}
+
+function Invoke-BenchmarkConfiguration {
+    param(
+        [Parameter(Mandatory)][string]$WorkerBinary,
+        [Parameter(Mandatory)][string]$LoadgenBinary,
+        [Parameter(Mandatory)][string]$BenchmarkControllerBinary,
+        [Parameter(Mandatory)][string]$BaseURL,
+        [Parameter(Mandatory)][string]$DispatcherAddress,
+        [Parameter(Mandatory)][System.Diagnostics.Process]$APIProcess,
+        [Parameter(Mandatory)][System.Diagnostics.Process]$DispatcherProcess,
+        [Parameter(Mandatory)][string]$DispatcherMetricsURL,
+        [Parameter(Mandatory)][string]$PostgresContainer,
+        [Parameter(Mandatory)][string]$CampaignRoot,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Manifest,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$RunRecord,
+        [Parameter(Mandatory)][System.Collections.Generic.List[int]]$ProcessIDs
+    )
+
+    $manifestPath = Join-Path $CampaignRoot "manifest.json"
+    $runDirectory = Join-Path $CampaignRoot ($RunRecord.directory -replace '/', [IO.Path]::DirectorySeparatorChar)
+    $workerProcesses = @()
+    $loadgenProcess = $null
+    try {
+        New-Item -ItemType Directory -Path $runDirectory | Out-Null
+        $workerHostNames = @()
+        $processMetrics = @(
+            [pscustomobject]@{ Name = "api"; ProcessID = $APIProcess.Id; MetricsURL = "$BaseURL/metrics" },
+            [pscustomobject]@{ Name = "dispatcher"; ProcessID = $DispatcherProcess.Id; MetricsURL = $DispatcherMetricsURL }
+        )
+        for ($index = 1; $index -le $RunRecord.config.worker_processes; $index++) {
+            $metricsPort = Get-AvailableLoopbackPort
+            $hostName = "$($RunRecord.run_id)-worker-$('{0:D2}' -f $index)"
+            $worker = Start-DistributedProcess -Binary $WorkerBinary -Environment @{
+                QUARRY_DISPATCHER_ADDR = $DispatcherAddress
+                QUARRY_WORKER_CONCURRENCY = "8"
+                QUARRY_WORKER_HOSTNAME = $hostName
+                QUARRY_WORKER_VERSION = "benchmark"
+                QUARRY_WORKER_METRICS_ADDR = "127.0.0.1:$metricsPort"
+                QUARRY_HEARTBEAT_INTERVAL = "5s"
+            }
+            $workerProcesses += $worker
+            $workerHostNames += $hostName
+            $ProcessIDs.Add($worker.Id)
+            $processMetrics += [pscustomobject]@{
+                Name = "worker-$('{0:D2}' -f $index)"
+                ProcessID = $worker.Id
+                MetricsURL = "http://127.0.0.1:$metricsPort/metrics"
+            }
+        }
+        $null = Wait-DistributedWorkers -HostNames $workerHostNames -Processes $workerProcesses
+
+        $jobPath = Join-Path $runDirectory "jobs.jsonl.gz"
+        $jobSummaryPath = Join-Path $runDirectory "job-summary.json"
+        $resourcePath = Join-Path $runDirectory "resources.jsonl"
+        $arguments = @(
+            "-api-url", $BaseURL,
+            "-output", $jobPath,
+            "-summary", $jobSummaryPath,
+            "-run-id", $RunRecord.run_id,
+            "-workload", $RunRecord.config.workload,
+            "-seed", [string]$RunRecord.config.seed,
+            "-warmup", "$($RunRecord.config.warmup_duration)ns",
+            "-measurement", "$($RunRecord.config.measurement_duration)ns",
+            "-drain-timeout", "$($RunRecord.config.drain_timeout)ns",
+            "-poll-interval", "$($RunRecord.config.poll_interval)ns",
+            "-max-outstanding", [string]$RunRecord.config.max_outstanding,
+            "-http-concurrency", [string]$RunRecord.config.http_concurrency,
+            "-max-attempts", [string]$RunRecord.config.max_attempts,
+            "-job-timeout", "$($RunRecord.config.job_timeout)ns"
+        )
+        $loadgenProcess = Start-DistributedProcess -Binary $LoadgenBinary -Environment @{} -Arguments $arguments
+        $ProcessIDs.Add($loadgenProcess.Id)
+        do {
+            Write-BenchmarkResourceSample `
+                -RunID $RunRecord.run_id `
+                -ProcessMetrics $processMetrics `
+                -PostgresContainer $PostgresContainer `
+                -OutputPath $resourcePath
+        } while (-not $loadgenProcess.WaitForExit(100))
+        if ($loadgenProcess.ExitCode -ne 0) {
+            throw "Load generator exited with code $($loadgenProcess.ExitCode)."
+        }
+
+        $RunRecord.status = "valid"
+        $RunRecord.Remove("failure_reason")
+        Write-BenchmarkManifest -Manifest $Manifest -Path $manifestPath
+        & $BenchmarkControllerBinary "summarize-run" "-campaign-root" $CampaignRoot "-run-id" $RunRecord.run_id
+        if ($LASTEXITCODE -ne 0) {
+            throw "Benchmark summary regeneration failed with exit code $LASTEXITCODE."
+        }
+        $summary = Get-Content -LiteralPath (Join-Path $runDirectory "summary.json") -Raw | ConvertFrom-Json
+        if ($summary.jobs.run_id -ne $RunRecord.run_id -or $summary.jobs.completed_count -le 0 -or
+            $summary.resources.sample_count -lt 2 -or $summary.config.worker_processes -ne $RunRecord.config.worker_processes -or
+            $summary.config.worker_concurrency -ne 8 -or $summary.config.max_outstanding -ne $RunRecord.config.max_outstanding) {
+            throw "Benchmark run summary did not preserve the required configuration and measurements."
+        }
+        Write-Host "Benchmark run $($RunRecord.run_id) passed with $($summary.jobs.completed_count) measured completions and $($summary.resources.sample_count) resource samples."
+    }
+    catch {
+        $RunRecord.status = "invalid"
+        $RunRecord.failure_reason = $_.Exception.Message
+        Write-BenchmarkManifest -Manifest $Manifest -Path $manifestPath
+        throw
+    }
+    finally {
+        $stopErrors = @()
+        foreach ($process in @($loadgenProcess) + @($workerProcesses)) {
+            if ($null -eq $process) {
+                continue
+            }
+            try {
+                Stop-DistributedProcess -Process $process
+            }
+            catch {
+                $stopErrors += $_
+            }
+        }
+        if ($stopErrors.Count -gt 0) {
+            throw "Failed to stop $($stopErrors.Count) benchmark configuration processes."
+        }
+    }
+}
+
+function Test-BenchmarkFailedConfigurationCleanup {
+    param(
+        [Parameter(Mandatory)][string]$WorkerBinary,
+        [Parameter(Mandatory)][string]$DispatcherAddress,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$RunRecord,
+        [Parameter(Mandatory)][string]$CampaignRoot,
+        [Parameter(Mandatory)][System.Collections.Generic.List[int]]$ProcessIDs
+    )
+
+    $runDirectory = Join-Path $CampaignRoot ($RunRecord.directory -replace '/', [IO.Path]::DirectorySeparatorChar)
+    New-Item -ItemType Directory -Path $runDirectory | Out-Null
+    $workerProcess = $null
+    $workerProcessID = 0
+    $failureObserved = $false
+    try {
+        $metricsPort = Get-AvailableLoopbackPort
+        $hostName = "$($RunRecord.run_id)-worker"
+        $workerProcess = Start-DistributedProcess -Binary $WorkerBinary -Environment @{
+            QUARRY_DISPATCHER_ADDR = $DispatcherAddress
+            QUARRY_WORKER_CONCURRENCY = "8"
+            QUARRY_WORKER_HOSTNAME = $hostName
+            QUARRY_WORKER_VERSION = "benchmark-cleanup-probe"
+            QUARRY_WORKER_METRICS_ADDR = "127.0.0.1:$metricsPort"
+        }
+        $ProcessIDs.Add($workerProcess.Id)
+        $workerProcessID = $workerProcess.Id
+        $null = Wait-DistributedWorkers -HostNames @($hostName) -Processes @($workerProcess)
+        throw "intentional failed-configuration cleanup probe"
+    }
+    catch {
+        if ($_.Exception.Message -ne "intentional failed-configuration cleanup probe") {
+            throw
+        }
+        $failureObserved = $true
+        $RunRecord.failure_reason = $_.Exception.Message
+    }
+    finally {
+        if ($null -ne $workerProcess) {
+            Stop-DistributedProcess -Process $workerProcess
+        }
+    }
+    if (-not $failureObserved -or $null -ne (Get-Process -Id $workerProcessID -ErrorAction SilentlyContinue)) {
+        throw "Failed benchmark configuration did not clean up its worker process."
+    }
+}
+
+function Invoke-BenchmarkCampaign {
+    param([switch]$Smoke)
+
     $testID = [Guid]::NewGuid().ToString("N")
-    $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "quarry-benchmark-smoke-$testID"
+    $campaignID = if ($Smoke) { "smoke-$testID" } else { "quarry-$([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))" }
+    $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "quarry-benchmark-$testID"
+    $campaignRoot = if ($Smoke) {
+        Join-Path $temporaryDirectory "campaign"
+    }
+    else {
+        Join-Path $repositoryRoot "benchmarks/results/$campaignID"
+    }
+    if (-not $Smoke -and @(git status --porcelain --untracked-files=all).Count -ne 0) {
+        throw "Publishable benchmark requires a clean Git worktree."
+    }
+    $initialGitCommit = (& git rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw "git rev-parse HEAD failed."
+    }
+    $initialGitState = if (@(git status --porcelain --untracked-files=all).Count -eq 0) { "clean" } else { "dirty" }
+
     $binaryExtension = if ($IsWindows) { ".exe" } else { "" }
     $apiBinary = Join-Path $temporaryDirectory "quarry-api$binaryExtension"
     $dispatcherBinary = Join-Path $temporaryDirectory "quarry-dispatcher$binaryExtension"
     $workerBinary = Join-Path $temporaryDirectory "quarry-worker$binaryExtension"
     $loadgenBinary = Join-Path $temporaryDirectory "quarry-loadgen$binaryExtension"
+    $benchmarkControllerBinary = Join-Path $temporaryDirectory "quarry-benchmarkctl$binaryExtension"
     $previousComposeProject = $env:COMPOSE_PROJECT_NAME
     $previousPostgresPort = $env:QUARRY_POSTGRES_PORT
-    $composeProject = "quarry-m6-smoke-$testID"
+    $composeProject = "quarry-m6-benchmark-$testID"
     $apiProcess = $null
     $dispatcherProcess = $null
-    $workerProcess = $null
     $processIDs = [System.Collections.Generic.List[int]]::new()
-
     $env:COMPOSE_PROJECT_NAME = $composeProject
     $env:QUARRY_POSTGRES_PORT = [string](Get-AvailableLoopbackPort)
     $databaseURL = Get-PostgresConnectionString
 
     try {
         New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $campaignRoot "runs") -Force | Out-Null
         Invoke-Go -Arguments @("build", "-o", $apiBinary, "./cmd/api")
         Invoke-Go -Arguments @("build", "-o", $dispatcherBinary, "./cmd/dispatcher")
         Invoke-Go -Arguments @("build", "-o", $workerBinary, "./cmd/worker")
         Invoke-Go -Arguments @("build", "-o", $loadgenBinary, "./cmd/loadgen")
+        Invoke-Go -Arguments @("build", "-o", $benchmarkControllerBinary, "./cmd/benchmarkctl")
         Invoke-Docker -Arguments @("compose", "up", "--detach", "--wait", "postgres")
         Invoke-Goose -MigrationCommand "up"
+        $postgresContainer = @(Invoke-Docker -Arguments @("compose", "ps", "--quiet", "postgres"))[0].Trim()
 
         $httpPort = Get-AvailableLoopbackPort
         $dispatcherPort = Get-AvailableLoopbackPort
+        $dispatcherMetricsPort = Get-AvailableLoopbackPort
         $httpAddress = "127.0.0.1:$httpPort"
         $dispatcherAddress = "127.0.0.1:$dispatcherPort"
         $baseURL = "http://$httpAddress"
@@ -1216,55 +1515,124 @@ function Test-BenchmarkSmoke {
         }
         $processIDs.Add($apiProcess.Id)
         Wait-ApiReady -Process $apiProcess -BaseURL $baseURL
-
         $dispatcherProcess = Start-DistributedProcess -Binary $dispatcherBinary -Environment @{
             QUARRY_DATABASE_URL = $databaseURL
             QUARRY_DISPATCHER_ADDR = $dispatcherAddress
-            QUARRY_DISPATCHER_METRICS_ADDR = "127.0.0.1:0"
+            QUARRY_DISPATCHER_METRICS_ADDR = "127.0.0.1:$dispatcherMetricsPort"
+            QUARRY_LEASE_DURATION = "20s"
+            QUARRY_REAPER_INTERVAL = "1s"
+            QUARRY_REAPER_BATCH_SIZE = "100"
         }
         $processIDs.Add($dispatcherProcess.Id)
-        Wait-TcpReady `
-            -Process $dispatcherProcess `
-            -HostName "127.0.0.1" `
-            -Port $dispatcherPort `
-            -ProcessName "Dispatcher"
+        Wait-TcpReady -Process $dispatcherProcess -HostName "127.0.0.1" -Port $dispatcherPort -ProcessName "Dispatcher"
 
-        $workerHostName = "benchmark-smoke-worker-$testID"
-        $workerProcess = Start-DistributedProcess -Binary $workerBinary -Environment @{
-            QUARRY_DISPATCHER_ADDR = $dispatcherAddress
-            QUARRY_WORKER_CONCURRENCY = "4"
-            QUARRY_WORKER_HOSTNAME = $workerHostName
-            QUARRY_WORKER_VERSION = "benchmark-smoke"
-            QUARRY_WORKER_METRICS_ADDR = "127.0.0.1:0"
+        $goVersion = (& $script:GoExecutable version).Trim()
+        $dockerVersion = @(Invoke-Docker -Arguments @("version", "--format", "{{.Client.Version}}/{{.Server.Version}}"))[0].Trim()
+        $postgresImage = @(Invoke-Docker -Arguments @("inspect", "--format", "{{.Config.Image}}", $postgresContainer))[0].Trim()
+        $warmup = if ($Smoke) { [TimeSpan]::FromMilliseconds(750) } else { [TimeSpan]::FromSeconds(30) }
+        $measurement = if ($Smoke) { [TimeSpan]::FromSeconds(6) } else { [TimeSpan]::FromSeconds(120) }
+        $drain = if ($Smoke) { [TimeSpan]::FromSeconds(8) } else { [TimeSpan]::FromSeconds(30) }
+        $maxOutstanding = 8
+        $workerCounts = if ($Smoke) { @(1, 2) } else { @(1, 2, 4, 8) }
+        $repetitions = if ($Smoke) { @(1) } else { @(1, 2, 3) }
+        $runs = [System.Collections.Generic.List[object]]::new()
+        foreach ($workload in @("a", "b")) {
+            foreach ($workerCount in $workerCounts) {
+                foreach ($repetition in $repetitions) {
+                    $runID = "$campaignID-$workload-w$workerCount-r$repetition"
+                    $runs.Add((New-BenchmarkRunRecord `
+                        -RunID $runID `
+                        -Workload $workload `
+                        -WorkerProcesses $workerCount `
+                        -Repetition $repetition `
+                        -MaxOutstanding $maxOutstanding `
+                        -Warmup $warmup `
+                        -Measurement $measurement `
+                        -Drain $drain `
+                        -Seed 20260827))
+                }
+            }
         }
-        $processIDs.Add($workerProcess.Id)
-        $null = Wait-DistributedWorkers -HostNames @($workerHostName) -Processes @($workerProcess)
+        if ($Smoke) {
+            $runs.Add((New-BenchmarkRunRecord `
+                -RunID "$campaignID-cleanup-probe" `
+                -Workload "a" `
+                -WorkerProcesses 1 `
+                -Repetition 2 `
+                -MaxOutstanding $maxOutstanding `
+                -Warmup $warmup `
+                -Measurement $measurement `
+                -Drain $drain `
+                -Seed 20260827))
+        }
+        $manifest = [ordered]@{
+            schema_version = 1
+            campaign_id = $campaignID
+            publishable = -not $Smoke
+            created_at = [DateTime]::UtcNow.ToString("o")
+            git = [ordered]@{ commit = $initialGitCommit; worktree_state = $initialGitState }
+            machine = Get-BenchmarkMachineMetadata
+            software = [ordered]@{
+                go_version = $goVersion
+                docker_version = $dockerVersion
+                postgres_image = $postgresImage
+            }
+            quarry = [ordered]@{
+                lease_duration = ConvertTo-BenchmarkNanoseconds -Duration ([TimeSpan]::FromSeconds(20))
+                reaper_interval = ConvertTo-BenchmarkNanoseconds -Duration ([TimeSpan]::FromSeconds(1))
+                reaper_batch_size = 100
+                worker_heartbeat_interval = ConvertTo-BenchmarkNanoseconds -Duration ([TimeSpan]::FromSeconds(5))
+            }
+            runs = $runs
+        }
+        $manifestPath = Join-Path $campaignRoot "manifest.json"
+        Write-BenchmarkManifest -Manifest $manifest -Path $manifestPath
 
-        Invoke-BenchmarkSmokeRun `
-            -LoadgenBinary $loadgenBinary `
-            -BaseURL $baseURL `
-            -Workload "a" `
-            -Seed 20260827 `
-            -RunID "benchmark-smoke-a-$testID" `
-            -OutputDirectory $temporaryDirectory
-        Invoke-BenchmarkSmokeRun `
-            -LoadgenBinary $loadgenBinary `
-            -BaseURL $baseURL `
-            -Workload "b" `
-            -Seed 20260827 `
-            -RunID "benchmark-smoke-b-$testID" `
-            -OutputDirectory $temporaryDirectory
-
-        foreach ($process in @($apiProcess, $dispatcherProcess, $workerProcess)) {
-            if ($process.HasExited) {
-                throw "Benchmark-smoke service exited early with code $($process.ExitCode)."
+        foreach ($runRecord in @($runs)) {
+            if ($Smoke -and $runRecord.run_id.EndsWith("cleanup-probe")) {
+                Test-BenchmarkFailedConfigurationCleanup `
+                    -WorkerBinary $workerBinary `
+                    -DispatcherAddress $dispatcherAddress `
+                    -RunRecord $runRecord `
+                    -CampaignRoot $campaignRoot `
+                    -ProcessIDs $processIDs
+                Write-BenchmarkManifest -Manifest $manifest -Path $manifestPath
+                continue
+            }
+            Invoke-BenchmarkConfiguration `
+                -WorkerBinary $workerBinary `
+                -LoadgenBinary $loadgenBinary `
+                -BenchmarkControllerBinary $benchmarkControllerBinary `
+                -BaseURL $baseURL `
+                -DispatcherAddress $dispatcherAddress `
+                -APIProcess $apiProcess `
+                -DispatcherProcess $dispatcherProcess `
+                -DispatcherMetricsURL "http://127.0.0.1:$dispatcherMetricsPort/metrics" `
+                -PostgresContainer $postgresContainer `
+                -CampaignRoot $campaignRoot `
+                -Manifest $manifest `
+                -RunRecord $runRecord `
+                -ProcessIDs $processIDs
+        }
+        & $benchmarkControllerBinary "verify-runs" "-campaign-root" $campaignRoot
+        if ($LASTEXITCODE -ne 0) {
+            throw "Benchmark run verification failed with exit code $LASTEXITCODE."
+        }
+        if (-not $Smoke) {
+            & $benchmarkControllerBinary "summarize-campaign" "-campaign-root" $campaignRoot
+            if ($LASTEXITCODE -ne 0) {
+                throw "Benchmark campaign aggregation failed with exit code $LASTEXITCODE."
+            }
+            & $benchmarkControllerBinary "verify" "-campaign-root" $campaignRoot
+            if ($LASTEXITCODE -ne 0) {
+                throw "Benchmark campaign verification failed with exit code $LASTEXITCODE."
             }
         }
     }
     finally {
         try {
             $stopErrors = @()
-            foreach ($process in @($workerProcess, $dispatcherProcess, $apiProcess)) {
+            foreach ($process in @($dispatcherProcess, $apiProcess)) {
                 if ($null -eq $process) {
                     continue
                 }
@@ -1276,7 +1644,7 @@ function Test-BenchmarkSmoke {
                 }
             }
             if ($stopErrors.Count -gt 0) {
-                throw "Failed to stop $($stopErrors.Count) benchmark-smoke processes."
+                throw "Failed to stop $($stopErrors.Count) benchmark service processes."
             }
         }
         finally {
@@ -1296,11 +1664,39 @@ function Test-BenchmarkSmoke {
     }
 
     Assert-ProcessTestCleanup `
-        -TestName "Benchmark-smoke" `
+        -TestName $(if ($Smoke) { "Benchmark-smoke" } else { "Benchmark" }) `
         -ComposeProject $composeProject `
         -TemporaryDirectory $temporaryDirectory `
         -ProcessIDs $processIDs.ToArray()
-    Write-Host "Benchmark smoke passed for Workloads A and B. Output was temporary and is not publishable evidence."
+    if ($Smoke) {
+        Write-Host "Benchmark smoke passed for Workloads A and B at 1 and 2 workers. Temporary output was removed."
+    }
+    else {
+        Write-Host "Benchmark campaign $campaignID passed and remains at $campaignRoot."
+    }
+}
+
+function Test-BenchmarkSmoke {
+    Invoke-BenchmarkCampaign -Smoke
+}
+
+function Test-Benchmark {
+    Invoke-BenchmarkCampaign
+}
+
+function Test-BenchmarkVerification {
+    Invoke-Go -Arguments @(
+        "test", "-count=1", "-run", "^TestBenchmarkController", "./cmd/benchmarkctl"
+    )
+    $resultsRoot = Join-Path $repositoryRoot "benchmarks/results"
+    if (Test-Path -LiteralPath $resultsRoot) {
+        foreach ($manifestPath in @(Get-ChildItem -LiteralPath $resultsRoot -Filter "manifest.json" -File -Recurse)) {
+            Invoke-Go -Arguments @(
+                "run", "./cmd/benchmarkctl", "verify", "-campaign-root", $manifestPath.Directory.FullName
+            )
+        }
+    }
+    Write-Host "Benchmark verification passed against deterministic campaign fixtures and committed results."
 }
 
 function Build-LinuxWorkerBinary {
@@ -3263,6 +3659,12 @@ try {
         }
         "benchmark-smoke" {
             Test-BenchmarkSmoke
+        }
+        "benchmark" {
+            Test-Benchmark
+        }
+        "benchmark-verify" {
+            Test-BenchmarkVerification
         }
         "observability-config-test" {
             Test-ObservabilityConfiguration
