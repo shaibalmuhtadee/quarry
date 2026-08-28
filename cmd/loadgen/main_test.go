@@ -43,6 +43,24 @@ func TestParseConfig(t *testing.T) {
 	}
 }
 
+func TestParseRecoveryConfig(t *testing.T) {
+	directory := t.TempDir()
+	cfg, err := parseConfig([]string{
+		"-output", filepath.Join(directory, "samples.jsonl.gz"),
+		"-summary", filepath.Join(directory, "summary.json"),
+		"-recovery-event", filepath.Join(directory, "recovery-event.json"),
+		"-workload", "c",
+		"-max-attempts", "3",
+		"-warmup", "0s",
+	}, io.Discard, time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("parse recovery config: %v", err)
+	}
+	if cfg.workload != loadgen.WorkloadRecovery || cfg.maxAttempts != 3 || cfg.recoveryEventPath == "" {
+		t.Fatalf("recovery config = %#v", cfg)
+	}
+}
+
 func TestParseConfigRejectsBoundaryErrors(t *testing.T) {
 	directory := t.TempDir()
 	validOutput := filepath.Join(directory, "samples.jsonl.gz")
@@ -58,7 +76,11 @@ func TestParseConfigRejectsBoundaryErrors(t *testing.T) {
 		{name: "missing summary parent", args: []string{"-output", validOutput, "-summary", filepath.Join(directory, "missing", "summary.json"), "-workload", "a"}},
 		{name: "same output paths", args: []string{"-output", validOutput, "-summary", validOutput, "-workload", "a"}},
 		{name: "missing workload", args: []string{"-output", validOutput, "-summary", validSummary}},
-		{name: "unknown workload", args: append(append([]string{}, valid...), "-workload", "c")},
+		{name: "unknown workload", args: append(append([]string{}, valid...), "-workload", "d")},
+		{name: "recovery event on throughput workload", args: append(append([]string{}, valid...), "-recovery-event", filepath.Join(directory, "event.json"))},
+		{name: "recovery without event", args: []string{"-output", validOutput, "-summary", validSummary, "-workload", "c", "-max-attempts", "3"}},
+		{name: "recovery with one attempt", args: []string{"-output", validOutput, "-summary", validSummary, "-workload", "c", "-recovery-event", filepath.Join(directory, "event.json"), "-max-attempts", "1"}},
+		{name: "recovery event overwrites samples", args: []string{"-output", validOutput, "-summary", validSummary, "-workload", "c", "-recovery-event", validOutput, "-max-attempts", "3"}},
 		{name: "fractional timeout", args: append(append([]string{}, valid...), "-job-timeout", "1500us")},
 		{name: "invalid runner config", args: append(append([]string{}, valid...), "-max-outstanding", "0")},
 	} {

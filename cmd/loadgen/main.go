@@ -33,15 +33,16 @@ const (
 )
 
 type config struct {
-	apiURL         string
-	outputPath     string
-	summaryPath    string
-	requestTimeout time.Duration
-	run            loadgen.Config
-	workload       loadgen.Workload
-	seed           int64
-	maxAttempts    int32
-	jobTimeout     time.Duration
+	apiURL            string
+	outputPath        string
+	summaryPath       string
+	recoveryEventPath string
+	requestTimeout    time.Duration
+	run               loadgen.Config
+	workload          loadgen.Workload
+	seed              int64
+	maxAttempts       int32
+	jobTimeout        time.Duration
 }
 
 func main() {
@@ -75,6 +76,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 
 	result, runErr := runner.Run(ctx)
+	if cfg.workload == loadgen.WorkloadRecovery {
+		event, err := readRecoveryEvent(cfg.recoveryEventPath)
+		if err != nil {
+			return errors.Join(runErr, err)
+		}
+		result.Samples, err = loadgen.AttachRecoveryEvent(result.Samples, event)
+		if err != nil {
+			return errors.Join(runErr, err)
+		}
+	}
 	writeErr := writeSamples(cfg.outputPath, result.Samples)
 	if writeErr != nil {
 		return errors.Join(runErr, writeErr)
@@ -83,7 +94,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if readErr != nil {
 		return errors.Join(runErr, readErr)
 	}
-	summary, summaryErr := loadgen.SummarizeSamples(persistedSamples)
+	var summary any
+	var summaryErr error
+	if cfg.workload == loadgen.WorkloadRecovery {
+		summary, summaryErr = loadgen.SummarizeRecoverySamples(persistedSamples)
+	} else {
+		summary, summaryErr = loadgen.SummarizeSamples(persistedSamples)
+	}
 	if summaryErr != nil {
 		return errors.Join(runErr, summaryErr)
 	}
@@ -104,6 +121,7 @@ func parseConfig(args []string, stderr io.Writer, now time.Time) (config, error)
 	flags.StringVar(&cfg.apiURL, "api-url", defaultAPIURL, "Quarry API base URL")
 	flags.StringVar(&cfg.outputPath, "output", "", "compressed JSON Lines sample path")
 	flags.StringVar(&cfg.summaryPath, "summary", "", "generated JSON summary path")
+	flags.StringVar(&cfg.recoveryEventPath, "recovery-event", "", "Workload C worker-termination event path")
 	flags.DurationVar(&cfg.requestTimeout, "request-timeout", defaultRequestTimeout, "per-request timeout")
 	flags.StringVar(&cfg.run.RunID, "run-id", "loadgen-"+now.Format("20060102T150405.000000000Z"), "stable run identifier")
 	flags.DurationVar(&cfg.run.WarmupDuration, "warmup", defaultWarmupDuration, "warmup duration")
@@ -112,7 +130,7 @@ func parseConfig(args []string, stderr io.Writer, now time.Time) (config, error)
 	flags.DurationVar(&cfg.run.PollInterval, "poll-interval", defaultPollInterval, "job polling interval")
 	flags.IntVar(&cfg.run.MaxOutstanding, "max-outstanding", defaultMaxOutstanding, "maximum outstanding jobs")
 	flags.IntVar(&cfg.run.MaxHTTPConcurrency, "http-concurrency", defaultHTTPConcurrency, "maximum concurrent HTTP requests")
-	flags.StringVar(&workload, "workload", "", "benchmark workload: a or b")
+	flags.StringVar(&workload, "workload", "", "benchmark workload: a, b, or c")
 	flags.Int64Var(&cfg.seed, "seed", 1, "deterministic payload seed")
 	flags.IntVar(&maxAttempts, "max-attempts", int(defaultMaxAttempts), "maximum attempts per job")
 	flags.DurationVar(&cfg.jobTimeout, "job-timeout", defaultJobTimeout, "job execution timeout")
@@ -163,10 +181,39 @@ func parseConfig(args []string, stderr io.Writer, now time.Time) (config, error)
 		return config{}, errors.New("-job-timeout must be a positive whole number of milliseconds")
 	}
 	cfg.maxAttempts = int32(maxAttempts)
+	if cfg.workload == loadgen.WorkloadRecovery {
+		if cfg.recoveryEventPath == "" {
+			return config{}, errors.New("-recovery-event is required for Workload C")
+		}
+		if cfg.maxAttempts < 2 {
+			return config{}, errors.New("Workload C requires at least two attempts")
+		}
+		parent, statErr := os.Stat(filepath.Dir(cfg.recoveryEventPath))
+		if statErr != nil || !parent.IsDir() {
+			return config{}, errors.New("-recovery-event parent directory must exist")
+		}
+		eventAbsolute, absoluteErr := filepath.Abs(cfg.recoveryEventPath)
+		if absoluteErr != nil {
+			return config{}, fmt.Errorf("resolve -recovery-event: %w", absoluteErr)
+		}
+		if equalPaths(eventAbsolute, outputAbsolute) || equalPaths(eventAbsolute, summaryAbsolute) {
+			return config{}, errors.New("-recovery-event must differ from -output and -summary")
+		}
+	} else if cfg.recoveryEventPath != "" {
+		return config{}, errors.New("-recovery-event is only valid for Workload C")
+	}
 	if err := loadgen.ValidateConfig(cfg.run); err != nil {
 		return config{}, err
 	}
 	return cfg, nil
+}
+
+func equalPaths(left, right string) bool {
+	left, right = filepath.Clean(left), filepath.Clean(right)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
 }
 
 func readSamples(path string) (samples []loadgen.Sample, readErr error) {
@@ -184,7 +231,22 @@ func readSamples(path string) (samples []loadgen.Sample, readErr error) {
 	return samples, nil
 }
 
-func writeSummary(path string, summary loadgen.Summary) (writeErr error) {
+func readRecoveryEvent(path string) (event loadgen.RecoveryEvent, readErr error) {
+	input, err := os.Open(path)
+	if err != nil {
+		return loadgen.RecoveryEvent{}, fmt.Errorf("open recovery event: %w", err)
+	}
+	defer func() {
+		readErr = errors.Join(readErr, input.Close())
+	}()
+	event, err = loadgen.ReadRecoveryEvent(input)
+	if err != nil {
+		return loadgen.RecoveryEvent{}, err
+	}
+	return event, nil
+}
+
+func writeSummary(path string, summary any) (writeErr error) {
 	output, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("create summary output: %w", err)

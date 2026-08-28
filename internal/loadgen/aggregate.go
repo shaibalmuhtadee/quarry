@@ -11,7 +11,8 @@ type RunSummary struct {
 	SchemaVersion int                `json:"schema_version"`
 	RunID         string             `json:"run_id"`
 	Config        BenchmarkRunConfig `json:"config"`
-	Jobs          Summary            `json:"jobs"`
+	Jobs          *Summary           `json:"jobs,omitempty"`
+	Recovery      *RecoverySummary   `json:"recovery,omitempty"`
 	Resources     ResourceSummary    `json:"resources"`
 }
 
@@ -38,9 +39,19 @@ type MedianMetrics struct {
 }
 
 type ConfigurationMedian struct {
-	Config BenchmarkRunConfig `json:"config"`
-	RunIDs []string           `json:"run_ids"`
-	Median MedianMetrics      `json:"median"`
+	Config   BenchmarkRunConfig `json:"config"`
+	RunIDs   []string           `json:"run_ids"`
+	Median   *MedianMetrics     `json:"median,omitempty"`
+	Recovery *RecoveryMedian    `json:"recovery,omitempty"`
+}
+
+type RecoveryMedian struct {
+	KillToReplacementStartP50 time.Duration `json:"kill_to_replacement_start_p50"`
+	KillToReplacementStartP95 time.Duration `json:"kill_to_replacement_start_p95"`
+	KillToReplacementStartP99 time.Duration `json:"kill_to_replacement_start_p99"`
+	KillToSuccessP50          time.Duration `json:"kill_to_success_p50"`
+	KillToSuccessP95          time.Duration `json:"kill_to_success_p95"`
+	KillToSuccessP99          time.Duration `json:"kill_to_success_p99"`
 }
 
 type CampaignSummary struct {
@@ -56,15 +67,8 @@ func SummarizeRun(run RunManifest, jobSamples []Sample, resourceSamples []Resour
 	if run.Status != RunStatusValid {
 		return RunSummary{}, errors.New("cannot summarize an invalid run")
 	}
-	jobs, err := SummarizeSamples(jobSamples)
-	if err != nil {
-		return RunSummary{}, err
-	}
-	if jobs.RunID != run.RunID {
-		return RunSummary{}, errors.New("job samples do not match the run manifest")
-	}
 	expectedJobType := "demo.echo"
-	if run.Config.Workload == WorkloadSimulatedIO {
+	if run.Config.Workload == WorkloadSimulatedIO || run.Config.Workload == WorkloadRecovery {
 		expectedJobType = "demo.sleep"
 	}
 	for _, sample := range jobSamples {
@@ -72,27 +76,47 @@ func SummarizeRun(run RunManifest, jobSamples []Sample, resourceSamples []Resour
 			return RunSummary{}, errors.New("job samples contain a mixed workload")
 		}
 	}
-	if jobs.SubmissionFailureCount != 0 || jobs.TerminalFailureCount != 0 || jobs.IncompleteCount != 0 ||
-		jobs.SuccessfulCount == 0 || jobs.SuccessfulCount != jobs.CompletedCount {
-		return RunSummary{}, errors.New("valid run contains failed, incomplete, or no successful measured jobs")
+	if len(jobSamples) == 0 {
+		return RunSummary{}, errors.New("valid run contains no job samples")
+	}
+	header := jobSamples[0].Header()
+	if header.RunID != run.RunID {
+		return RunSummary{}, errors.New("job samples do not match the run manifest")
 	}
 	resources, err := SummarizeResources(
 		resourceSamples,
 		run.RunID,
 		run.Config.WorkerProcesses,
-		jobs.MeasurementStartedAt,
-		jobs.MeasurementEndedAt,
+		header.MeasurementStartedAt,
+		header.MeasurementEndedAt,
 	)
 	if err != nil {
 		return RunSummary{}, err
 	}
-	return RunSummary{
+	summary := RunSummary{
 		SchemaVersion: RunSummarySchemaVersion,
 		RunID:         run.RunID,
 		Config:        run.Config,
-		Jobs:          jobs,
 		Resources:     resources,
-	}, nil
+	}
+	if run.Config.Workload == WorkloadRecovery {
+		recovery, err := SummarizeRecoverySamples(jobSamples)
+		if err != nil {
+			return RunSummary{}, err
+		}
+		summary.Recovery = &recovery
+		return summary, nil
+	}
+	jobs, err := SummarizeSamples(jobSamples)
+	if err != nil {
+		return RunSummary{}, err
+	}
+	if jobs.SubmissionFailureCount != 0 || jobs.TerminalFailureCount != 0 || jobs.IncompleteCount != 0 ||
+		jobs.SuccessfulCount == 0 || jobs.SuccessfulCount != jobs.CompletedCount {
+		return RunSummary{}, errors.New("valid run contains failed, incomplete, or no successful measured jobs")
+	}
+	summary.Jobs = &jobs
+	return summary, nil
 }
 
 func AggregateCampaign(manifest CampaignManifest, summaries []RunSummary) (CampaignSummary, error) {
@@ -131,11 +155,18 @@ func AggregateCampaign(manifest CampaignManifest, summaries []RunSummary) (Campa
 			return CampaignSummary{}, fmt.Errorf("configuration has %d valid runs, want 3", len(group))
 		}
 		sort.Slice(group, func(i, j int) bool { return group[i].RunID < group[j].RunID })
-		result.Configurations = append(result.Configurations, ConfigurationMedian{
+		configuration := ConfigurationMedian{
 			Config: group[0].Config,
 			RunIDs: []string{group[0].RunID, group[1].RunID, group[2].RunID},
-			Median: medianMetrics(group),
-		})
+		}
+		if group[0].Config.Workload == WorkloadRecovery {
+			recovery := medianRecovery(group)
+			configuration.Recovery = &recovery
+		} else {
+			median := medianMetrics(group)
+			configuration.Median = &median
+		}
+		result.Configurations = append(result.Configurations, configuration)
 	}
 	sort.Slice(result.Configurations, func(i, j int) bool {
 		left, right := result.Configurations[i].Config, result.Configurations[j].Config
@@ -149,8 +180,15 @@ func AggregateCampaign(manifest CampaignManifest, summaries []RunSummary) (Campa
 
 func validatePersistedRunSummary(summary RunSummary, run RunManifest) error {
 	if summary.SchemaVersion != RunSummarySchemaVersion || summary.RunID != run.RunID || summary.Config != run.Config ||
-		summary.Jobs.RunID != run.RunID || summary.Resources.SampleCount < 2 {
+		summary.Resources.SampleCount < 2 {
 		return fmt.Errorf("persisted summary for run %q does not match its manifest", run.RunID)
+	}
+	if run.Config.Workload == WorkloadRecovery {
+		if summary.Jobs != nil || summary.Recovery == nil || summary.Recovery.RunID != run.RunID || summary.Recovery.SampleCount == 0 {
+			return fmt.Errorf("persisted recovery summary for run %q does not match its manifest", run.RunID)
+		}
+	} else if summary.Jobs == nil || summary.Recovery != nil || summary.Jobs.RunID != run.RunID {
+		return fmt.Errorf("persisted job summary for run %q does not match its manifest", run.RunID)
 	}
 	return nil
 }
@@ -176,6 +214,17 @@ func medianMetrics(group []RunSummary) MedianMetrics {
 		PostgreSQLCPUPercentAverage:   medianFloat(group, func(value RunSummary) float64 { return value.Resources.PostgreSQLCPUPercentAverage }),
 		PostgreSQLMemoryPeakBytes:     medianUint64(group, func(value RunSummary) uint64 { return value.Resources.PostgreSQLMemoryPeakBytes }),
 		DatabaseConnectionsPeak:       medianInt(group, func(value RunSummary) int { return value.Resources.DatabaseConnectionsPeak }),
+	}
+}
+
+func medianRecovery(group []RunSummary) RecoveryMedian {
+	return RecoveryMedian{
+		KillToReplacementStartP50: medianDuration(group, func(value RunSummary) time.Duration { return value.Recovery.KillToReplacementStart.P50 }),
+		KillToReplacementStartP95: medianDuration(group, func(value RunSummary) time.Duration { return value.Recovery.KillToReplacementStart.P95 }),
+		KillToReplacementStartP99: medianDuration(group, func(value RunSummary) time.Duration { return value.Recovery.KillToReplacementStart.P99 }),
+		KillToSuccessP50:          medianDuration(group, func(value RunSummary) time.Duration { return value.Recovery.KillToSuccess.P50 }),
+		KillToSuccessP95:          medianDuration(group, func(value RunSummary) time.Duration { return value.Recovery.KillToSuccess.P95 }),
+		KillToSuccessP99:          medianDuration(group, func(value RunSummary) time.Duration { return value.Recovery.KillToSuccess.P99 }),
 	}
 }
 

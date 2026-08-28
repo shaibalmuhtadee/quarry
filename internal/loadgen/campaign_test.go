@@ -39,6 +39,46 @@ func TestCampaignManifestValidation(t *testing.T) {
 	}
 }
 
+func TestRecoveryCampaignManifestValidation(t *testing.T) {
+	manifest := testCampaignManifest(3)
+	for index := range manifest.Runs {
+		manifest.Runs[index].Config.Workload = WorkloadRecovery
+		manifest.Runs[index].Config.WorkerProcesses = 2
+		manifest.Runs[index].Config.MaxAttempts = 3
+		manifest.Runs[index].Config.JobTimeout = 30 * time.Second
+	}
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("validate recovery campaign: %v", err)
+	}
+	manifest.Runs[0].Config.WorkerProcesses = 1
+	if err := manifest.Validate(); err == nil {
+		t.Fatal("recovery campaign accepted one worker")
+	}
+}
+
+func TestSummarizeRecoveryRunFromRawSamples(t *testing.T) {
+	manifest := testCampaignManifest(1)
+	run := manifest.Runs[0]
+	run.Config.Workload = WorkloadRecovery
+	run.Config.WorkerProcesses = 2
+	run.Config.WarmupDuration = 0
+	run.Config.MeasurementDuration = 3 * time.Second
+	run.Config.MaxAttempts = 3
+	run.Config.JobTimeout = 30 * time.Second
+	sample := testRecoverySample(run.RunID, testKilledWorker, testReplacementWorker)
+	resources := testResourceSamples(run.RunID, sample.Base.MeasurementStartedAt, 2)
+	resources[1].Processes = resources[1].Processes[:3]
+	resources[2].Processes = resources[2].Processes[:3]
+
+	summary, err := SummarizeRun(run, []Sample{sample}, resources)
+	if err != nil {
+		t.Fatalf("summarize recovery run: %v", err)
+	}
+	if summary.Jobs != nil || summary.Recovery == nil || summary.Recovery.SampleCount != 1 || summary.Resources.SampleCount != 3 {
+		t.Fatalf("recovery run summary = %#v", summary)
+	}
+}
+
 func TestReadCampaignManifestRejectsMalformedData(t *testing.T) {
 	manifest := testCampaignManifest(3)
 	encoded, err := json.Marshal(manifest)
@@ -87,9 +127,25 @@ func TestResourceSamplesRejectMalformedAndMixedData(t *testing.T) {
 		t.Fatal("resource summary accepted mixed run IDs")
 	}
 	samples = testResourceSamples("run-1", start, 1)
-	samples[1].Processes = samples[1].Processes[:2]
+	for index := range samples {
+		samples[index].Processes = samples[index].Processes[:2]
+	}
 	if _, err := SummarizeResources(samples, "run-1", 1, start, start.Add(10*time.Second)); err == nil {
 		t.Fatal("resource summary accepted a missing process")
+	}
+}
+
+func TestResourceSummaryAllowsAWorkerToDisappearAfterTermination(t *testing.T) {
+	start := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	samples := testResourceSamples("run-1", start, 2)
+	samples[1].Processes = samples[1].Processes[:3]
+	samples[2].Processes = samples[2].Processes[:3]
+	summary, err := SummarizeResources(samples, "run-1", 2, start, start.Add(10*time.Second))
+	if err != nil {
+		t.Fatalf("summarize resources after worker termination: %v", err)
+	}
+	if summary.SampleCount != 3 || summary.QuarryResidentMemoryPeakBytes == 0 {
+		t.Fatalf("resource summary = %#v", summary)
 	}
 }
 
@@ -135,6 +191,36 @@ func TestAggregateCampaignRejectsMissingDuplicateAndMixedRuns(t *testing.T) {
 	}
 }
 
+func TestAggregateCampaignUsesRecoveryMedians(t *testing.T) {
+	manifest := testCampaignManifest(3)
+	summaries := make([]RunSummary, len(manifest.Runs))
+	for index := range manifest.Runs {
+		run := &manifest.Runs[index]
+		run.Config.Workload = WorkloadRecovery
+		run.Config.WorkerProcesses = 2
+		run.Config.MaxAttempts = 3
+		duration := time.Duration(index+1) * time.Second
+		summaries[index] = RunSummary{
+			SchemaVersion: RunSummarySchemaVersion, RunID: run.RunID, Config: run.Config,
+			Recovery: &RecoverySummary{
+				RunID: run.RunID, SampleCount: 1,
+				KillToReplacementStart: DurationPercentiles{Count: 1, P50: duration, P95: duration, P99: duration},
+				KillToSuccess:          DurationPercentiles{Count: 1, P50: 2 * duration, P95: 2 * duration, P99: 2 * duration},
+			},
+			Resources: ResourceSummary{SampleCount: 2},
+		}
+	}
+	summary, err := AggregateCampaign(manifest, summaries)
+	if err != nil {
+		t.Fatalf("aggregate recovery campaign: %v", err)
+	}
+	if len(summary.Configurations) != 1 || summary.Configurations[0].Median != nil || summary.Configurations[0].Recovery == nil ||
+		summary.Configurations[0].Recovery.KillToReplacementStartP50 != 2*time.Second ||
+		summary.Configurations[0].Recovery.KillToSuccessP50 != 4*time.Second {
+		t.Fatalf("recovery campaign summary = %#v", summary)
+	}
+}
+
 func testCampaignManifest(runCount int) CampaignManifest {
 	config := BenchmarkRunConfig{
 		Workload: WorkloadQueueOverhead, WorkerProcesses: 1, WorkerConcurrency: 8,
@@ -163,7 +249,7 @@ func testRunSummary(run RunManifest, value int) RunSummary {
 	duration := time.Duration(value) * time.Millisecond
 	return RunSummary{
 		SchemaVersion: RunSummarySchemaVersion, RunID: run.RunID, Config: run.Config,
-		Jobs: Summary{
+		Jobs: &Summary{
 			RunID: run.RunID, CompletedPerSecond: float64(value), SubmittedPerSecond: float64(value),
 			EndToEnd:        DurationPercentiles{P50: duration, P95: duration, P99: duration},
 			Scheduling:      DurationPercentiles{P50: duration, P95: duration, P99: duration},

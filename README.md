@@ -162,9 +162,11 @@ Run the short Milestone 6 benchmark proof by itself:
 pwsh ./scripts/dev.ps1 benchmark-smoke
 ```
 
-The command runs Workloads A and B with one and two worker processes at concurrency 8. Every configuration uses the same in-flight limit. Workload A uses `demo.echo` with deterministic seed and sequence fields. Workload B uses `demo.sleep` with the same fields and an exact `duration_ms: 25` request.
+The command runs Workloads A and B with one and two worker processes at concurrency 8. It also runs Workload C with two worker processes at concurrency 8. Every configuration uses the same in-flight limit. Workload A uses `demo.echo` with deterministic seed and sequence fields. Workload B uses `demo.sleep` with the same fields and an exact `duration_ms: 25` request.
 
-Each run preserves compressed job samples and raw resource samples. Resource samples contain Quarry process CPU and memory, PostgreSQL container CPU and memory, and PostgreSQL connection counts. The command regenerates each run summary, verifies an intentional failed-configuration cleanup, and removes all temporary files and isolated Docker resources. Smoke results are not publishable benchmark evidence.
+Workload C submits long-running `demo.sleep` jobs to one target worker. After the target owns the measured batch, the command starts and verifies a replacement worker, force-kills the target, and records the termination time. The raw samples contain the killed worker ID, the lease-expired first attempt, and the successful replacement attempt. The generated summary reports kill-to-replacement-start and kill-to-success percentiles.
+
+Each run preserves compressed job samples and raw resource samples. Resource samples contain Quarry process CPU and memory, PostgreSQL container CPU and memory, and PostgreSQL connection counts. Recovery resource data records the target worker's disappearance instead of carrying its last metric values forward. The command regenerates each run summary, verifies an intentional failed-configuration cleanup, and removes all temporary files and isolated Docker resources. Smoke results are not publishable benchmark evidence.
 
 Verify the campaign aggregation and any committed benchmark results:
 
@@ -172,7 +174,7 @@ Verify the campaign aggregation and any committed benchmark results:
 pwsh ./scripts/dev.ps1 benchmark-verify
 ```
 
-The command regenerates deterministic three-run fixture medians and rejects missing, duplicate, mixed-configuration, malformed, or modified data. If `benchmarks/results/` contains campaigns, it also regenerates and compares their run and campaign summaries.
+The command regenerates deterministic three-run throughput and recovery medians. It rejects missing, duplicate, mixed-configuration, malformed, or modified data. If `benchmarks/results/` contains campaigns, it also regenerates and compares their run and campaign summaries.
 
 Run the Milestone 5 observability proof by itself:
 

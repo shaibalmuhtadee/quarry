@@ -11,17 +11,19 @@ type Workload string
 const (
 	WorkloadQueueOverhead Workload = "a"
 	WorkloadSimulatedIO   Workload = "b"
+	WorkloadRecovery      Workload = "c"
 
 	SimulatedIODuration = 25 * time.Millisecond
+	RecoveryDuration    = 6 * time.Second
 )
 
 func ParseWorkload(value string) (Workload, error) {
 	workload := Workload(value)
 	switch workload {
-	case WorkloadQueueOverhead, WorkloadSimulatedIO:
+	case WorkloadQueueOverhead, WorkloadSimulatedIO, WorkloadRecovery:
 		return workload, nil
 	default:
-		return "", fmt.Errorf("unsupported workload %q; use a or b", value)
+		return "", fmt.Errorf("unsupported workload %q; use a, b, or c", value)
 	}
 }
 
@@ -37,9 +39,13 @@ func NewWorkloadFactory(workload Workload, seed int64, maxAttempts int32, timeou
 	}
 
 	return func(sequence uint64) Submission {
-		if workload == WorkloadSimulatedIO {
+		if workload == WorkloadSimulatedIO || workload == WorkloadRecovery {
+			duration := SimulatedIODuration
+			if workload == WorkloadRecovery {
+				duration = RecoveryDuration
+			}
 			payload := fmt.Appendf(nil, `{"duration_ms":%d,"seed":%d,"sequence":%d}`,
-				SimulatedIODuration/time.Millisecond, seed, sequence)
+				duration/time.Millisecond, seed, sequence)
 			return Submission{JobType: "demo.sleep", Payload: payload, MaxAttempts: maxAttempts, Timeout: timeout}
 		}
 		payload := fmt.Appendf(nil, `{"seed":%d,"sequence":%d}`, seed, sequence)

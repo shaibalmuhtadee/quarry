@@ -115,32 +115,36 @@ func SummarizeResources(
 	}
 
 	expectedProcesses := workerProcesses + 2
-	firstProcesses, err := indexProcesses(measured[0].Processes, expectedProcesses)
-	if err != nil {
-		return ResourceSummary{}, err
-	}
-	previousCPU := make(map[string]float64, len(firstProcesses))
-	for name, process := range firstProcesses {
-		previousCPU[name] = process.CPUSeconds
-	}
+	processIDs := make(map[string]int, expectedProcesses)
+	firstCPU := make(map[string]float64, expectedProcesses)
+	previousCPU := make(map[string]float64, expectedProcesses)
+	lastCPU := make(map[string]float64, expectedProcesses)
 	var residentPeak, postgresMemoryPeak uint64
 	var postgresCPUTotal float64
 	databaseConnectionsPeak := 0
 	for index, sample := range measured {
-		processes, err := indexProcesses(sample.Processes, expectedProcesses)
+		if len(sample.Processes) > expectedProcesses {
+			return ResourceSummary{}, fmt.Errorf("resource sample %d has %d processes, want at most %d", index, len(sample.Processes), expectedProcesses)
+		}
+		processes, err := indexProcesses(sample.Processes, len(sample.Processes))
 		if err != nil {
 			return ResourceSummary{}, fmt.Errorf("resource sample %d: %w", index, err)
 		}
 		var residentTotal uint64
 		for name, process := range processes {
-			previous, exists := previousCPU[name]
-			if !exists {
-				return ResourceSummary{}, fmt.Errorf("resource sample %d has a different process set", index)
+			processID, seen := processIDs[name]
+			if seen && processID != process.ProcessID {
+				return ResourceSummary{}, fmt.Errorf("resource sample %d changes process ID for %q", index, name)
 			}
-			if process.CPUSeconds < previous {
+			if !seen {
+				processIDs[name] = process.ProcessID
+				firstCPU[name] = process.CPUSeconds
+			}
+			if previous, exists := previousCPU[name]; exists && process.CPUSeconds < previous {
 				return ResourceSummary{}, fmt.Errorf("resource sample %d has a decreasing CPU counter for %q", index, name)
 			}
 			previousCPU[name] = process.CPUSeconds
+			lastCPU[name] = process.CPUSeconds
 			residentTotal += process.ResidentMemoryBytes
 		}
 		if residentTotal > residentPeak {
@@ -154,10 +158,12 @@ func SummarizeResources(
 			databaseConnectionsPeak = sample.DatabaseConnections
 		}
 	}
-	lastProcesses, _ := indexProcesses(measured[len(measured)-1].Processes, expectedProcesses)
+	if len(processIDs) != expectedProcesses {
+		return ResourceSummary{}, fmt.Errorf("resource samples contain %d distinct processes, want %d", len(processIDs), expectedProcesses)
+	}
 	var cpuDelta float64
-	for name, first := range firstProcesses {
-		cpuDelta += lastProcesses[name].CPUSeconds - first.CPUSeconds
+	for name, first := range firstCPU {
+		cpuDelta += lastCPU[name] - first
 	}
 	elapsed := measured[len(measured)-1].ObservedAt.Sub(measured[0].ObservedAt).Seconds()
 	if elapsed <= 0 {

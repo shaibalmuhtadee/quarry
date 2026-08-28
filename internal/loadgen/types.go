@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const SampleSchemaVersion = 2
+const SampleSchemaVersion = 3
 
 type Phase string
 
@@ -237,6 +237,7 @@ type TerminalJobSample struct {
 	FinishedAt            time.Time
 	TerminalObservedAt    time.Time
 	Attempts              []AttemptSample
+	Recovery              *RecoveryEvent
 	Errors                []RequestError
 }
 

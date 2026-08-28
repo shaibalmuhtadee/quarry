@@ -13,7 +13,7 @@ import (
 
 const (
 	CampaignSchemaVersion   = 1
-	RunSummarySchemaVersion = 1
+	RunSummarySchemaVersion = 2
 )
 
 type RunStatus string
@@ -192,9 +192,16 @@ func (config BenchmarkRunConfig) validate() error {
 	if _, err := ParseWorkload(string(config.Workload)); err != nil {
 		return err
 	}
-	if config.WorkerProcesses != 1 && config.WorkerProcesses != 2 &&
+	if config.Workload == WorkloadRecovery {
+		if config.WorkerProcesses != 2 {
+			return errors.New("Workload C requires two worker processes")
+		}
+		if config.MaxAttempts < 2 {
+			return errors.New("Workload C requires at least two attempts")
+		}
+	} else if config.WorkerProcesses != 1 && config.WorkerProcesses != 2 &&
 		config.WorkerProcesses != 4 && config.WorkerProcesses != 8 {
-		return errors.New("worker processes must be 1, 2, 4, or 8")
+		return errors.New("Workloads A and B require 1, 2, 4, or 8 worker processes")
 	}
 	if config.WorkerConcurrency != 8 {
 		return errors.New("worker concurrency must be 8")

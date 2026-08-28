@@ -538,7 +538,7 @@ Drive the 1, 2, 4, and 8-worker matrix at concurrency 8. Capture machine, proces
 
 ## Slice 6: controlled worker-kill recovery benchmark
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -602,11 +602,26 @@ Implement Workload C and measure recovery after terminating a real worker during
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- Workload C uses deterministic six-second `demo.sleep` jobs. PowerShell starts only the target worker, waits until it owns the full in-flight batch, starts and verifies the replacement worker, samples both workers, force-kills the target, and records the observed termination time.
+- `cmd/loadgen` continues to use only the public HTTP API for job submission and observation. PowerShell uses PostgreSQL only to coordinate the fault at the point where the target owns all attempt-1 jobs. The load generator accepts the resulting recovery event as a strict external input.
+- Raw job sample schema version 3 embeds the killed worker ID and termination time on each affected job. Recovery validation requires a measured `demo.sleep` job, an attempt-1 `abandoned` outcome with `lease_expired`, a successful attempt 2 on a distinct worker, positive recovery durations, and a final job timestamp equal to attempt 2's finish timestamp.
+- Run summary schema version 2 represents throughput and recovery summaries as distinct variants. Recovery summaries recompute kill-to-attempt-2-start and kill-to-success percentiles from raw attempt timestamps. Campaign summaries compute the median of each recovery percentile across three valid runs.
+- Resource aggregation permits a process to disappear while preserving a fixed set of process identities across the run. It calculates CPU from each process's first and last observed counters and does not carry a terminated worker's last metrics into later raw samples.
+- `benchmark-smoke` now runs Workload C once with two workers, concurrency 8, max outstanding 8, a two-second lease, and a 250 ms heartbeat. `benchmark` includes three Workload C repetitions with the documented 30-second warmup, 120-second measurement, 20-second lease, and five-second heartbeat. Each campaign manifest records the actual configuration.
+- No database, protocol, application-runtime, architecture, or Milestone 7 change was required.
 
 ### Validation evidence
 
-None yet.
+- `go test -count=1 ./internal/loadgen ./cmd/loadgen ./cmd/benchmarkctl` passed against the final code. Tests cover Workload C payloads, strict recovery-event parsing, affected-job selection, raw schema round trips, contradictory recovery evidence, recovery-duration recomputation, worker disappearance in resource samples, Workload C manifest constraints, run-summary regeneration, campaign medians, CLI boundary validation, and existing benchmark-controller behavior.
+- Two consecutive `pwsh ./scripts/dev.ps1 benchmark-smoke` runs passed against the exact final code. Runs `smoke-bb6ee699b2e04ed1956c20f3fb2279d3-c-w2-r1` and `smoke-74e02d1c90e54e80bce4410385c0d0bb-c-w2-r1` each preserved and regenerated eight affected recovery jobs. Each run verified the killed worker, one distinct replacement worker, lease-expired attempt 1, successful attempt 2, positive recovery durations, at least two resource samples, all five A, B, and C smoke configurations, and complete process, file, container, network, and volume cleanup.
+- `pwsh ./scripts/dev.ps1 benchmark-verify` passed deterministic throughput and recovery summary fixtures and found no committed campaign results to verify.
+- `pwsh ./scripts/dev.ps1 failure-test` passed the real worker-death recovery proof, acknowledgement-loss proof, stale-completion gRPC and PostgreSQL proof, and cleanup.
+- Native Windows race testing remains unavailable because the local toolchain has CGO disabled. `docker run --rm --volume "${PWD}:/src" --workdir /src golang:1.27.0-bookworm go test -race -count=1 ./internal/loadgen` passed. A second Docker command passed focused worker and dispatcher race tests without host Docker-socket access. The broader Docker-socket race command was denied by the execution environment, so package-wide dispatcher integration race coverage was not run.
+- `go vet ./internal/loadgen ./cmd/loadgen ./cmd/benchmarkctl` and `go build ./cmd/loadgen ./cmd/benchmarkctl` passed.
+- PowerShell parsed `scripts/dev.ps1` without errors.
+- `pwsh ./scripts/dev.ps1 check` passed against the final code. It included formatting, dependency and generated-code checks, vet, all Go tests and builds, observability validation, distributed execution, worker-death recovery, acknowledgement loss, stale completion, shutdown semantics, and cleanup.
+- `git diff --check` passed after the final implementation and tracking updates. The worktree contains only Slice 6 source, test, command, README, execution-plan, and status changes. No benchmark result or Milestone 7 file was created.
+- GitHub-hosted CI did not run for this slice.
 
 ## Slice 7: full measurement campaign and benchmark documentation
 

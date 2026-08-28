@@ -32,6 +32,7 @@ type sampleEnvelope struct {
 	TerminalObservedAt    *time.Time       `json:"terminal_observed_at,omitempty"`
 	DrainEndedAt          *time.Time       `json:"drain_ended_at,omitempty"`
 	Attempts              *[]AttemptSample `json:"attempts,omitempty"`
+	Recovery              *RecoveryEvent   `json:"recovery,omitempty"`
 	Errors                []RequestError   `json:"errors,omitempty"`
 }
 
@@ -136,6 +137,7 @@ func envelopeFromSample(sample Sample) (sampleEnvelope, error) {
 		envelope.FinishedAt = timePointer(value.FinishedAt)
 		envelope.TerminalObservedAt = timePointer(value.TerminalObservedAt)
 		envelope.Attempts = attemptSamplesPointer(value.Attempts)
+		envelope.Recovery = value.Recovery
 		envelope.Errors = value.Errors
 	case IncompleteJobSample:
 		envelope.SubmissionCompletedAt = timePointer(value.SubmissionCompletedAt)
@@ -183,6 +185,7 @@ func (envelope sampleEnvelope) sample() (Sample, error) {
 			FinishedAt:            *envelope.FinishedAt,
 			TerminalObservedAt:    *envelope.TerminalObservedAt,
 			Attempts:              *envelope.Attempts,
+			Recovery:              envelope.Recovery,
 			Errors:                envelope.Errors,
 		}, nil
 	case SampleKindIncomplete:
@@ -242,7 +245,7 @@ func (envelope sampleEnvelope) validate() error {
 			return errors.New("submission-failure sample requires commit ambiguity and at least one error")
 		}
 		if envelope.SubmissionCompletedAt != nil || envelope.JobID != "" || envelope.CreatedAt != nil || envelope.Status != "" ||
-			envelope.FinishedAt != nil || envelope.TerminalObservedAt != nil || envelope.DrainEndedAt != nil || envelope.Attempts != nil {
+			envelope.FinishedAt != nil || envelope.TerminalObservedAt != nil || envelope.DrainEndedAt != nil || envelope.Attempts != nil || envelope.Recovery != nil {
 			return errors.New("submission-failure sample contains job completion fields")
 		}
 	case SampleKindTerminal:
@@ -260,9 +263,23 @@ func (envelope sampleEnvelope) validate() error {
 		if err := validateAttemptSamples(*envelope.Attempts); err != nil {
 			return err
 		}
+		if envelope.Recovery != nil {
+			if err := validateRecoveryTerminal(TerminalJobSample{
+				Base: SampleHeader{
+					RunID: envelope.RunID, Sequence: envelope.Sequence, Phase: envelope.Phase, JobType: envelope.JobType,
+					SubmissionStartedAt: envelope.SubmissionStartedAt, MeasurementStartedAt: envelope.MeasurementStartedAt,
+					MeasurementEndedAt: envelope.MeasurementEndedAt,
+				},
+				JobID: envelope.JobID, CreatedAt: *envelope.CreatedAt, SubmissionCompletedAt: *envelope.SubmissionCompletedAt,
+				Status: envelope.Status, FinishedAt: *envelope.FinishedAt, TerminalObservedAt: *envelope.TerminalObservedAt,
+				Attempts: *envelope.Attempts, Recovery: envelope.Recovery, Errors: envelope.Errors,
+			}); err != nil {
+				return err
+			}
+		}
 	case SampleKindIncomplete:
 		if envelope.MayHaveCommitted != nil || envelope.SubmissionCompletedAt == nil || envelope.JobID == "" || envelope.CreatedAt == nil ||
-			envelope.Status == "" || envelope.DrainEndedAt == nil || envelope.FinishedAt != nil || envelope.TerminalObservedAt != nil || envelope.Attempts != nil {
+			envelope.Status == "" || envelope.DrainEndedAt == nil || envelope.FinishedAt != nil || envelope.TerminalObservedAt != nil || envelope.Attempts != nil || envelope.Recovery != nil {
 			return errors.New("incomplete sample is incomplete or contradictory")
 		}
 		if _, err := ParseJobStatus(string(envelope.Status)); err != nil {
