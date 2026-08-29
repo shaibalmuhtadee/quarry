@@ -176,6 +176,8 @@ pwsh ./scripts/dev.ps1 benchmark-verify
 
 The command regenerates deterministic three-run throughput and recovery medians. It rejects missing, duplicate, mixed-configuration, malformed, or modified data. If `benchmarks/results/` contains campaigns, it also regenerates and compares their run and campaign summaries.
 
+See [`docs/benchmarks.md`](docs/benchmarks.md) for the published local campaign, measurement definitions, results, and limits.
+
 Run the Milestone 5 observability proof by itself:
 
 ```powershell
