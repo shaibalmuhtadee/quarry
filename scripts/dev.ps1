@@ -1653,6 +1653,22 @@ function Invoke-BenchmarkRecoveryConfiguration {
                 MetricsURL = "http://127.0.0.1:$secondMetricsPort/metrics"
             }
         )
+        $processMetrics = @(
+            [pscustomobject]@{ Name = "api"; ProcessID = $APIProcess.Id; MetricsURL = "$BaseURL/metrics" },
+            [pscustomobject]@{ Name = "dispatcher"; ProcessID = $DispatcherProcess.Id; MetricsURL = $DispatcherMetricsURL },
+            [pscustomobject]@{ Name = "worker-01"; ProcessID = $firstWorkerProcess.Id; MetricsURL = $workers[0].MetricsURL },
+            [pscustomobject]@{ Name = "worker-02"; ProcessID = $secondWorkerProcess.Id; MetricsURL = $workers[1].MetricsURL }
+        )
+        Write-BenchmarkResourceSample `
+            -RunID $RunRecord.run_id `
+            -ProcessMetrics $processMetrics `
+            -PostgresContainer $PostgresContainer `
+            -OutputPath $resourcePath
+
+        # Force at least one Workload C batch turnover before selecting the
+        # owner. This keeps slow external resource sampling outside the
+        # ownership-check-to-kill interval.
+        Start-Sleep -Milliseconds 6500
         $targetWorkerID = Wait-BenchmarkRecoveryAttemptBatch `
             -RunID $RunRecord.run_id `
             -Workers $workers `
@@ -1661,18 +1677,6 @@ function Invoke-BenchmarkRecoveryConfiguration {
         $targetWorker = $workers | Where-Object ID -eq $targetWorkerID | Select-Object -First 1
         $replacementWorker = $workers | Where-Object ID -ne $targetWorkerID | Select-Object -First 1
         $replacementWorkerID = $replacementWorker.ID
-
-        $processMetrics = @(
-            [pscustomobject]@{ Name = "api"; ProcessID = $APIProcess.Id; MetricsURL = "$BaseURL/metrics" },
-            [pscustomobject]@{ Name = "dispatcher"; ProcessID = $DispatcherProcess.Id; MetricsURL = $DispatcherMetricsURL },
-            [pscustomobject]@{ Name = "worker-target"; ProcessID = $targetWorker.Process.Id; MetricsURL = $targetWorker.MetricsURL },
-            [pscustomobject]@{ Name = "worker-replacement"; ProcessID = $replacementWorker.Process.Id; MetricsURL = $replacementWorker.MetricsURL }
-        )
-        Write-BenchmarkResourceSample `
-            -RunID $RunRecord.run_id `
-            -ProcessMetrics $processMetrics `
-            -PostgresContainer $PostgresContainer `
-            -OutputPath $resourcePath
 
         $workerTerminatedAt = Stop-BenchmarkTargetWorker -Process $targetWorker.Process
         if ($targetWorkerID -eq $firstWorkerID) {
