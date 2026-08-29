@@ -3,7 +3,7 @@ param(
         "check", "test", "tools",
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
-        "generate", "generate-check", "format-check", "vet", "build",
+        "generate", "generate-check", "format-check", "vet", "build", "image-test",
         "smoke-test", "distributed-test", "recovery-test", "ack-loss-test", "failure-test", "semantics-test",
         "benchmark-smoke", "benchmark", "benchmark-verify",
         "observability-config-test", "observability-test", "observability-up", "observability-down"
@@ -3940,6 +3940,222 @@ function Test-ComposeSmoke {
     }
 }
 
+function Wait-ImageTestPostgres {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ContainerName
+    )
+
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(45)
+    do {
+        & $script:DockerExecutable exec $ContainerName `
+            pg_isready --username quarry --dbname quarry *> $null
+        if ($LASTEXITCODE -eq 0) {
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    } while ([DateTimeOffset]::UtcNow -lt $deadline)
+
+    $logs = @(& $script:DockerExecutable logs $ContainerName 2>&1) -join "`n"
+    throw "Image-test PostgreSQL did not become ready.`n$logs"
+}
+
+function Wait-ImageTestApplication {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ContainerName,
+
+        [Parameter(Mandatory)]
+        [string]$StartMessage
+    )
+
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
+    do {
+        $running = @(
+            & $script:DockerExecutable inspect --format "{{.State.Running}}" $ContainerName 2>$null
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw "Image-test container '$ContainerName' could not be inspected."
+        }
+
+        $logs = @(& $script:DockerExecutable logs $ContainerName 2>&1) -join "`n"
+        if ($running.Count -eq 1 -and $running[0].Trim() -eq "true" -and $logs.Contains($StartMessage)) {
+            return
+        }
+        if ($running.Count -eq 1 -and $running[0].Trim() -ne "true") {
+            throw "Image-test container '$ContainerName' exited before startup.`n$logs"
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTimeOffset]::UtcNow -lt $deadline)
+
+    throw "Image-test container '$ContainerName' did not log '$StartMessage'.`n$logs"
+}
+
+function Assert-ContainerImageMetadata {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Image,
+
+        [Parameter(Mandatory)]
+        [string]$EntryPoint
+    )
+
+    $configurationJSON = @(
+        Invoke-Docker -Arguments @("image", "inspect", "--format", "{{json .Config}}", $Image)
+    )[0]
+    $configuration = $configurationJSON | ConvertFrom-Json
+    $entryPointValues = @($configuration.Entrypoint)
+    if ($entryPointValues.Count -ne 1 -or $entryPointValues[0] -ne $EntryPoint) {
+        throw "Image '$Image' entry point is '$($entryPointValues -join ' ')', expected '$EntryPoint'."
+    }
+    if ([string]::IsNullOrWhiteSpace($configuration.User) -or $configuration.User -in @("0", "root")) {
+        throw "Image '$Image' must configure a non-root user, found '$($configuration.User)'."
+    }
+}
+
+function Remove-ImageTestContainer {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ContainerName
+    )
+
+    $containerIDs = @(
+        & $script:DockerExecutable ps --all --quiet --filter "name=^/$ContainerName$" 2>$null |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($containerIDs.Count -gt 0) {
+        Invoke-Docker -Arguments @("rm", "--force", $ContainerName) | Out-Null
+    }
+}
+
+function Test-ContainerImages {
+    $suffix = [Guid]::NewGuid().ToString("N")
+    $networkName = "quarry-image-test-$suffix"
+    $postgresContainer = "quarry-image-test-postgres-$suffix"
+    $apiContainer = "quarry-image-test-api-$suffix"
+    $dispatcherContainer = "quarry-image-test-dispatcher-$suffix"
+    $workerContainer = "quarry-image-test-worker-$suffix"
+    $containers = @($workerContainer, $dispatcherContainer, $apiContainer, $postgresContainer)
+    $images = @(
+        @{ Target = "api"; Tag = "quarry-api:dev"; EntryPoint = "/quarry-api" },
+        @{ Target = "dispatcher"; Tag = "quarry-dispatcher:dev"; EntryPoint = "/quarry-dispatcher" },
+        @{ Target = "worker"; Tag = "quarry-worker:dev"; EntryPoint = "/quarry-worker" },
+        @{ Target = "migration"; Tag = "quarry-migration:dev"; EntryPoint = "/goose" }
+    )
+    $databaseURL = "postgres://quarry:quarry@postgres:5432/quarry?sslmode=disable"
+
+    try {
+        foreach ($image in $images) {
+            Invoke-Docker -Arguments @(
+                "build", "--target", $image.Target, "--tag", $image.Tag, "."
+            )
+            Assert-ContainerImageMetadata -Image $image.Tag -EntryPoint $image.EntryPoint
+        }
+
+        Invoke-Docker -Arguments @("network", "create", $networkName) | Out-Null
+        Invoke-Docker -Arguments @(
+            "run", "--detach",
+            "--name", $postgresContainer,
+            "--network", $networkName,
+            "--network-alias", "postgres",
+            "--env", "POSTGRES_DB=quarry",
+            "--env", "POSTGRES_USER=quarry",
+            "--env", "POSTGRES_PASSWORD=quarry",
+            "postgres:18.6"
+        ) | Out-Null
+        Wait-ImageTestPostgres -ContainerName $postgresContainer
+
+        Invoke-Docker -Arguments @(
+            "run", "--rm",
+            "--network", $networkName,
+            "--env", "GOOSE_DBSTRING=$databaseURL",
+            "quarry-migration:dev"
+        )
+        $migrationVersion = @(
+            Invoke-Docker -Arguments @(
+                "exec", $postgresContainer,
+                "psql", "--username", "quarry", "--dbname", "quarry",
+                "--tuples-only", "--no-align",
+                "--command", "SELECT MAX(version_id) FROM goose_db_version WHERE is_applied;"
+            )
+        )[0].Trim()
+        if ($migrationVersion -ne "8") {
+            throw "Migration image applied version '$migrationVersion', expected '8'."
+        }
+
+        Invoke-Docker -Arguments @(
+            "run", "--detach",
+            "--name", $apiContainer,
+            "--network", $networkName,
+            "--env", "QUARRY_DATABASE_URL=$databaseURL",
+            "--env", "QUARRY_HTTP_ADDR=:8080",
+            "quarry-api:dev"
+        ) | Out-Null
+        Wait-ImageTestApplication -ContainerName $apiContainer -StartMessage '"msg":"api starting"'
+
+        Invoke-Docker -Arguments @(
+            "run", "--detach",
+            "--name", $dispatcherContainer,
+            "--network", $networkName,
+            "--network-alias", "dispatcher",
+            "--env", "QUARRY_DATABASE_URL=$databaseURL",
+            "--env", "QUARRY_DISPATCHER_ADDR=:9090",
+            "--env", "QUARRY_DISPATCHER_METRICS_ADDR=:9464",
+            "quarry-dispatcher:dev"
+        ) | Out-Null
+        Wait-ImageTestApplication `
+            -ContainerName $dispatcherContainer -StartMessage '"msg":"dispatcher starting"'
+
+        Invoke-Docker -Arguments @(
+            "run", "--detach",
+            "--name", $workerContainer,
+            "--network", $networkName,
+            "--env", "QUARRY_DISPATCHER_ADDR=dispatcher:9090",
+            "--env", "QUARRY_WORKER_HOSTNAME=image-test",
+            "--env", "QUARRY_WORKER_METRICS_ADDR=:9465",
+            "quarry-worker:dev"
+        ) | Out-Null
+        Wait-ImageTestApplication -ContainerName $workerContainer -StartMessage '"msg":"worker starting"'
+
+        Write-Host "Image test passed: four non-root targets, migration version 8, and API, dispatcher, and worker startup verified."
+    }
+    finally {
+        foreach ($container in $containers) {
+            try {
+                Remove-ImageTestContainer -ContainerName $container
+            }
+            catch {
+                Write-Warning "Failed to remove image-test container '$container': $_"
+            }
+        }
+        $networks = @(
+            & $script:DockerExecutable network ls --quiet --filter "name=^$networkName$" 2>$null |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        if ($networks.Count -gt 0) {
+            Invoke-Docker -Arguments @("network", "rm", $networkName) | Out-Null
+        }
+    }
+
+    foreach ($container in $containers) {
+        $remaining = @(
+            & $script:DockerExecutable ps --all --quiet --filter "name=^/$container$" 2>$null |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        if ($remaining.Count -ne 0) {
+            throw "Image-test container '$container' remains after cleanup."
+        }
+    }
+    $remainingNetwork = @(
+        & $script:DockerExecutable network ls --quiet --filter "name=^$networkName$" 2>$null |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($remainingNetwork.Count -ne 0) {
+        throw "Image-test network '$networkName' remains after cleanup."
+    }
+    Write-Host "Image-test cleanup verified: containers and network removed."
+}
+
 $script:GoExecutable = Find-GoExecutable
 $script:GoFmtExecutable = Find-GoFmtExecutable
 $script:DockerExecutable = $null
@@ -3963,6 +4179,7 @@ try {
             Test-GoVet
             Test-GoPackages
             Test-GoBuild
+            Test-ContainerImages
             Test-ObservabilityConfiguration
             Test-ObservabilityWorkflow
             Test-ComposeSmoke
@@ -4020,6 +4237,9 @@ try {
         }
         "build" {
             Test-GoBuild
+        }
+        "image-test" {
+            Test-ContainerImages
         }
         "smoke-test" {
             Test-ComposeSmoke

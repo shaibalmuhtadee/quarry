@@ -1,0 +1,686 @@
+# Milestone 7 execution plan
+
+## Milestone goal
+
+Package Quarry as a resume-ready V1 that a technically competent stranger can understand, start, exercise, disrupt, observe, and benchmark.
+
+Milestone 7 packages and documents the existing execution system. It does not add workflow behavior, another queue, cloud infrastructure, Helm, Terraform, autoscaling, authentication, a frontend, or image publishing.
+
+## Existing foundation
+
+Milestones 0 through 6 already provide:
+
+- durable jobs and attempts in PostgreSQL,
+- the public HTTP API for submission, job lookup, attempt history, and cancellation,
+- gRPC worker registration, acquisition, heartbeats, and outcome reporting,
+- bounded worker concurrency,
+- leases, lease recovery, and stale-attempt fencing,
+- retries, timeouts, cancellation, and graceful worker shutdown,
+- deterministic demonstration handlers,
+- Prometheus metrics, a Grafana dashboard, OpenTelemetry traces, and Jaeger,
+- worker-death, acknowledgement-loss, stale-completion, and shutdown process proofs,
+- a bounded Go load generator,
+- a verified 27-run benchmark campaign with preserved raw data,
+- a PowerShell command interface through `scripts/dev.ps1`.
+
+The repository has no application `Dockerfile`, full-system Compose environment, Kubernetes resources, kind proof, architecture document, or guarantees document. The existing GitHub Actions workflow does not build images, validate Kustomize output, run a linter, or run the race detector. GitHub-hosted CI has not run for the current repository state.
+
+## Milestone requirements
+
+The slices use these requirement identifiers:
+
+- M7-R1: complete Docker images
+- M7-R2: full Docker Compose environment
+- M7-R3: kind deployment and Kustomize
+- M7-R4: Kubernetes probes and resource requests and limits
+- M7-R5: measured worker scaling demonstration
+- M7-R6: final CI
+- M7-R7: architecture documentation
+- M7-R8: guarantees documentation
+- M7-R9: final README
+- M7-R10: demonstration scripts
+- M7-D1: a stranger can understand Quarry
+- M7-D2: a stranger can start Quarry
+- M7-D3: a stranger can submit jobs
+- M7-D4: a stranger can kill workers
+- M7-D5: a stranger can observe recovery
+- M7-D6: a stranger can inspect metrics and traces
+- M7-D7: a stranger can reproduce benchmarks
+
+## Approved decisions
+
+### Container images
+
+- Use one multi-stage `Dockerfile` with separate named runtime targets for the API, dispatcher, worker, and migration process.
+- Build separate service images from the named targets rather than use one generic image with command overrides.
+- Run application images as a non-root user.
+- Build the pinned Goose command and copy the SQL migrations into the migration image.
+- Keep load generation and benchmark verification as development commands. Do not add them to the runtime images.
+
+### Dispatcher health
+
+- Implement the standard gRPC health protocol on the dispatcher port.
+- Use distinct liveness and readiness service names.
+- Make liveness report whether the gRPC process can serve the health request.
+- Make readiness perform a bounded PostgreSQL ping.
+- Keep health logic in the dispatcher process boundary. Do not move operational state into the dispatcher domain service.
+- Use native Kubernetes gRPC probes. Do not add a separate probe executable.
+
+### Docker Compose
+
+- Make `docker compose up --build` start PostgreSQL, one migration process, API, dispatcher, worker, Prometheus, Grafana, the OpenTelemetry Collector, and Jaeger.
+- Use one explicit migration service. API and dispatcher replicas do not run migrations.
+- Do not set a fixed container name for workers. Compose must support worker replicas.
+- Use service DNS for the full Compose Prometheus configuration.
+- Preserve the existing host-run development path with a separate Prometheus scrape configuration selected by `scripts/dev.ps1`.
+- Keep telemetry failure non-authoritative. Application startup and job execution do not depend on the Collector, Prometheus, Grafana, or Jaeger.
+
+### Recovery demonstration
+
+- Add one user-facing Compose demonstration that starts the stack, submits work, force-kills one validated worker container, observes lease recovery, and leaves the stack running for inspection.
+- Use an explicit short lease and heartbeat configuration for the demonstration so recovery finishes promptly.
+- Validate the target container through its exact Compose project and service labels before killing it.
+- Prove recovery through the public HTTP job and attempt APIs.
+- Require attempt 1 to be `abandoned` with `lease_expired` and attempt 2 to succeed under a new worker identity.
+- Keep an automated recovery test separate from the user-facing command so test cleanup remains deterministic.
+
+### Kubernetes shape
+
+- Use kind, Kustomize, and plain Kubernetes resources.
+- Do not add Helm, an operator, cloud infrastructure, or automatic scaling.
+- Keep the kind deployment limited to PostgreSQL and Quarry services. The full metrics and traces demonstration remains in Compose.
+- Split deployment into ordered PostgreSQL, migration, and application stages.
+- Use one Kubernetes Job for migrations.
+- Deploy the API behind a Service with HTTP liveness and readiness probes.
+- Deploy two dispatcher replicas behind a Service with native gRPC liveness and readiness probes.
+- Deploy several worker replicas without a Service.
+- Set worker `terminationGracePeriodSeconds` longer than `QUARRY_WORKER_SHUTDOWN_TIMEOUT`.
+- Give API, dispatcher, worker, migration, and PostgreSQL containers explicit resource requests and limits.
+- Use a single PostgreSQL StatefulSet, Service, and persistent volume for the local demonstration.
+- Generate local-only credentials through the kind overlay. State plainly that this PostgreSQL deployment is not highly available or production-ready.
+
+### kind orchestration
+
+- Build and load local Quarry images into kind.
+- Apply PostgreSQL, wait for readiness, run the migration Job, then apply the applications.
+- Use uniquely named clusters for automated tests and always remove them.
+- Use a managed `kubectl port-forward` process for the HTTP proof.
+- Keep the user-facing kind cluster available until an explicit down command removes it.
+
+### Worker scaling
+
+- Demonstrate manual scaling at 1, 4, and 8 worker replicas.
+- Use Workload B with worker concurrency 1 and a fixed maximum of eight outstanding jobs.
+- Require the requested worker count to be Ready before each measurement.
+- Use short warmup and measurement windows.
+- Label the results as a deployment demonstration. Do not publish or commit them as benchmark evidence.
+- Keep the Milestone 6 campaign and `docs/benchmarks.md` claims unchanged unless direct verification finds an error.
+
+### CI
+
+- Keep GitHub Actions as the CI system.
+- Pin Staticcheck as the repository linter. Do not add `golangci-lint`.
+- Split Go validation, race tests, and packaging validation into clear jobs.
+- Run formatting, dependency consistency, Staticcheck, `go vet`, unit tests, PostgreSQL integration tests, generated-code consistency, and binary builds on pull requests.
+- Build every Docker image target and validate the Compose configuration on pull requests.
+- Render and validate the kind Kustomize configuration on pull requests.
+- Run the Linux race detector on pull requests.
+- Keep complete kind tests, long failure suites, and benchmarks outside mandatory pull-request checks.
+- Add a manually triggered extended workflow only if it gives useful evidence without duplicating local commands.
+- Require an observed green GitHub-hosted workflow before the milestone audit can pass.
+
+### Documentation ownership
+
+- Make `README.md` the short portfolio entry point and runnable demonstration guide.
+- Make `docs/architecture.md` an explanation of components, ownership, state transitions, failure paths, and deployment topology.
+- Make `docs/guarantees.md` the reference for guarantees, boundaries, and explicit non-guarantees.
+- Keep measurements, methodology, and benchmark limits in `docs/benchmarks.md`.
+- Link between documents instead of copying the same material.
+- Make only claims supported by the implementation and recorded evidence.
+
+## Slice 1: runtime health and container images
+
+Status: complete
+
+### Goal
+
+Produce reproducible non-root images for API, dispatcher, worker, and migrations. Add the dispatcher health contract required by Kubernetes.
+
+### Expected files and areas
+
+- `Dockerfile`
+- `.dockerignore`
+- `cmd/dispatcher/main.go`
+- focused dispatcher health code and tests
+- `scripts/dev.ps1`
+- this execution plan
+- `docs/current-status.md`
+
+### Dependencies
+
+- Go 1.27
+- the existing Goose tool dependency and SQL migrations
+- Docker BuildKit
+- the existing API, dispatcher, and worker commands
+
+### Important decisions
+
+- Use the approved named Docker targets and one shared build stage.
+- Copy only the required binary and runtime files into each final image.
+- Run application images as a non-root user.
+- Use Goose environment variables in the migration image instead of shell interpolation.
+- Implement distinct standard gRPC liveness and readiness service names.
+- Bound the readiness PostgreSQL ping by the health-request context.
+- Do not change the worker-dispatcher application protocol.
+
+### Validation required
+
+- focused dispatcher health tests cover live, ready, and PostgreSQL-unavailable behavior
+- `go test -count=1 ./cmd/dispatcher`
+- `go vet ./cmd/dispatcher`
+- every Docker target builds successfully
+- image inspection confirms the expected entry point and non-root user
+- the migration image applies all migrations to fresh PostgreSQL
+- application images start their intended binary
+- `pwsh ./scripts/dev.ps1 build`
+- `pwsh ./scripts/dev.ps1 check`
+- `git diff --check`
+
+### Milestone requirements satisfied
+
+- M7-R1
+- dispatcher-health foundation for M7-R4
+
+### Decisions and deviations discovered during implementation
+
+- The Dockerfile pins the Dockerfile frontend, Go builder, and distroless runtime base by digest while retaining readable version tags.
+- The dispatcher exposes `quarry.dispatcher.liveness` and `quarry.dispatcher.readiness` through the standard gRPC health service. Readiness passes the health request context directly to PostgreSQL `Ping`.
+- `pwsh ./scripts/dev.ps1 image-test` is the rerunnable image proof. It owns unique containers and a Docker network, and it verifies their removal after each run.
+- No architecture or project-plan deviations were required.
+
+### Validation evidence
+
+- 2026-08-29: `go test -count=1 ./cmd/dispatcher` passed, including direct standard gRPC health calls and live, ready, PostgreSQL-unavailable, request-context, and unknown-service cases.
+- 2026-08-29: `go vet ./cmd/dispatcher` passed.
+- 2026-08-29: `pwsh ./scripts/dev.ps1 image-test` passed twice. All four named targets built; image inspection found the expected entrypoint and a non-root user; the migration image applied migrations 1 through 8 to fresh PostgreSQL; API, dispatcher, and worker startup logs came from their intended binaries; cleanup removed every owned container and network.
+- 2026-08-29: `pwsh ./scripts/dev.ps1 build` passed.
+- 2026-08-29: `pwsh ./scripts/dev.ps1 check` passed. The canonical run included dependency, formatting, pinned-tool, generated-code, vet, unit, PostgreSQL integration, build, image, observability, distributed-process, recovery, acknowledgement-loss, and shutdown-semantics validation with cleanup.
+- 2026-08-29: `git diff --check` passed.
+- GitHub-hosted CI remains unverified and is deferred to Slice 7.
+
+## Slice 2: full Docker Compose environment
+
+Status: not started
+
+### Goal
+
+Make `docker compose up --build` start the complete local system with one explicit migration process and scalable workers.
+
+### Expected files and areas
+
+- `compose.yaml`
+- Compose-specific configuration under `deploy/observability/`
+- `scripts/dev.ps1`
+- focused Compose configuration tests
+- this execution plan
+- `docs/current-status.md`
+
+### Dependencies
+
+- Slice 1 images
+- existing PostgreSQL and observability services
+- existing API readiness endpoint and dispatcher gRPC health endpoint
+- Docker Compose dependency conditions
+
+### Important decisions
+
+- Keep PostgreSQL data in the existing named volume.
+- Run one migration service after PostgreSQL becomes healthy.
+- Start API, dispatcher, and worker only after migrations succeed.
+- Preserve direct host-run development and observability tests.
+- Use DNS discovery for scaled worker metrics inside Compose.
+- Do not publish worker ports to the host.
+- Do not make job execution depend on telemetry services.
+
+### Validation required
+
+- `docker compose config`
+- an isolated `compose-test` starts from a fresh volume
+- the migration service exits successfully exactly once
+- API readiness succeeds
+- a submitted job completes and exposes one successful attempt
+- Prometheus reports the expected Quarry targets
+- Jaeger receives a job trace
+- the worker service scales without naming or port conflicts
+- existing `pwsh ./scripts/dev.ps1 observability-test` passes
+- cleanup removes test processes, containers, networks, and volumes
+- `pwsh ./scripts/dev.ps1 check`
+- `git diff --check`
+
+### Milestone requirements satisfied
+
+- M7-R2
+- Compose scaling portion of M7-R5
+- foundation for M7-R10
+- M7-D2
+- M7-D3
+- M7-D6
+
+### Decisions and deviations discovered during implementation
+
+None yet.
+
+### Validation evidence
+
+None yet.
+
+## Slice 3: Compose recovery demonstration
+
+Status: not started
+
+### Goal
+
+Provide a stranger-oriented command that demonstrates worker death, lease recovery, replacement execution, and observability in the full Compose environment.
+
+### Expected files and areas
+
+- `scripts/dev.ps1`
+- an optional Compose demonstration override
+- focused recovery-demonstration assertions
+- this execution plan
+- `docs/current-status.md`
+
+### Dependencies
+
+- Slice 2 full Compose environment
+- the existing public job and attempt APIs
+- existing lease recovery and `demo.sleep` behavior
+- Docker Compose project and service labels
+
+### Important decisions
+
+- Keep the automated recovery test isolated and self-cleaning.
+- Let the user-facing demonstration leave the stack running for Grafana and Jaeger inspection.
+- Use one worker before the forced kill so ownership is unambiguous.
+- Use a short explicit lease configuration only for this demonstration.
+- Kill only a container whose project and service labels match the expected demonstration target.
+- Prove attempt state through HTTP rather than direct PostgreSQL queries.
+- Do not claim exactly-once execution or side-effect deduplication.
+
+### Validation required
+
+- an automated `compose-recovery-test` passes twice
+- attempt 1 is `abandoned` with `lease_expired`
+- attempt 2 succeeds under a distinct worker identity
+- the final job status is `succeeded`
+- Grafana and Jaeger remain reachable after recovery
+- the user-facing demonstration prints the job ID, attempt evidence, and inspection URLs
+- the automated test removes all owned processes, containers, networks, volumes, and temporary files
+- `pwsh ./scripts/dev.ps1 failure-test`
+- `pwsh ./scripts/dev.ps1 check`
+- `git diff --check`
+
+### Milestone requirements satisfied
+
+- M7-R10
+- M7-D3
+- M7-D4
+- M7-D5
+- M7-D6
+
+### Decisions and deviations discovered during implementation
+
+None yet.
+
+### Validation evidence
+
+None yet.
+
+## Slice 4: Kubernetes and Kustomize resources
+
+Status: not started
+
+### Goal
+
+Define the local Kubernetes deployment with plain resources and an ordered Kustomize structure.
+
+### Expected files and areas
+
+- `deploy/k8s/base/`
+- `deploy/k8s/overlays/kind/`
+- `scripts/dev.ps1`
+- focused Kubernetes configuration checks
+- this execution plan
+- `docs/current-status.md`
+
+### Dependencies
+
+- Slice 1 images and dispatcher health endpoint
+- `kubectl` with built-in Kustomize
+- Kubernetes native HTTP and gRPC probes
+- the existing worker shutdown timeout
+
+### Important decisions
+
+- Keep PostgreSQL, migration, and application resources in explicit deployment stages.
+- Use a Kustomize kind overlay for local image names and local-only credentials.
+- Use two dispatcher replicas and several worker replicas by default.
+- Give workers no Service.
+- Set application and PostgreSQL resource requests and limits.
+- Use a worker termination grace period longer than its configured shutdown timeout.
+- Keep the kind deployment free of Helm, autoscaling, and the observability stack.
+- State that the single PostgreSQL StatefulSet is a local demonstration, not a high-availability design.
+
+### Validation required
+
+- `kubectl kustomize` renders every stage and the complete kind configuration
+- `kubectl apply --dry-run=client` accepts the rendered resources
+- focused checks inspect image references, replica counts, Services, probes, resources, migration ownership, persistent storage, and worker termination grace
+- no worker Service exists
+- no Helm, autoscaling, operator, or cloud resource exists
+- `pwsh ./scripts/dev.ps1 k8s-config-test`
+- `pwsh ./scripts/dev.ps1 check`
+- `git diff --check`
+
+### Milestone requirements satisfied
+
+- M7-R3
+- M7-R4
+
+### Decisions and deviations discovered during implementation
+
+None yet.
+
+### Validation evidence
+
+None yet.
+
+## Slice 5: kind deployment proof
+
+Status: not started
+
+### Goal
+
+Prove that a fresh kind cluster can run locally built Quarry images and complete a job.
+
+### Expected files and areas
+
+- `scripts/dev.ps1`
+- optional kind cluster configuration under `deploy/k8s/`
+- focused kind orchestration helpers
+- this execution plan
+- `docs/current-status.md`
+
+### Dependencies
+
+- Slices 1 and 4
+- Docker daemon access
+- `kind`
+- `kubectl`
+- locally built Quarry images
+
+### Important decisions
+
+- Use a unique cluster name for automated validation.
+- Load local images into the cluster rather than publish them.
+- Apply PostgreSQL, migration, and application stages in order.
+- Wait for each required condition before advancing.
+- Manage the API port-forward as an owned child process.
+- Keep user-facing and automated cluster lifecycles separate.
+- Delete every automated cluster even when validation fails.
+
+### Validation required
+
+- a fresh cluster starts from no prior Quarry resources
+- all local images load into kind
+- PostgreSQL becomes ready before migration starts
+- the migration Job completes before applications deploy
+- API, two dispatcher replicas, and the configured worker replicas become Ready
+- API and dispatcher probes report success
+- a submitted job succeeds and returns attempt history
+- the automated port-forward stops
+- the automated cluster is deleted and cleanup is verified
+- `pwsh ./scripts/dev.ps1 kind-test`
+- `pwsh ./scripts/dev.ps1 check`
+- `git diff --check`
+
+### Milestone requirements satisfied
+
+- M7-R3
+- runtime proof for M7-R4
+- M7-D2
+- M7-D3
+
+### Decisions and deviations discovered during implementation
+
+None yet.
+
+### Validation evidence
+
+None yet.
+
+## Slice 6: Kubernetes worker scaling demonstration
+
+Status: not started
+
+### Goal
+
+Measure manual worker scaling at 1, 4, and 8 kind replicas without changing the publishable Milestone 6 benchmark evidence.
+
+### Expected files and areas
+
+- `scripts/dev.ps1`
+- focused scaling orchestration and output
+- optional kind demonstration documentation
+- this execution plan
+- `docs/current-status.md`
+
+### Dependencies
+
+- Slice 5 kind deployment
+- existing `cmd/loadgen`
+- Workload B
+- enough local kind capacity for eight bounded worker pods
+
+### Important decisions
+
+- Fix worker concurrency at 1 for this replica-scaling demonstration.
+- Keep the maximum number of outstanding jobs at 8 for every measurement.
+- Scale to 1, 4, and 8 worker replicas.
+- Require the requested number of Ready replicas before each run.
+- Use short warmup and measurement windows.
+- Print the results but do not commit them as benchmark claims.
+- Restore the documented default replica count after the demonstration.
+
+### Validation required
+
+- each scale operation reaches exactly the requested Ready count
+- Workload B completes successfully at 1, 4, and 8 replicas
+- each result reports the worker count, fixed load settings, phase durations, and completed jobs per second
+- all configurations use the same load limit
+- the output labels the measurements as non-publishable
+- the documented default replica count is restored
+- `pwsh ./scripts/dev.ps1 kind-scaling-test`
+- `pwsh ./scripts/dev.ps1 benchmark-verify`
+- `pwsh ./scripts/dev.ps1 check`
+- `git diff --check`
+
+### Milestone requirements satisfied
+
+- M7-R5
+- scaling portion of M7-R10
+
+### Decisions and deviations discovered during implementation
+
+None yet.
+
+### Validation evidence
+
+None yet.
+
+## Slice 7: final CI
+
+Status: not started
+
+### Goal
+
+Make pull-request CI validate the completed Go, Docker, Compose, and Kustomize artifacts, then obtain direct hosted evidence.
+
+### Expected files and areas
+
+- `.github/workflows/ci.yml`
+- an optional manually triggered extended workflow
+- `go.mod`
+- `go.sum`
+- `scripts/dev.ps1`
+- this execution plan
+- `docs/current-status.md`
+
+### Dependencies
+
+- Slices 1, 2, and 4
+- GitHub Actions
+- pinned Staticcheck
+- Linux race-detector support
+- Docker on the GitHub-hosted runner
+- a pinned kubectl setup for Kustomize rendering
+
+### Important decisions
+
+- Keep Staticcheck pinned through the repository's Go tool mechanism.
+- Separate Go validation, race, and packaging jobs so failures identify their owner.
+- Keep PostgreSQL integration tests in mandatory CI.
+- Build every named Docker target.
+- Validate Compose configuration and Kustomize rendering.
+- Keep long failure, complete kind, and benchmark runs outside mandatory pull-request checks.
+- Do not represent local workflow inspection as hosted CI success.
+
+### Validation required
+
+- formatting verification
+- `go mod tidy -diff`
+- pinned-tool checks
+- Staticcheck
+- `go vet ./...`
+- unit and PostgreSQL integration tests
+- protobuf and sqlc generation consistency
+- all binary builds
+- Linux race detector
+- every Docker image target builds
+- Docker Compose configuration validates
+- kind Kustomize output renders and validates
+- workflow YAML passes local syntax checks
+- an actual GitHub-hosted push or pull-request run completes successfully
+- `pwsh ./scripts/dev.ps1 check`
+- `git diff --check`
+
+### Milestone requirements satisfied
+
+- M7-R6
+
+### Decisions and deviations discovered during implementation
+
+None yet.
+
+### Validation evidence
+
+None yet.
+
+## Slice 8: architecture, guarantees, and portfolio entry point
+
+Status: not started
+
+### Goal
+
+Make the finished repository understandable and runnable without requiring the project plan or source code as the first reference.
+
+### Expected files and areas
+
+- `docs/architecture.md`
+- `docs/guarantees.md`
+- `README.md`
+- `docs/benchmarks.md` only if links or reproduction commands need correction
+- demonstration command help in `scripts/dev.ps1`
+- this execution plan
+- `docs/current-status.md`
+
+### Dependencies
+
+- Slices 2, 3, 5, 6, and 7
+- current implementation and recorded validation evidence
+- the verified Milestone 6 benchmark campaign
+
+### Important decisions
+
+- Keep `README.md` short enough to act as the repository entry point.
+- Put component ownership, request flow, execution flow, recovery, and deployment topology in `docs/architecture.md`.
+- Put guarantees, failure boundaries, and non-guarantees in `docs/guarantees.md`.
+- Keep benchmark methodology, results, and limits in `docs/benchmarks.md`.
+- Document the Compose path as the complete metrics and traces demonstration.
+- Document kind as a local platform demonstration without production availability claims.
+- State at-least-once execution and cooperative cancellation limits directly.
+- Link to evidence instead of copying benchmark values across files.
+
+### Validation required
+
+- follow the README Compose path from a clean checkout
+- submit and complete a job through the documented commands
+- run the documented worker-kill recovery demonstration
+- inspect Grafana metrics and the Jaeger trace through the documented URLs
+- follow the kind quickstart and scaling demonstration
+- run every documented validation and benchmark-verification command that is part of the primary walkthrough
+- verify every local documentation link
+- compare all guarantee statements with code and tests
+- `pwsh ./scripts/dev.ps1 benchmark-verify`
+- `pwsh ./scripts/dev.ps1 check`
+- `git diff --check`
+
+### Milestone requirements satisfied
+
+- M7-R7
+- M7-R8
+- M7-R9
+- M7-R10
+- M7-D1
+- M7-D2
+- M7-D3
+- M7-D4
+- M7-D5
+- M7-D6
+- M7-D7
+
+### Decisions and deviations discovered during implementation
+
+None yet.
+
+### Validation evidence
+
+None yet.
+
+## Milestone audit
+
+Status: not started
+
+The milestone audit begins only after all eight slices are complete. Completed slice statuses are not proof that Milestone 7 is complete.
+
+### Required audit checks
+
+- compare the implementation with Milestone 7 and the resume-ready stop condition in `docs/project-plan.md`
+- inspect the public API, runtime behavior, images, Compose environment, Kubernetes resources, scripts, CI, and documentation directly
+- run the focused image, Compose, recovery, Kustomize, kind, scaling, and benchmark-verification commands
+- run `pwsh ./scripts/dev.ps1 check`
+- run required Linux race validation
+- observe a successful GitHub-hosted CI run
+- follow the README demonstration as a stranger would
+- inspect metrics and traces from the full Compose environment
+- verify worker-kill recovery through public attempt history
+- verify all test processes, containers, networks, volumes, port-forwards, and kind clusters are cleaned up
+- inspect the diff for excluded V1 features, unsupported claims, and unnecessary dependencies
+- run `git diff --check`
+
+Only after the audit passes:
+
+- mark Milestone 7 complete in `docs/current-status.md`,
+- move this plan to `docs/exec-plans/completed/milestone-7.md`,
+- record any remaining limitations,
+- stop adding V1 features.
