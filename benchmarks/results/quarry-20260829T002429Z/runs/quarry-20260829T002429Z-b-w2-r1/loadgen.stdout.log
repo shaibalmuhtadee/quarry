@@ -1,0 +1,40 @@
+{
+  "run_id": "quarry-20260829T002429Z-b-w2-r1",
+  "measurement_started_at": "2026-08-29T01:03:34.8869522Z",
+  "measurement_ended_at": "2026-08-29T01:05:34.8869522Z",
+  "warmup_sample_count": 800,
+  "measurement_sample_count": 3186,
+  "submitted_count": 3186,
+  "completed_count": 3178,
+  "successful_count": 3178,
+  "terminal_failure_count": 0,
+  "submission_failure_count": 0,
+  "incomplete_count": 0,
+  "submitted_per_second": 26.55,
+  "completed_per_second": 26.483333333333334,
+  "end_to_end": {
+    "count": 3178,
+    "p50": 237560000,
+    "p95": 678589000,
+    "p99": 862407000
+  },
+  "scheduling": {
+    "count": 3178,
+    "p50": 207427000,
+    "p95": 647814000,
+    "p99": 823217000
+  },
+  "attempt_duration": {
+    "count": 3178,
+    "p50": 30443000,
+    "p95": 33288000,
+    "p99": 39170000
+  },
+  "client_observed": {
+    "count": 3178,
+    "p50": 245304200,
+    "p95": 692368500,
+    "p99": 873166200
+  }
+}
+

@@ -3,6 +3,8 @@ package handlers
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -111,11 +113,59 @@ func TestSleepRejectsInvalidDuration(t *testing.T) {
 	}
 }
 
+func TestTestSideEffectHandlerAppendsOneDurableMarkerPerSuccess(t *testing.T) {
+	t.Parallel()
+
+	markerPath := filepath.Join(t.TempDir(), "side-effects.log")
+	handler := NewTestSideEffectHandler(markerPath)
+	payload, err := domain.ParsePayload([]byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		result, err := handler(context.Background(), payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := string(result.JSON()), `{"marker":"written"}`; got != want {
+			t.Fatalf("result = %s, want %s", got, want)
+		}
+	}
+	contents, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(contents), "completed\ncompleted\n"; got != want {
+		t.Fatalf("marker contents = %q, want %q", got, want)
+	}
+}
+
+func TestTestSideEffectHandlerHonorsPreCanceledContext(t *testing.T) {
+	t.Parallel()
+
+	markerPath := filepath.Join(t.TempDir(), "side-effects.log")
+	payload, err := domain.ParsePayload([]byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := NewTestSideEffectHandler(markerPath)(ctx, payload); !errors.Is(err, context.Canceled) {
+		t.Fatalf("handler error = %v, want context.Canceled", err)
+	}
+	if _, err := os.Stat(markerPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("marker stat error = %v, want os.ErrNotExist", err)
+	}
+}
+
 func TestRegistryContainsOnlyDemonstrationHandlers(t *testing.T) {
 	t.Parallel()
 
 	registry := Registry()
 	if len(registry) != 3 || registry[EchoType] == nil || registry[PayloadSizeType] == nil || registry[SleepType] == nil {
 		t.Fatalf("registry = %#v", registry)
+	}
+	if registry[TestSideEffectType] != nil {
+		t.Fatal("default registry contains the test-only side-effect handler")
 	}
 }

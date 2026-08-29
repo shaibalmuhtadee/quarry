@@ -154,7 +154,29 @@ Run the complete local validation:
 pwsh ./scripts/dev.ps1 check
 ```
 
-This checks formatting, dependencies, pinned tools, generated code, static analysis, tests, builds, and the Compose configuration. It runs both the HTTP smoke test and the distributed process test against PostgreSQL.
+This checks formatting, dependencies, pinned tools, generated code, static analysis, tests, builds, and the Compose configuration. It also runs the HTTP smoke test, distributed process test, failure suite, observability proof, and execution-semantics proof against PostgreSQL.
+
+Run the short Milestone 6 benchmark proof by itself:
+
+```powershell
+pwsh ./scripts/dev.ps1 benchmark-smoke
+```
+
+The command runs Workloads A and B with one and two worker processes at concurrency 8. It also runs Workload C with two worker processes at concurrency 8. Every configuration uses the same in-flight limit. Workload A uses `demo.echo` with deterministic seed and sequence fields. Workload B uses `demo.sleep` with the same fields and an exact `duration_ms: 25` request.
+
+Workload C submits long-running `demo.sleep` jobs to one target worker. After the target owns the measured batch, the command starts and verifies a replacement worker, force-kills the target, and records the termination time. The raw samples contain the killed worker ID, the lease-expired first attempt, and the successful replacement attempt. The generated summary reports kill-to-replacement-start and kill-to-success percentiles.
+
+Each run preserves compressed job samples, raw resource samples, and the load generator's stdout and stderr. Resource samples contain Quarry process CPU and memory, PostgreSQL container CPU and memory, and PostgreSQL connection counts. Recovery resource data records the target worker's disappearance instead of carrying its last metric values forward. Invalid recovery runs preserve unfiltered job samples before recovery validation, so the failure remains diagnosable. The command regenerates each run summary, verifies an intentional failed-configuration cleanup, and removes all temporary files and isolated Docker resources. Smoke results are not publishable benchmark evidence.
+
+Verify the campaign aggregation and any committed benchmark results:
+
+```powershell
+pwsh ./scripts/dev.ps1 benchmark-verify
+```
+
+The command regenerates deterministic three-run throughput and recovery medians. It rejects missing, duplicate, mixed-configuration, malformed, or modified data. If `benchmarks/results/` contains campaigns, it also regenerates and compares their run and campaign summaries.
+
+See [`docs/benchmarks.md`](docs/benchmarks.md) for the published local campaign, measurement definitions, results, and limits.
 
 Run the Milestone 5 observability proof by itself:
 
@@ -187,6 +209,22 @@ pwsh ./scripts/dev.ps1 recovery-test
 ```
 
 The recovery test starts isolated API, dispatcher, worker, and PostgreSQL processes. It submits a long-running `demo.sleep` job, proves worker 1 renews attempt 1, kills that worker without graceful shutdown, and proves the lease and worker heartbeat stop advancing. Worker 2 then completes attempt 2. The test verifies both attempts through HTTP and PostgreSQL, runs a stale-report gRPC integration test, and checks that all temporary processes and Docker resources were removed.
+
+Run the acknowledgement-loss proof by itself:
+
+```powershell
+pwsh ./scripts/dev.ps1 ack-loss-test
+```
+
+The acknowledgement-loss test starts a fault-enabled worker that appends one marker after handler success and exits before `ReportAttempt`. The test proves that attempt 1 remains unreported, its lease stops advancing, and PostgreSQL abandons it with `lease_expired`. A replacement worker appends the second marker and completes attempt 2. The test checks public attempt history, direct PostgreSQL state, and cleanup.
+
+Run every required failure proof:
+
+```powershell
+pwsh ./scripts/dev.ps1 failure-test
+```
+
+The failure suite runs the worker-death recovery process test, the acknowledgement-loss process test, and the stale-completion gRPC and PostgreSQL test.
 
 Run the HTTP smoke test by itself:
 

@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -34,7 +35,24 @@ const (
 	reportBackoffMax         = 500 * time.Millisecond
 	defaultMetricsAddress    = ":0"
 	defaultServiceName       = "quarry-worker"
+	testSideEffectFileEnv    = "QUARRY_TEST_SIDE_EFFECT_FILE"
+	testExitAfterSuccessEnv  = "QUARRY_TEST_EXIT_AFTER_HANDLER_SUCCESS"
 )
+
+var errTestExitAfterHandlerSuccess = errors.New("test fault injected after successful handler")
+
+type testFaultConfig struct {
+	sideEffectFile          string
+	exitAfterHandlerSuccess bool
+}
+
+func (cfg testFaultConfig) handlerEnabled() bool {
+	return cfg.sideEffectFile != ""
+}
+
+func (cfg testFaultConfig) exitEnabled() bool {
+	return cfg.exitAfterHandlerSuccess
+}
 
 type config struct {
 	dispatcherAddress string
@@ -44,6 +62,7 @@ type config struct {
 	heartbeatInterval time.Duration
 	shutdownTimeout   time.Duration
 	telemetry         telemetry.Config
+	testFault         testFaultConfig
 }
 
 func main() {
@@ -104,6 +123,10 @@ func loadConfig() (config, error) {
 		}
 		shutdownTimeout = parsed
 	}
+	testFault, err := loadTestFaultConfig()
+	if err != nil {
+		return config{}, err
+	}
 	telemetryConfig, err := telemetry.LoadConfig(
 		defaultServiceName,
 		"QUARRY_WORKER_METRICS_ADDR",
@@ -121,6 +144,46 @@ func loadConfig() (config, error) {
 		heartbeatInterval: heartbeatInterval,
 		shutdownTimeout:   shutdownTimeout,
 		telemetry:         telemetryConfig,
+		testFault:         testFault,
+	}, nil
+}
+
+func loadTestFaultConfig() (testFaultConfig, error) {
+	markerPath := os.Getenv(testSideEffectFileEnv)
+	exitAfterSuccess := os.Getenv(testExitAfterSuccessEnv)
+	if markerPath == "" && exitAfterSuccess == "" {
+		return testFaultConfig{}, nil
+	}
+	if markerPath == "" {
+		return testFaultConfig{}, fmt.Errorf(
+			"%s is required when %s is set",
+			testSideEffectFileEnv,
+			testExitAfterSuccessEnv,
+		)
+	}
+	if exitAfterSuccess != "" && exitAfterSuccess != "true" {
+		return testFaultConfig{}, fmt.Errorf("%s must be true when configured", testExitAfterSuccessEnv)
+	}
+	if !filepath.IsAbs(markerPath) {
+		return testFaultConfig{}, fmt.Errorf("%s must be an absolute path", testSideEffectFileEnv)
+	}
+	parent, err := os.Stat(filepath.Dir(markerPath))
+	if err != nil {
+		return testFaultConfig{}, fmt.Errorf("inspect %s parent directory: %w", testSideEffectFileEnv, err)
+	}
+	if !parent.IsDir() {
+		return testFaultConfig{}, fmt.Errorf("%s parent must be a directory", testSideEffectFileEnv)
+	}
+	markerInfo, err := os.Stat(markerPath)
+	if err == nil && markerInfo.IsDir() {
+		return testFaultConfig{}, fmt.Errorf("%s must not be a directory", testSideEffectFileEnv)
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return testFaultConfig{}, fmt.Errorf("inspect %s: %w", testSideEffectFileEnv, err)
+	}
+	return testFaultConfig{
+		sideEffectFile:          filepath.Clean(markerPath),
+		exitAfterHandlerSuccess: exitAfterSuccess == "true",
 	}, nil
 }
 
@@ -167,9 +230,20 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
 		return err
 	}
 
+	handlerRegistry := handlers.Registry()
+	var testAfterHandlerSuccess func(worker.Job) error
+	if cfg.testFault.handlerEnabled() {
+		handlerRegistry[handlers.TestSideEffectType] = handlers.NewTestSideEffectHandler(cfg.testFault.sideEffectFile)
+	}
+	if cfg.testFault.exitEnabled() {
+		testAfterHandlerSuccess = func(worker.Job) error {
+			return errTestExitAfterHandlerSuccess
+		}
+	}
+
 	workerID := domain.NewWorkerID()
 	startedAt := time.Now().UTC()
-	runtime, err := worker.New(dispatcherClient, handlers.Registry(), worker.Config{
+	runtime, err := worker.New(dispatcherClient, handlerRegistry, worker.Config{
 		Registration: worker.Registration{
 			WorkerID:    workerID,
 			Hostname:    cfg.hostname,
@@ -177,15 +251,16 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
 			Concurrency: cfg.concurrency,
 			StartedAt:   startedAt,
 		},
-		IdleBackoffMin:    idleBackoffMin,
-		IdleBackoffMax:    idleBackoffMax,
-		ReportBackoffMin:  reportBackoffMin,
-		ReportBackoffMax:  reportBackoffMax,
-		HeartbeatInterval: cfg.heartbeatInterval,
-		ShutdownTimeout:   cfg.shutdownTimeout,
-		Logger:            logger,
-		Metrics:           telemetryRuntime.Metrics(),
-		Tracer:            telemetryRuntime.Tracer("quarry/worker"),
+		IdleBackoffMin:          idleBackoffMin,
+		IdleBackoffMax:          idleBackoffMax,
+		ReportBackoffMin:        reportBackoffMin,
+		ReportBackoffMax:        reportBackoffMax,
+		HeartbeatInterval:       cfg.heartbeatInterval,
+		ShutdownTimeout:         cfg.shutdownTimeout,
+		TestAfterHandlerSuccess: testAfterHandlerSuccess,
+		Logger:                  logger,
+		Metrics:                 telemetryRuntime.Metrics(),
+		Tracer:                  telemetryRuntime.Tracer("quarry/worker"),
 	})
 	if err != nil {
 		return err

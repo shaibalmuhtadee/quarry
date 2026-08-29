@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
@@ -19,6 +22,7 @@ import (
 )
 
 func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
+	clearTestFaultEnvironment(t)
 	t.Setenv("QUARRY_DISPATCHER_ADDR", "")
 	t.Setenv("QUARRY_WORKER_HOSTNAME", "test-host")
 	t.Setenv("QUARRY_WORKER_VERSION", "")
@@ -41,6 +45,9 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 	}
 	if cfg.telemetry.ServiceName != defaultServiceName || cfg.telemetry.MetricsAddress != defaultMetricsAddress {
 		t.Fatalf("default telemetry config = %#v", cfg.telemetry)
+	}
+	if cfg.testFault.handlerEnabled() || cfg.testFault.exitEnabled() {
+		t.Fatalf("default test fault config = %#v", cfg.testFault)
 	}
 
 	t.Setenv("QUARRY_DISPATCHER_ADDR", "127.0.0.1:19090")
@@ -66,6 +73,7 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 }
 
 func TestLoadConfigRejectsInvalidHeartbeatInterval(t *testing.T) {
+	clearTestFaultEnvironment(t)
 	for _, value := range []string{"invalid", "0s", "-1s"} {
 		t.Run(value, func(t *testing.T) {
 			t.Setenv("QUARRY_WORKER_HOSTNAME", "test-host")
@@ -78,6 +86,7 @@ func TestLoadConfigRejectsInvalidHeartbeatInterval(t *testing.T) {
 }
 
 func TestLoadConfigRejectsInvalidConcurrency(t *testing.T) {
+	clearTestFaultEnvironment(t)
 	for _, value := range []string{"0", "-1", "1.5", "4294967296"} {
 		t.Run(value, func(t *testing.T) {
 			t.Setenv("QUARRY_WORKER_HOSTNAME", "test-host")
@@ -90,6 +99,7 @@ func TestLoadConfigRejectsInvalidConcurrency(t *testing.T) {
 }
 
 func TestLoadConfigRejectsInvalidShutdownTimeout(t *testing.T) {
+	clearTestFaultEnvironment(t)
 	for _, value := range []string{"invalid", "0s", "-1s"} {
 		t.Run(value, func(t *testing.T) {
 			t.Setenv("QUARRY_WORKER_HOSTNAME", "test-host")
@@ -102,10 +112,77 @@ func TestLoadConfigRejectsInvalidShutdownTimeout(t *testing.T) {
 }
 
 func TestLoadConfigRejectsInvalidMetricsAddress(t *testing.T) {
+	clearTestFaultEnvironment(t)
 	t.Setenv("QUARRY_WORKER_HOSTNAME", "test-host")
 	t.Setenv("QUARRY_WORKER_METRICS_ADDR", "invalid address")
 	if _, err := loadConfig(); err == nil {
 		t.Fatal("loadConfig accepted an invalid metrics address")
+	}
+}
+
+func TestLoadConfigAcceptsCompleteTestFaultConfig(t *testing.T) {
+	clearTestFaultEnvironment(t)
+	t.Setenv("QUARRY_WORKER_HOSTNAME", "test-host")
+	markerPath := filepath.Join(t.TempDir(), "side-effects.log")
+	t.Setenv(testSideEffectFileEnv, markerPath)
+	t.Setenv(testExitAfterSuccessEnv, "true")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.testFault.handlerEnabled() || !cfg.testFault.exitEnabled() ||
+		cfg.testFault.sideEffectFile != filepath.Clean(markerPath) {
+		t.Fatalf("test fault config = %#v", cfg.testFault)
+	}
+}
+
+func TestLoadConfigAcceptsTestSideEffectHandlerWithoutExit(t *testing.T) {
+	clearTestFaultEnvironment(t)
+	t.Setenv("QUARRY_WORKER_HOSTNAME", "test-host")
+	markerPath := filepath.Join(t.TempDir(), "side-effects.log")
+	t.Setenv(testSideEffectFileEnv, markerPath)
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.testFault.handlerEnabled() || cfg.testFault.exitEnabled() ||
+		cfg.testFault.sideEffectFile != filepath.Clean(markerPath) {
+		t.Fatalf("test handler config = %#v", cfg.testFault)
+	}
+}
+
+func TestLoadConfigRejectsInvalidTestFaultConfig(t *testing.T) {
+	absoluteMarker := filepath.Join(t.TempDir(), "side-effects.log")
+	missingParentMarker := filepath.Join(t.TempDir(), "missing", "side-effects.log")
+	directoryMarker := t.TempDir()
+	parentFile := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(parentFile, []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name       string
+		markerPath string
+		exitValue  string
+	}{
+		{name: "exit only", exitValue: "true"},
+		{name: "false exit", markerPath: absoluteMarker, exitValue: "false"},
+		{name: "numeric exit", markerPath: absoluteMarker, exitValue: "1"},
+		{name: "relative marker", markerPath: "side-effects.log", exitValue: "true"},
+		{name: "missing parent", markerPath: missingParentMarker, exitValue: "true"},
+		{name: "parent is file", markerPath: filepath.Join(parentFile, "side-effects.log"), exitValue: "true"},
+		{name: "marker is directory", markerPath: directoryMarker, exitValue: "true"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("QUARRY_WORKER_HOSTNAME", "test-host")
+			t.Setenv(testSideEffectFileEnv, test.markerPath)
+			t.Setenv(testExitAfterSuccessEnv, test.exitValue)
+			if _, err := loadConfig(); err == nil {
+				t.Fatalf("loadConfig accepted marker %q and exit value %q", test.markerPath, test.exitValue)
+			}
+		})
 	}
 }
 
@@ -158,6 +235,126 @@ func TestRunRegistersFreshIdentityAndStopsOnCancellation(t *testing.T) {
 			t.Fatalf("registration = %#v", registration)
 		}
 	}
+}
+
+func TestRunTestFaultWritesMarkerAndStopsBeforeReport(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := grpc.NewServer()
+	service := &testFaultLifecycleService{jobID: domain.NewJobID().String()}
+	dispatcherv1.RegisterDispatcherServiceServer(server, service)
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		server.Stop()
+		<-serveDone
+	})
+
+	markerPath := filepath.Join(t.TempDir(), "side-effects.log")
+	cfg := config{
+		dispatcherAddress: listener.Addr().String(),
+		hostname:          "fault-test-host",
+		version:           "fault-test",
+		concurrency:       1,
+		heartbeatInterval: 10 * time.Millisecond,
+		shutdownTimeout:   time.Second,
+		telemetry: telemetry.Config{
+			ServiceName:    defaultServiceName,
+			MetricsAddress: "127.0.0.1:0",
+		},
+		testFault: testFaultConfig{
+			sideEffectFile:          markerPath,
+			exitAfterHandlerSuccess: true,
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = run(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if !errors.Is(err, errTestExitAfterHandlerSuccess) {
+		t.Fatalf("run error = %v, want injected test fault", err)
+	}
+	contents, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(contents), "completed\n"; got != want {
+		t.Fatalf("marker contents = %q, want %q", got, want)
+	}
+
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	wantTypes := []string{"demo.echo", "demo.payload_size", "demo.sleep", "test.side_effect"}
+	if !slices.Equal(service.supportedTypes, wantTypes) {
+		t.Fatalf("supported job types = %v, want %v", service.supportedTypes, wantTypes)
+	}
+	if service.reportCalls != 0 {
+		t.Fatalf("attempt report calls = %d, want 0", service.reportCalls)
+	}
+}
+
+type testFaultLifecycleService struct {
+	dispatcherv1.UnimplementedDispatcherServiceServer
+	mu             sync.Mutex
+	jobID          string
+	jobSent        bool
+	supportedTypes []string
+	reportCalls    int
+}
+
+func (service *testFaultLifecycleService) RegisterWorker(
+	context.Context,
+	*dispatcherv1.RegisterWorkerRequest,
+) (*dispatcherv1.RegisterWorkerResponse, error) {
+	return &dispatcherv1.RegisterWorkerResponse{}, nil
+}
+
+func (service *testFaultLifecycleService) AcquireJobs(
+	_ context.Context,
+	request *dispatcherv1.AcquireJobsRequest,
+) (*dispatcherv1.AcquireJobsResponse, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.supportedTypes = append([]string(nil), request.GetSupportedJobTypes()...)
+	if service.jobSent {
+		return &dispatcherv1.AcquireJobsResponse{}, nil
+	}
+	service.jobSent = true
+	return &dispatcherv1.AcquireJobsResponse{Jobs: []*dispatcherv1.AcquiredJob{{
+		JobId:       service.jobID,
+		AttemptNo:   1,
+		JobType:     "test.side_effect",
+		PayloadJson: []byte(`{}`),
+		TimeoutMs:   30_000,
+	}}}, nil
+}
+
+func (service *testFaultLifecycleService) Heartbeat(
+	_ context.Context,
+	request *dispatcherv1.HeartbeatRequest,
+) (*dispatcherv1.HeartbeatResponse, error) {
+	results := make([]*dispatcherv1.HeartbeatAttemptResult, len(request.GetActiveAttempts()))
+	for i, attempt := range request.GetActiveAttempts() {
+		results[i] = &dispatcherv1.HeartbeatAttemptResult{
+			JobId:     attempt.GetJobId(),
+			AttemptNo: attempt.GetAttemptNo(),
+			State:     dispatcherv1.HeartbeatAttemptState_HEARTBEAT_ATTEMPT_STATE_VALID,
+		}
+	}
+	return &dispatcherv1.HeartbeatResponse{Attempts: results}, nil
+}
+
+func (service *testFaultLifecycleService) ReportAttempt(
+	context.Context,
+	*dispatcherv1.ReportAttemptRequest,
+) (*dispatcherv1.ReportAttemptResponse, error) {
+	service.mu.Lock()
+	service.reportCalls++
+	service.mu.Unlock()
+	return &dispatcherv1.ReportAttemptResponse{}, nil
 }
 
 type workerLifecycleService struct {
@@ -234,4 +431,10 @@ func runUntilAcquisition(t *testing.T, cfg config, acquired <-chan string) strin
 		t.Fatal("timed out waiting for worker shutdown")
 	}
 	return workerID
+}
+
+func clearTestFaultEnvironment(t *testing.T) {
+	t.Helper()
+	t.Setenv(testSideEffectFileEnv, "")
+	t.Setenv(testExitAfterSuccessEnv, "")
 }

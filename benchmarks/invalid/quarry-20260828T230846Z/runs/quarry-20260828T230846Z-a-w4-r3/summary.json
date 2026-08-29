@@ -1,0 +1,67 @@
+{
+  "schema_version": 2,
+  "run_id": "quarry-20260828T230846Z-a-w4-r3",
+  "config": {
+    "workload": "a",
+    "worker_processes": 4,
+    "worker_concurrency": 8,
+    "max_outstanding": 8,
+    "http_concurrency": 8,
+    "warmup_duration": 30000000000,
+    "measurement_duration": 120000000000,
+    "drain_timeout": 30000000000,
+    "poll_interval": 10000000,
+    "seed": 20260827,
+    "max_attempts": 1,
+    "job_timeout": 5000000000
+  },
+  "jobs": {
+    "run_id": "quarry-20260828T230846Z-a-w4-r3",
+    "measurement_started_at": "2026-08-28T23:30:03.1484757Z",
+    "measurement_ended_at": "2026-08-28T23:32:03.1484757Z",
+    "warmup_sample_count": 1640,
+    "measurement_sample_count": 6640,
+    "submitted_count": 6640,
+    "completed_count": 6632,
+    "successful_count": 6632,
+    "terminal_failure_count": 0,
+    "submission_failure_count": 0,
+    "incomplete_count": 0,
+    "submitted_per_second": 55.333333333333336,
+    "completed_per_second": 55.266666666666666,
+    "end_to_end": {
+      "count": 6632,
+      "p50": 110641000,
+      "p95": 347144000,
+      "p99": 446965000
+    },
+    "scheduling": {
+      "count": 6632,
+      "p50": 105516000,
+      "p95": 342307000,
+      "p99": 442460000
+    },
+    "attempt_duration": {
+      "count": 6632,
+      "p50": 4854000,
+      "p95": 6416000,
+      "p99": 7945000
+    },
+    "client_observed": {
+      "count": 6632,
+      "p50": 121897400,
+      "p95": 358620400,
+      "p99": 459643500
+    }
+  },
+  "resources": {
+    "sample_count": 48,
+    "started_at": "2026-08-28T23:30:05.4851865Z",
+    "ended_at": "2026-08-28T23:32:02.4565103Z",
+    "quarry_cpu_core_average": 0.48956977778514293,
+    "quarry_resident_memory_peak_bytes": 322134016,
+    "postgresql_cpu_percent_average": 19.18229166666666,
+    "postgresql_memory_peak_bytes": 136839168,
+    "database_connections_peak": 19
+  }
+}

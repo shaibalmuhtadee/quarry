@@ -1,0 +1,21 @@
+{
+  "run_id": "quarry-20260829T002429Z-c-w2-r1",
+  "killed_worker_id": "b3b0ae36-a4e2-44ac-862c-0a973cd6d1ce",
+  "replacement_worker_ids": [
+    "b2b04e48-734a-4f46-8ebf-97f7748bb153"
+  ],
+  "worker_terminated_at": "2026-08-29T01:26:39.409316Z",
+  "sample_count": 8,
+  "kill_to_replacement_start": {
+    "count": 8,
+    "p50": 20825880000,
+    "p95": 20825880000,
+    "p99": 20825880000
+  },
+  "kill_to_success": {
+    "count": 8,
+    "p50": 26832287000,
+    "p95": 26832614000,
+    "p99": 26832614000
+  }
+}

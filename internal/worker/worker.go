@@ -72,16 +72,17 @@ type Dispatcher interface {
 }
 
 type Config struct {
-	Registration      Registration
-	IdleBackoffMin    time.Duration
-	IdleBackoffMax    time.Duration
-	ReportBackoffMin  time.Duration
-	ReportBackoffMax  time.Duration
-	HeartbeatInterval time.Duration
-	ShutdownTimeout   time.Duration
-	Logger            *slog.Logger
-	Metrics           workerMetrics
-	Tracer            trace.Tracer
+	Registration            Registration
+	IdleBackoffMin          time.Duration
+	IdleBackoffMax          time.Duration
+	ReportBackoffMin        time.Duration
+	ReportBackoffMax        time.Duration
+	HeartbeatInterval       time.Duration
+	ShutdownTimeout         time.Duration
+	TestAfterHandlerSuccess func(Job) error
+	Logger                  *slog.Logger
+	Metrics                 workerMetrics
+	Tracer                  trace.Tracer
 }
 
 type workerMetrics interface {
@@ -90,19 +91,21 @@ type workerMetrics interface {
 }
 
 type Worker struct {
-	dispatcher        Dispatcher
-	registration      Registration
-	handlers          map[string]Handler
-	supportedTypes    []domain.JobType
-	idleBackoffMin    time.Duration
-	idleBackoffMax    time.Duration
-	reportBackoffMin  time.Duration
-	reportBackoffMax  time.Duration
-	heartbeatInterval time.Duration
-	shutdownTimeout   time.Duration
-	logger            *slog.Logger
-	metrics           workerMetrics
-	tracer            trace.Tracer
+	dispatcher                  Dispatcher
+	registration                Registration
+	handlers                    map[string]Handler
+	supportedTypes              []domain.JobType
+	idleBackoffMin              time.Duration
+	idleBackoffMax              time.Duration
+	reportBackoffMin            time.Duration
+	reportBackoffMax            time.Duration
+	heartbeatInterval           time.Duration
+	shutdownTimeout             time.Duration
+	testAfterHandlerSuccess     func(Job) error
+	testAfterHandlerSuccessOnce sync.Once
+	logger                      *slog.Logger
+	metrics                     workerMetrics
+	tracer                      trace.Tracer
 }
 
 func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worker, error) {
@@ -163,19 +166,20 @@ func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worke
 	})
 
 	return &Worker{
-		dispatcher:        dispatcher,
-		registration:      cfg.Registration,
-		handlers:          handlerCopy,
-		supportedTypes:    supportedTypes,
-		idleBackoffMin:    cfg.IdleBackoffMin,
-		idleBackoffMax:    cfg.IdleBackoffMax,
-		reportBackoffMin:  cfg.ReportBackoffMin,
-		reportBackoffMax:  cfg.ReportBackoffMax,
-		heartbeatInterval: cfg.HeartbeatInterval,
-		shutdownTimeout:   cfg.ShutdownTimeout,
-		logger:            logger,
-		metrics:           cfg.Metrics,
-		tracer:            tracer,
+		dispatcher:              dispatcher,
+		registration:            cfg.Registration,
+		handlers:                handlerCopy,
+		supportedTypes:          supportedTypes,
+		idleBackoffMin:          cfg.IdleBackoffMin,
+		idleBackoffMax:          cfg.IdleBackoffMax,
+		reportBackoffMin:        cfg.ReportBackoffMin,
+		reportBackoffMax:        cfg.ReportBackoffMax,
+		heartbeatInterval:       cfg.HeartbeatInterval,
+		shutdownTimeout:         cfg.ShutdownTimeout,
+		testAfterHandlerSuccess: cfg.TestAfterHandlerSuccess,
+		logger:                  logger,
+		metrics:                 cfg.Metrics,
+		tracer:                  tracer,
 	}, nil
 }
 
@@ -516,6 +520,16 @@ func (worker *Worker) execute(
 				worker.metrics.JobExecutionCompleted(job.Type, outcome.Kind(), executionDuration)
 			}
 			executionSpan.SetAttributes(attribute.String("job.outcome", string(outcome.Kind())))
+			if err := worker.runTestAfterHandlerSuccess(job, outcome); err != nil {
+				executionSpan.End()
+				fail(fmt.Errorf(
+					"after successful handler for %s attempt %d: %w",
+					job.ID,
+					job.AttemptNumber.Int32(),
+					err,
+				))
+				return
+			}
 			reportCtx := trace.ContextWithSpanContext(attempt.ctx, trace.SpanContextFromContext(executionCtx))
 			if err := worker.reportUntilAcknowledged(reportCtx, job, outcome); err != nil {
 				executionSpan.End()
@@ -547,6 +561,17 @@ func (worker *Worker) execute(
 			}
 		}
 	}
+}
+
+func (worker *Worker) runTestAfterHandlerSuccess(job Job, outcome domain.AttemptOutcome) error {
+	if outcome.Kind() != domain.AttemptOutcomeKindSucceeded || worker.testAfterHandlerSuccess == nil {
+		return nil
+	}
+	var err error
+	worker.testAfterHandlerSuccessOnce.Do(func() {
+		err = worker.testAfterHandlerSuccess(job)
+	})
+	return err
 }
 
 func (worker *Worker) heartbeatLoop(

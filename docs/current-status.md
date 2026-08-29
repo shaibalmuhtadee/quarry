@@ -1,10 +1,10 @@
 # Current status
 
-- Current milestone: Milestone 5, observability
-- Milestone status: complete
-- Completed milestones: Milestones 0, 1, 2, 3, 4, and 5
-- Current area of work: Milestone 5 audit complete; Milestone 6 not started
+- Current milestone: Milestone 7, packaging and portfolio polish
+- Milestone status: planning not started
+- Completed milestones: Milestones 0, 1, 2, 3, 4, 5, and 6
+- Current area of work: Milestone 6 is complete; Milestone 7 slice planning has not started
 - Known blockers: none
 - Known architecture deviations: none
 - Known implementation deviations: PowerShell provides the common command interface instead of GNU Make. The project plan permits an equivalent command interface, and this choice does not change the system architecture.
-- Known limitations: Cancellation, timeout, and forced-shutdown cancellation are cooperative; Quarry cannot forcibly terminate a handler that ignores its context before the worker process exits. Local Jaeger trace storage is in memory. GitHub-hosted CI has not run for the current state.
+- Known limitations: Three incomplete benchmark campaigns remain preserved as invalid evidence. Published results describe one local machine under a fixed maximum of eight outstanding jobs and do not establish production capacity. Cancellation, timeout, and forced-shutdown cancellation are cooperative; Quarry cannot forcibly terminate a handler that ignores its context before the worker process exits. Local Jaeger trace storage is in memory. GitHub-hosted CI has not run for the current state.
