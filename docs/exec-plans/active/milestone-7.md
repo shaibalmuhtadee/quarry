@@ -210,7 +210,7 @@ Produce reproducible non-root images for API, dispatcher, worker, and migrations
 
 ## Slice 2: full Docker Compose environment
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -268,11 +268,18 @@ Make `docker compose up --build` start the complete local system with one explic
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- The default Compose stack uses `deploy/observability/prometheus-compose.yml`, which scrapes the API and dispatcher through service DNS and discovers every worker replica through DNS service discovery. The existing host-run observability commands select `compose.host-observability.yaml` so they continue to use `host.docker.internal` targets.
+- Worker-only scale operations use `docker compose up --no-deps --scale` so Compose does not restart the completed one-shot migration container.
+- The Compose test allocates unique host ports and a unique project name, then verifies cleanup through Docker labels. No architecture or project-plan deviations were required.
 
 ### Validation evidence
 
-None yet.
+- 2026-08-29: `docker compose config --quiet` passed for the complete stack. Promtool accepted both the Compose and host-run Prometheus configurations, the Collector accepted its configuration, and `go test -count=1 ./deploy/observability` passed.
+- 2026-08-29: `pwsh ./scripts/dev.ps1 compose-test` passed twice, once directly and once inside the canonical check. Each fresh-volume run built the four Quarry images, ran one migration container successfully without restarting it during scaling, reached API readiness, completed a `demo.echo` job with one successful attempt, found healthy API, dispatcher, and worker Prometheus targets, retrieved the provisioned Grafana dashboard, found the complete job trace in Jaeger, scaled the worker service from two to three containers, and removed its containers, network, volume, and temporary directory.
+- 2026-08-29: `pwsh ./scripts/dev.ps1 observability-test` passed twice, once directly and once inside the canonical check. The existing host-run path retained its success and retry traces, Collector-unavailable execution proof, structured-log assertions, Prometheus metrics, Grafana dashboard, Jaeger traces, and cleanup.
+- 2026-08-29: `pwsh ./scripts/dev.ps1 check` passed. The canonical run included dependency and formatting checks, pinned tools, sqlc and protobuf consistency, vet, all Go tests, all binary builds, image validation, the Compose proof, observability validation, API smoke, distributed execution, failure recovery, acknowledgement-loss, stale-report, and worker-shutdown semantics.
+- 2026-08-29: `git diff --check` passed.
+- GitHub-hosted CI was not run and remains unverified.
 
 ## Slice 3: Compose recovery demonstration
 

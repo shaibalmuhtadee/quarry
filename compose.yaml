@@ -17,6 +17,70 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  migration:
+    image: quarry-migration:dev
+    build:
+      context: .
+      target: migration
+    environment:
+      GOOSE_DBSTRING: postgres://quarry:quarry@postgres:5432/quarry?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    image: quarry-api:dev
+    build:
+      context: .
+      target: api
+    environment:
+      QUARRY_DATABASE_URL: postgres://quarry:quarry@postgres:5432/quarry?sslmode=disable
+      QUARRY_HTTP_ADDR: :8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    ports:
+      - "${QUARRY_API_PORT:-8080}:8080"
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  dispatcher:
+    image: quarry-dispatcher:dev
+    build:
+      context: .
+      target: dispatcher
+    environment:
+      QUARRY_DATABASE_URL: postgres://quarry:quarry@postgres:5432/quarry?sslmode=disable
+      QUARRY_DISPATCHER_ADDR: :9090
+      QUARRY_DISPATCHER_METRICS_ADDR: :9464
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    ports:
+      - "${QUARRY_DISPATCHER_PORT:-9090}:9090"
+      - "${QUARRY_DISPATCHER_METRICS_PORT:-9464}:9464"
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker:
+    image: quarry-worker:dev
+    build:
+      context: .
+      target: worker
+    environment:
+      QUARRY_DISPATCHER_ADDR: dispatcher:9090
+      QUARRY_WORKER_CONCURRENCY: "${QUARRY_WORKER_CONCURRENCY:-4}"
+      QUARRY_WORKER_VERSION: compose
+      QUARRY_WORKER_METRICS_ADDR: :9465
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      dispatcher:
+        condition: service_started
+    restart: unless-stopped
+
   prometheus:
     # Pinned to Prometheus 3.12.0 for reproducible local observability.
     image: prom/prometheus:v3.12.0
@@ -28,7 +92,14 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/observability/prometheus-compose.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      api:
+        condition: service_started
+      dispatcher:
+        condition: service_started
+      worker:
+        condition: service_started
     restart: unless-stopped
 
   otel-collector:

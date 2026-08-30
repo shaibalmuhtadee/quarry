@@ -1,0 +1,4 @@
+services:
+  prometheus:
+    volumes:
+      - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro

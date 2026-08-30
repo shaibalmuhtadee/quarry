@@ -3,7 +3,7 @@ param(
         "check", "test", "tools",
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
-        "generate", "generate-check", "format-check", "vet", "build", "image-test",
+        "generate", "generate-check", "format-check", "vet", "build", "image-test", "compose-test",
         "smoke-test", "distributed-test", "recovery-test", "ack-loss-test", "failure-test", "semantics-test",
         "benchmark-smoke", "benchmark", "benchmark-verify",
         "observability-config-test", "observability-test", "observability-up", "observability-down"
@@ -1006,8 +1006,7 @@ function Assert-ProcessTestCleanup {
         [Parameter(Mandatory)]
         [string]$TemporaryDirectory,
 
-        [Parameter(Mandatory)]
-        [int[]]$ProcessIDs
+        [int[]]$ProcessIDs = @()
     )
 
     if (Test-Path -LiteralPath $TemporaryDirectory) {
@@ -3216,12 +3215,20 @@ function Wait-ObservabilityEndpoint {
 
 function Test-ObservabilityConfiguration {
     $prometheusConfig = (Resolve-Path -LiteralPath "deploy/observability/prometheus.yml").Path
+    $composePrometheusConfig = (Resolve-Path -LiteralPath "deploy/observability/prometheus-compose.yml").Path
     $collectorConfig = (Resolve-Path -LiteralPath "deploy/observability/otel-collector.yaml").Path
 
     Invoke-Docker -Arguments @("compose", "config", "--quiet")
     Invoke-Docker -Arguments @(
         "run", "--rm",
         "--volume", "${prometheusConfig}:/etc/prometheus/prometheus.yml:ro",
+        "--entrypoint", "promtool",
+        "prom/prometheus:v3.12.0",
+        "check", "config", "/etc/prometheus/prometheus.yml"
+    )
+    Invoke-Docker -Arguments @(
+        "run", "--rm",
+        "--volume", "${composePrometheusConfig}:/etc/prometheus/prometheus.yml:ro",
         "--entrypoint", "promtool",
         "prom/prometheus:v3.12.0",
         "check", "config", "/etc/prometheus/prometheus.yml"
@@ -3238,7 +3245,10 @@ function Test-ObservabilityConfiguration {
 function Start-ObservabilityInfrastructure {
     Test-ObservabilityConfiguration
     Invoke-Docker -Arguments @(
-        "compose", "up", "--detach", "--wait",
+        "compose",
+        "--file", "compose.yaml",
+        "--file", "deploy/observability/compose.host-observability.yaml",
+        "up", "--detach", "--wait", "--no-deps",
         "prometheus", "jaeger", "otel-collector", "grafana"
     )
 
@@ -3904,6 +3914,209 @@ function Test-ObservabilityWorkflow {
     Write-Host "Observability-test cleanup verified: processes, temporary binaries, containers, network, and volume removed."
 }
 
+function Get-ComposeServiceContainers {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComposeProject,
+
+        [Parameter(Mandatory)]
+        [string]$Service,
+
+        [switch]$Running
+    )
+
+    $arguments = @("ps", "--quiet")
+    if ($Running) {
+        $arguments += @("--filter", "status=running")
+    }
+    else {
+        $arguments = @("ps", "--all", "--quiet")
+    }
+    $arguments += @(
+        "--filter", "label=com.docker.compose.project=$ComposeProject",
+        "--filter", "label=com.docker.compose.service=$Service"
+    )
+
+    return @(
+        Invoke-Docker -Arguments $arguments |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+}
+
+function Wait-PrometheusWorkerTargets {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [int]$MinimumCount
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(45)
+    $lastCount = 0
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $response = Invoke-RestMethod -Uri "$BaseURL/api/v1/targets" -TimeoutSec 5
+            $lastCount = @(
+                $response.data.activeTargets |
+                    Where-Object { $_.health -eq "up" -and $_.labels.job -eq "quarry-worker" }
+            ).Count
+            if ($lastCount -ge $MinimumCount) {
+                return
+            }
+        }
+        catch {
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Prometheus reported $lastCount healthy worker targets, expected at least $MinimumCount."
+}
+
+function Test-ComposeWorkflow {
+    $testID = [Guid]::NewGuid().ToString("N")
+    $composeProject = "quarry-m7-compose-$testID"
+    $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "quarry-compose-$testID"
+    $savedEnvironment = @{}
+    $environmentNames = @(
+        "COMPOSE_PROJECT_NAME",
+        "QUARRY_POSTGRES_PORT",
+        "QUARRY_API_PORT",
+        "QUARRY_DISPATCHER_PORT",
+        "QUARRY_DISPATCHER_METRICS_PORT",
+        "QUARRY_PROMETHEUS_PORT",
+        "QUARRY_GRAFANA_PORT",
+        "QUARRY_OTEL_GRPC_PORT",
+        "QUARRY_OTEL_HTTP_PORT",
+        "QUARRY_OTEL_HEALTH_PORT",
+        "QUARRY_JAEGER_PORT",
+        "QUARRY_WORKER_CONCURRENCY"
+    )
+    foreach ($name in $environmentNames) {
+        $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
+    }
+
+    $ports = [System.Collections.Generic.List[int]]::new()
+    while ($ports.Count -lt 10) {
+        $candidate = Get-AvailableLoopbackPort
+        if (-not $ports.Contains($candidate)) {
+            $ports.Add($candidate)
+        }
+    }
+
+    $env:COMPOSE_PROJECT_NAME = $composeProject
+    $env:QUARRY_POSTGRES_PORT = [string]$ports[0]
+    $env:QUARRY_API_PORT = [string]$ports[1]
+    $env:QUARRY_DISPATCHER_PORT = [string]$ports[2]
+    $env:QUARRY_DISPATCHER_METRICS_PORT = [string]$ports[3]
+    $env:QUARRY_PROMETHEUS_PORT = [string]$ports[4]
+    $env:QUARRY_GRAFANA_PORT = [string]$ports[5]
+    $env:QUARRY_OTEL_GRPC_PORT = [string]$ports[6]
+    $env:QUARRY_OTEL_HTTP_PORT = [string]$ports[7]
+    $env:QUARRY_OTEL_HEALTH_PORT = [string]$ports[8]
+    $env:QUARRY_JAEGER_PORT = [string]$ports[9]
+    $env:QUARRY_WORKER_CONCURRENCY = "1"
+
+    $apiURL = "http://127.0.0.1:$($env:QUARRY_API_PORT)"
+    $prometheusURL = "http://127.0.0.1:$($env:QUARRY_PROMETHEUS_PORT)"
+    $grafanaURL = "http://127.0.0.1:$($env:QUARRY_GRAFANA_PORT)"
+    $jaegerURL = "http://127.0.0.1:$($env:QUARRY_JAEGER_PORT)"
+
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        Invoke-Docker -Arguments @("compose", "config", "--quiet")
+        Invoke-Docker -Arguments @("compose", "up", "--build", "--detach", "--scale", "worker=2")
+
+        Wait-ObservabilityEndpoint -Name "Compose API readiness" -URL "$apiURL/readyz"
+        Wait-ObservabilityEndpoint `
+            -Name "Compose OpenTelemetry Collector" `
+            -URL "http://127.0.0.1:$($env:QUARRY_OTEL_HEALTH_PORT)/"
+        Wait-ObservabilityEndpoint -Name "Compose Prometheus" -URL "$prometheusURL/-/ready"
+        Wait-ObservabilityEndpoint -Name "Compose Grafana" -URL "$grafanaURL/api/health"
+        Wait-ObservabilityEndpoint -Name "Compose Jaeger" -URL "$jaegerURL/api/services"
+
+        $migrationContainers = @(Get-ComposeServiceContainers `
+            -ComposeProject $composeProject -Service "migration")
+        if ($migrationContainers.Count -ne 1) {
+            throw "Compose created $($migrationContainers.Count) migration containers, expected exactly one."
+        }
+        $migrationState = @(
+            Invoke-Docker -Arguments @(
+                "inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", $migrationContainers[0]
+            )
+        )[0].Trim()
+        if ($migrationState -ne "exited 0") {
+            throw "Compose migration state was '$migrationState', expected 'exited 0'."
+        }
+        $migrationStartedAt = @(
+            Invoke-Docker -Arguments @(
+                "inspect", "--format", "{{.State.StartedAt}}", $migrationContainers[0]
+            )
+        )[0].Trim()
+
+        $submitted = Submit-ObservabilityJob -BaseURL $apiURL -Type "demo.echo" `
+            -Payload @{ message = "compose-test" } -MaxAttempts 1 -TimeoutMilliseconds 30000
+        $jobState = Wait-ObservabilityJobStatus `
+            -BaseURL $apiURL -JobID $submitted.id -ExpectedStatus "succeeded"
+        $attempts = Get-ObservabilityJobAttempts -BaseURL $apiURL -JobID $submitted.id
+        if ($jobState.result.message -ne "compose-test" -or
+            $attempts.Count -ne 1 -or $attempts[0].status -ne "succeeded") {
+            throw "Compose public API did not return the expected result and one succeeded attempt."
+        }
+
+        Wait-PrometheusTargets -BaseURL $prometheusURL
+        Wait-PrometheusWorkerTargets -BaseURL $prometheusURL -MinimumCount 2
+        Assert-GrafanaDashboard -BaseURL $grafanaURL
+        $traceID = Wait-JaegerJobTrace -BaseURL $jaegerURL -JobID $submitted.id
+
+        Invoke-Docker -Arguments @(
+            "compose", "up", "--detach", "--no-deps", "--scale", "worker=3", "worker"
+        )
+        $deadline = [DateTime]::UtcNow.AddSeconds(45)
+        do {
+            $runningWorkers = @(Get-ComposeServiceContainers `
+                -ComposeProject $composeProject -Service "worker" -Running)
+            if ($runningWorkers.Count -eq 3) {
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if ($runningWorkers.Count -ne 3) {
+            throw "Compose worker service has $($runningWorkers.Count) running containers, expected 3."
+        }
+        Wait-PrometheusWorkerTargets -BaseURL $prometheusURL -MinimumCount 3
+        $migrationStartedAtAfterScale = @(
+            Invoke-Docker -Arguments @(
+                "inspect", "--format", "{{.State.StartedAt}}", $migrationContainers[0]
+            )
+        )[0].Trim()
+        if ($migrationStartedAtAfterScale -ne $migrationStartedAt) {
+            throw "Compose restarted the one-shot migration while scaling workers."
+        }
+
+        Write-Host "Compose test passed: one migration, ready API, successful job $($submitted.id), trace $traceID, observability targets, and three scaled workers verified."
+    }
+    finally {
+        try {
+            Invoke-Docker -Arguments @("compose", "down", "--volumes", "--remove-orphans")
+        }
+        finally {
+            try {
+                Remove-DistributedTestDirectory -Directory $temporaryDirectory
+            }
+            finally {
+                foreach ($name in $environmentNames) {
+                    [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name])
+                }
+            }
+        }
+    }
+
+    Assert-ProcessTestCleanup -TestName "Compose-test" -ComposeProject $composeProject `
+        -TemporaryDirectory $temporaryDirectory
+    Write-Host "Compose-test cleanup verified: containers, network, volume, and temporary directory removed."
+}
+
 function Test-ComposeSmoke {
     $binaryExtension = if ($IsWindows) { ".exe" } else { "" }
     $apiBinary = Join-Path `
@@ -4180,6 +4393,7 @@ try {
             Test-GoPackages
             Test-GoBuild
             Test-ContainerImages
+            Test-ComposeWorkflow
             Test-ObservabilityConfiguration
             Test-ObservabilityWorkflow
             Test-ComposeSmoke
@@ -4240,6 +4454,9 @@ try {
         }
         "image-test" {
             Test-ContainerImages
+        }
+        "compose-test" {
+            Test-ComposeWorkflow
         }
         "smoke-test" {
             Test-ComposeSmoke
