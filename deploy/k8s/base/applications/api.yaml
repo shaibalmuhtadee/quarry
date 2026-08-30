@@ -37,6 +37,8 @@ spec:
         app.kubernetes.io/part-of: quarry
     spec:
       securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:

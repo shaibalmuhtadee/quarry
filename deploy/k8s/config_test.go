@@ -80,6 +80,8 @@ func TestPostgresAndMigrationResources(t *testing.T) {
 		"image: quarry-migration:dev",
 		"name: GOOSE_DBSTRING",
 		"key: database-url",
+		"runAsUser: 65532",
+		"runAsGroup: 65532",
 	)
 	requireContainerResources(t, migration)
 }
@@ -96,6 +98,8 @@ func TestApplicationServicesProbesReplicasAndResources(t *testing.T) {
 		"image: quarry-api:dev",
 		"path: /healthz",
 		"path: /readyz",
+		"runAsUser: 65532",
+		"runAsGroup: 65532",
 	)
 	requireContainerResources(t, api)
 
@@ -108,6 +112,8 @@ func TestApplicationServicesProbesReplicasAndResources(t *testing.T) {
 		"image: quarry-dispatcher:dev",
 		"service: quarry.dispatcher.liveness",
 		"service: quarry.dispatcher.readiness",
+		"runAsUser: 65532",
+		"runAsGroup: 65532",
 	)
 	if count := strings.Count(dispatcher, "grpc:"); count != 2 {
 		t.Fatalf("dispatcher gRPC probe count = %d, want 2", count)
@@ -123,6 +129,8 @@ func TestApplicationServicesProbesReplicasAndResources(t *testing.T) {
 		"image: quarry-worker:dev",
 		"name: QUARRY_WORKER_SHUTDOWN_TIMEOUT",
 		"value: 10s",
+		"runAsUser: 65532",
+		"runAsGroup: 65532",
 	)
 	if strings.Contains(worker, "kind: Service") {
 		t.Fatal("worker manifest must not define a Service")

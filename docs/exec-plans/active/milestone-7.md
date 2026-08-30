@@ -425,7 +425,7 @@ Define the local Kubernetes deployment with plain resources and an ordered Kusto
 
 ## Slice 5: kind deployment proof
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -481,11 +481,23 @@ Prove that a fresh kind cluster can run locally built Quarry images and complete
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- Automated validation creates a unique cluster, always deletes it, and verifies removal of the cluster, Docker node container, kubectl context, owned API port-forward, and temporary files. The user-facing `kind-up` command uses the fixed `quarry-demo` name and leaves a successful cluster available until `kind-down` removes it.
+- The proof requires kind v0.32.0 or newer and pins Kubernetes v1.33.12 by the kind node image digest. It builds and loads the four local Quarry images, then checks the node's container runtime for every exact tag. PostgreSQL remains an upstream image pulled by Kubernetes; importing Docker Desktop's multi-platform PostgreSQL image into kind was unnecessary and failed because its content store did not contain every referenced platform blob.
+- PostgreSQL, migration, and applications are applied as separate Kustomize stages. The proof checks that the fresh cluster has no prior Quarry namespace, records PostgreSQL's Ready transition, requires the migration to start afterward and complete once, confirms no application Deployment predates migration completion, and then checks the exact configured replica counts.
+- The distroless images declare the named user `nonroot:nonroot`, but Kubernetes cannot prove a named image user satisfies `runAsNonRoot`. The migration and application pod security contexts therefore set the distroless numeric UID and GID 65532 explicitly. This is a Kubernetes boundary fix, not an architecture change.
+- The application stage creates dispatcher and worker Deployments together, so Kubernetes can restart workers while dispatcher service endpoints become available. The proof requires the final exact Ready state and a successful public-API job rather than rejecting recovered startup restarts.
+- API liveness and readiness are checked through an owned loopback port-forward, dispatcher liveness and readiness are checked through the configured gRPC probes, and one `demo.echo` job must return its expected result with one succeeded attempt and a worker ID.
+- No architecture or project-plan deviations were required. Slice 6 scaling work did not begin.
 
 ### Validation evidence
 
-None yet.
+- 2026-08-30: kind v0.32.0 and Kubernetes v1.33.12 were used. `go test -count=1 ./deploy/k8s/...` and `pwsh ./scripts/dev.ps1 k8s-config-test` passed after the numeric UID/GID fix.
+- 2026-08-30: `pwsh ./scripts/dev.ps1 kind-test` passed on fresh cluster `quarry-m7-ffd6360034fe`. PostgreSQL became Ready, all eight migrations completed before application creation, API 1/1, dispatcher 2/2, and worker 3/3 became Ready, job `ef086ed0-a862-4303-9623-94e078aa7ae3` succeeded through worker `0e558c31-8044-4abf-beb5-d0d10a2b5d17`, and cleanup removed the port-forward, temporary directory, cluster, node container, and kubectl context.
+- 2026-08-30: `pwsh ./scripts/dev.ps1 check` passed. Its independent fresh cluster `quarry-m7-7631fc5a6a79` completed job `1c95cb27-79fb-456d-ab5f-cbca6d71b079` through worker `2de33f03-e568-4dc7-b2e6-dc43f225433d`, verified the same ordered deployment and cleanup, and the canonical run also passed tools, formatting and generation consistency, vet, all Go tests and builds, image validation, Compose and observability proofs, distributed execution, failure recovery, acknowledgement loss, stale-report handling, shutdown semantics, and race checks.
+- 2026-08-30: Four earlier live attempts were not counted as evidence. They exposed an unnecessary PostgreSQL image import, the named distroless user incompatibility, an acceptance check stricter than the slice requirements, and leaked PowerShell command output that obscured the structured result. Every failed automated cluster was deleted and its node container and kubectl context were removed.
+- 2026-08-30: A final cleanup inspection found zero kind clusters, kind node containers, Quarry kind contexts, and kind port-forward temporary directories.
+- 2026-08-30: `git diff --check` passed after the tracking updates.
+- GitHub-hosted CI was not run and remains unverified.
 
 ## Slice 6: Kubernetes worker scaling demonstration
 

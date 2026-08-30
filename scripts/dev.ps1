@@ -5,6 +5,7 @@ param(
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
         "generate", "generate-check", "format-check", "vet", "build", "image-test", "compose-test",
         "compose-recovery", "compose-recovery-test", "compose-recovery-down", "k8s-config-test",
+        "kind-up", "kind-test", "kind-down",
         "smoke-test", "distributed-test", "recovery-test", "ack-loss-test", "failure-test", "semantics-test",
         "benchmark-smoke", "benchmark", "benchmark-verify",
         "observability-config-test", "observability-test", "observability-up", "observability-down"
@@ -100,6 +101,31 @@ function Invoke-Kubectl {
     & $script:KubectlExecutable @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "kubectl $($Arguments -join ' ') failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Find-KindExecutable {
+    $kindCommand = Get-Command kind -ErrorAction SilentlyContinue
+    if ($null -ne $kindCommand) {
+        return $kindCommand.Source
+    }
+
+    throw "kind is not available. Install kind v0.32.0 or newer and add it to PATH."
+}
+
+function Invoke-Kind {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    if ($null -eq $script:KindExecutable) {
+        $script:KindExecutable = Find-KindExecutable
+    }
+
+    & $script:KindExecutable @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "kind $($Arguments -join ' ') failed with exit code $LASTEXITCODE."
     }
 }
 
@@ -3356,6 +3382,542 @@ users:
     Write-Host "K8s-config-test passed: base and kind stages rendered, client dry-runs passed, focused assertions passed, and temporary files were removed."
 }
 
+function Assert-KindVersion {
+    if ($null -eq $script:KindExecutable) {
+        $script:KindExecutable = Find-KindExecutable
+    }
+
+    $output = @(& $script:KindExecutable version)
+    if ($LASTEXITCODE -ne 0) {
+        throw "kind version failed with exit code $LASTEXITCODE."
+    }
+    $versionMatch = [regex]::Match(($output -join " "), 'kind v(?<version>\d+\.\d+\.\d+)')
+    if (-not $versionMatch.Success) {
+        throw "kind returned an unrecognized version: $($output -join ' ')"
+    }
+    $version = [version]$versionMatch.Groups['version'].Value
+    if ($version -lt [version]'0.32.0') {
+        throw "kind v$version is too old. Quarry requires kind v0.32.0 or newer."
+    }
+    return "v$version"
+}
+
+function Get-KindClusters {
+    return @(
+        Invoke-Kind -Arguments @("get", "clusters") |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+}
+
+function Test-KindClusterExists {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    return (Get-KindClusters) -contains $ClusterName
+}
+
+function Invoke-KindKubectl {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName,
+
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    Invoke-Kubectl -Arguments (@("--context", "kind-$ClusterName") + $Arguments)
+}
+
+function Get-KindKubectlJSON {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName,
+
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    $output = @(Invoke-KindKubectl -ClusterName $ClusterName -Arguments ($Arguments + @("-o", "json")))
+    return (($output -join [Environment]::NewLine) | ConvertFrom-Json)
+}
+
+function Remove-KindCluster {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    if ($null -eq $script:KubectlExecutable) {
+        $script:KubectlExecutable = Find-KubectlExecutable
+    }
+    if (Test-KindClusterExists -ClusterName $ClusterName) {
+        Invoke-Kind -Arguments @("delete", "cluster", "--name", $ClusterName)
+    }
+    if (Test-KindClusterExists -ClusterName $ClusterName) {
+        throw "kind cluster '$ClusterName' remains after deletion."
+    }
+
+    $containers = @(
+        Invoke-Docker -Arguments @(
+            "ps", "--all", "--quiet",
+            "--filter", "label=io.x-k8s.kind.cluster=$ClusterName"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($containers.Count -ne 0) {
+        throw "kind cluster '$ClusterName' still has Docker node containers after deletion."
+    }
+
+    $contexts = @(
+        & $script:KubectlExecutable config get-contexts --output name 2>$null |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "kubectl config get-contexts failed with exit code $LASTEXITCODE."
+    }
+    if ($contexts -contains "kind-$ClusterName") {
+        throw "kubectl context 'kind-$ClusterName' remains after cluster deletion."
+    }
+}
+
+function Get-KindImages {
+    return @(
+        [PSCustomObject]@{ Target = "api"; Tag = "quarry-api:kind" },
+        [PSCustomObject]@{ Target = "dispatcher"; Tag = "quarry-dispatcher:kind" },
+        [PSCustomObject]@{ Target = "worker"; Tag = "quarry-worker:kind" },
+        [PSCustomObject]@{ Target = "migration"; Tag = "quarry-migration:kind" }
+    )
+}
+
+function Build-AndLoadKindImages {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    $images = @(Get-KindImages)
+    foreach ($image in $images) {
+        Invoke-Docker -Arguments @(
+            "build", "--target", $image.Target, "--tag", $image.Tag, "."
+        ) | Out-Host
+    }
+
+    foreach ($image in $images) {
+        Invoke-Kind -Arguments @(
+            "load", "docker-image", "--name", $ClusterName, $image.Tag
+        ) | Out-Host
+    }
+
+    $nodes = @(
+        Invoke-Docker -Arguments @(
+            "ps", "--quiet",
+            "--filter", "label=io.x-k8s.kind.cluster=$ClusterName",
+            "--filter", "label=io.x-k8s.kind.role=control-plane"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($nodes.Count -ne 1) {
+        throw "kind cluster '$ClusterName' has $($nodes.Count) control-plane containers, expected one."
+    }
+    $loadedImages = @(
+        Invoke-Docker -Arguments @("exec", $nodes[0], "crictl", "images", "--output", "json")
+    ) -join [Environment]::NewLine
+    foreach ($tag in @($images.Tag)) {
+        if (-not $loadedImages.Contains($tag)) {
+            throw "kind node does not contain loaded image '$tag'."
+        }
+    }
+}
+
+function Assert-KindPodsReady {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName,
+
+        [Parameter(Mandatory)]
+        [string]$Component,
+
+        [Parameter(Mandatory)]
+        [int]$ExpectedCount
+    )
+
+    $response = Get-KindKubectlJSON `
+        -ClusterName $ClusterName `
+        -Arguments @(
+            "get", "pods", "--namespace", "quarry",
+            "--selector", "app.kubernetes.io/component=$Component"
+        )
+    $pods = @($response.items)
+    if ($pods.Count -ne $ExpectedCount) {
+        throw "kind component '$Component' has $($pods.Count) pods, expected $ExpectedCount."
+    }
+    foreach ($pod in $pods) {
+        $readyCondition = @($pod.status.conditions | Where-Object { $_.type -eq "Ready" })
+        $containerStatuses = @($pod.status.containerStatuses)
+        if ($readyCondition.Count -ne 1 -or $readyCondition[0].status -ne "True" -or
+            $containerStatuses.Count -ne 1 -or -not $containerStatuses[0].ready) {
+            throw "kind pod '$($pod.metadata.name)' is not Ready with one ready container."
+        }
+    }
+    return $pods
+}
+
+function Assert-KindDeploymentReady {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName,
+
+        [Parameter(Mandatory)]
+        [string]$Deployment,
+
+        [Parameter(Mandatory)]
+        [int]$ExpectedReplicas
+    )
+
+    $resource = Get-KindKubectlJSON `
+        -ClusterName $ClusterName `
+        -Arguments @("get", "deployment/$Deployment", "--namespace", "quarry")
+    if ([int]$resource.spec.replicas -ne $ExpectedReplicas -or
+        [int]$resource.status.readyReplicas -ne $ExpectedReplicas -or
+        [int]$resource.status.availableReplicas -ne $ExpectedReplicas) {
+        throw "kind deployment '$Deployment' is not ready at $ExpectedReplicas replicas."
+    }
+    return $resource
+}
+
+function Deploy-KindStages {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    $existingNamespace = @(
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "get", "namespace", "quarry", "--ignore-not-found", "--output", "name"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($existingNamespace.Count -ne 0) {
+        throw "fresh kind cluster '$ClusterName' already contains Quarry resources."
+    }
+
+    Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+        "apply", "--kustomize", "deploy/k8s/overlays/kind/postgres"
+    ) | Out-Host
+    Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+        "rollout", "status", "statefulset/postgres", "--namespace", "quarry", "--timeout", "180s"
+    ) | Out-Host
+    $postgresPods = @(Assert-KindPodsReady `
+        -ClusterName $ClusterName -Component "database" -ExpectedCount 1)
+    $postgresReadyCondition = @(
+        $postgresPods[0].status.conditions | Where-Object { $_.type -eq "Ready" }
+    )[0]
+    $postgresReadyAt = [DateTimeOffset]::Parse([string]$postgresReadyCondition.lastTransitionTime)
+
+    $jobsBeforeMigration = @(
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "get", "jobs", "--namespace", "quarry", "--output", "name"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($jobsBeforeMigration.Count -ne 0) {
+        throw "kind migration Job exists before the migration stage was applied."
+    }
+
+    Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+        "apply", "--kustomize", "deploy/k8s/overlays/kind/migration"
+    ) | Out-Host
+    Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+        "wait", "--for=condition=complete", "job/quarry-migration",
+        "--namespace", "quarry", "--timeout", "180s"
+    ) | Out-Host
+    $migration = Get-KindKubectlJSON `
+        -ClusterName $ClusterName `
+        -Arguments @("get", "job/quarry-migration", "--namespace", "quarry")
+    if ([int]$migration.status.succeeded -ne 1) {
+        throw "kind migration Job did not record one successful completion."
+    }
+    $migrationStartedAt = [DateTimeOffset]::Parse([string]$migration.status.startTime)
+    $migrationCompletedAt = [DateTimeOffset]::Parse([string]$migration.status.completionTime)
+    if ($migrationStartedAt -lt $postgresReadyAt) {
+        throw "kind migration started before PostgreSQL became Ready."
+    }
+
+    $deploymentsBeforeApplications = @(
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "get", "deployments", "--namespace", "quarry", "--output", "name"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($deploymentsBeforeApplications.Count -ne 0) {
+        throw "kind application Deployments exist before the application stage was applied."
+    }
+
+    Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+        "apply", "--kustomize", "deploy/k8s/overlays/kind/applications"
+    ) | Out-Host
+    foreach ($deployment in @("quarry-api", "quarry-dispatcher", "quarry-worker")) {
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "rollout", "status", "deployment/$deployment",
+            "--namespace", "quarry", "--timeout", "180s"
+        ) | Out-Host
+    }
+
+    $api = Assert-KindDeploymentReady `
+        -ClusterName $ClusterName -Deployment "quarry-api" -ExpectedReplicas 1
+    $dispatcher = Assert-KindDeploymentReady `
+        -ClusterName $ClusterName -Deployment "quarry-dispatcher" -ExpectedReplicas 2
+    $worker = Assert-KindDeploymentReady `
+        -ClusterName $ClusterName -Deployment "quarry-worker" -ExpectedReplicas 3
+    foreach ($deployment in @($api, $dispatcher, $worker)) {
+        $createdAt = [DateTimeOffset]::Parse([string]$deployment.metadata.creationTimestamp)
+        if ($createdAt -lt $migrationCompletedAt) {
+            throw "kind application deployment '$($deployment.metadata.name)' predates migration completion."
+        }
+    }
+
+    $null = @(Assert-KindPodsReady -ClusterName $ClusterName -Component "api" -ExpectedCount 1)
+    $null = @(Assert-KindPodsReady -ClusterName $ClusterName -Component "dispatcher" -ExpectedCount 2)
+    $null = @(Assert-KindPodsReady -ClusterName $ClusterName -Component "worker" -ExpectedCount 3)
+
+    $version = Get-KindKubectlJSON -ClusterName $ClusterName -Arguments @("version")
+    return [PSCustomObject]@{
+        KubernetesVersion = [string]$version.serverVersion.gitVersion
+        PostgresReadyAt = $postgresReadyAt
+        MigrationCompletedAt = $migrationCompletedAt
+    }
+}
+
+function Invoke-KindPublicAPIProof {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    $testID = [Guid]::NewGuid().ToString("N")
+    $temporaryDirectory = Join-Path `
+        ([System.IO.Path]::GetTempPath()) `
+        "quarry-kind-port-forward-$testID"
+    $standardOutput = Join-Path $temporaryDirectory "port-forward.stdout.log"
+    $standardError = Join-Path $temporaryDirectory "port-forward.stderr.log"
+    $portForward = $null
+    $portForwardID = $null
+    $port = Get-AvailableLoopbackPort
+    $baseURL = "http://127.0.0.1:$port"
+
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        $portForward = Start-DistributedProcess `
+            -Binary $script:KubectlExecutable `
+            -Environment @{} `
+            -Arguments @(
+                "--context", "kind-$ClusterName",
+                "--namespace", "quarry",
+                "port-forward", "--address", "127.0.0.1",
+                "service/quarry-api", "${port}:8080"
+            ) `
+            -StandardOutputPath $standardOutput `
+            -StandardErrorPath $standardError
+        $portForwardID = $portForward.Id
+
+        $deadline = [DateTime]::UtcNow.AddSeconds(30)
+        $ready = $false
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ($portForward.HasExited) {
+                throw (Get-DistributedProcessFailure `
+                    -Process $portForward -Label "kind API port-forward")
+            }
+            try {
+                $response = Invoke-WebRequest -Uri "$baseURL/readyz" -TimeoutSec 2
+                if ($response.StatusCode -eq 200) {
+                    $ready = $true
+                    break
+                }
+            }
+            catch {
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        if (-not $ready) {
+            throw "kind API port-forward did not reach readiness within 30 seconds."
+        }
+        $health = Invoke-WebRequest -Uri "$baseURL/healthz" -TimeoutSec 5
+        if ($health.StatusCode -ne 200) {
+            throw "kind API liveness returned HTTP $($health.StatusCode)."
+        }
+
+        $submitted = Submit-ObservabilityJob -BaseURL $baseURL -Type "demo.echo" `
+            -Payload @{ message = "kind-test" } -MaxAttempts 1 -TimeoutMilliseconds 30000
+        $jobState = Wait-ObservabilityJobStatus `
+            -BaseURL $baseURL -JobID $submitted.id -ExpectedStatus "succeeded"
+        $attempts = @(Get-ObservabilityJobAttempts -BaseURL $baseURL -JobID $submitted.id)
+        if ($jobState.result.message -ne "kind-test" -or
+            $attempts.Count -ne 1 -or $attempts[0].status -ne "succeeded" -or
+            [string]::IsNullOrWhiteSpace($attempts[0].worker_id)) {
+            throw "kind public API did not return the expected result and one succeeded worker attempt."
+        }
+        return [PSCustomObject]@{
+            JobID = [string]$submitted.id
+            WorkerID = [string]$attempts[0].worker_id
+        }
+    }
+    finally {
+        try {
+            if ($null -ne $portForward) {
+                Stop-DistributedProcess -Process $portForward
+            }
+        }
+        finally {
+            Remove-DistributedTestDirectory -Directory $temporaryDirectory
+        }
+        if ($null -ne $portForwardID -and
+            $null -ne (Get-Process -Id $portForwardID -ErrorAction SilentlyContinue)) {
+            throw "kind API port-forward process $portForwardID remains after cleanup."
+        }
+        if (Test-Path -LiteralPath $temporaryDirectory) {
+            throw "kind API port-forward temporary directory remains after cleanup."
+        }
+    }
+}
+
+function Write-KindDiagnostics {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    if (-not (Test-KindClusterExists -ClusterName $ClusterName)) {
+        return
+    }
+    Write-Warning "kind deployment failed; collecting cluster state before cleanup."
+    $namespace = @(
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "get", "namespace", "quarry", "--ignore-not-found", "--output", "name"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($namespace.Count -eq 0) {
+        Write-Warning "The failed kind cluster contains no Quarry namespace."
+        return
+    }
+    try {
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "get", "all,pvc", "--namespace", "quarry", "--output", "wide"
+        )
+    }
+    catch {
+        Write-Warning "Could not read kind cluster diagnostics: $_"
+    }
+    try {
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "describe", "pods", "--namespace", "quarry"
+        )
+    }
+    catch {
+        Write-Warning "Could not describe kind pods: $_"
+    }
+    try {
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "logs", "job/quarry-migration", "--namespace", "quarry"
+        )
+    }
+    catch {
+        Write-Warning "Could not read kind migration logs: $_"
+    }
+}
+
+function Invoke-KindDeploymentProof {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    $kindVersion = Assert-KindVersion
+    if (Test-KindClusterExists -ClusterName $ClusterName) {
+        throw "kind cluster '$ClusterName' already exists."
+    }
+
+    Invoke-Kind -Arguments @(
+        "create", "cluster",
+        "--name", $ClusterName,
+        "--image", $script:KindNodeImage,
+        "--wait", "180s"
+    ) | Out-Host
+    if (-not (Test-KindClusterExists -ClusterName $ClusterName)) {
+        throw "kind did not report newly created cluster '$ClusterName'."
+    }
+
+    $null = Build-AndLoadKindImages -ClusterName $ClusterName
+    $deployment = Deploy-KindStages -ClusterName $ClusterName
+    $apiProof = Invoke-KindPublicAPIProof -ClusterName $ClusterName
+    return [PSCustomObject]@{
+        KindVersion = $kindVersion
+        KubernetesVersion = $deployment.KubernetesVersion
+        JobID = $apiProof.JobID
+        WorkerID = $apiProof.WorkerID
+    }
+}
+
+function Write-KindResult {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Result,
+
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    Write-Host "kind deployment proof passed."
+    Write-Host "Cluster: $ClusterName"
+    Write-Host "kind: $($Result.KindVersion)"
+    Write-Host "Kubernetes: $($Result.KubernetesVersion)"
+    Write-Host "Ready replicas: API 1, dispatcher 2, worker 3"
+    Write-Host "Job ID: $($Result.JobID)"
+    Write-Host "Succeeded attempt worker: $($Result.WorkerID)"
+}
+
+function Start-KindDemonstration {
+    $clusterName = "quarry-demo"
+    if (Test-KindClusterExists -ClusterName $clusterName) {
+        throw "kind cluster '$clusterName' already exists. Run 'pwsh ./scripts/dev.ps1 kind-down' first."
+    }
+
+    try {
+        $result = Invoke-KindDeploymentProof -ClusterName $clusterName
+    }
+    catch {
+        try {
+            Write-KindDiagnostics -ClusterName $clusterName
+        }
+        finally {
+            Remove-KindCluster -ClusterName $clusterName
+        }
+        throw
+    }
+
+    Write-KindResult -Result $result -ClusterName $clusterName
+    Write-Host "The cluster remains running for inspection."
+    Write-Host "Forward the API with: kubectl --context kind-$clusterName --namespace quarry port-forward service/quarry-api 8080:8080"
+    Write-Host "Remove it with: pwsh ./scripts/dev.ps1 kind-down"
+}
+
+function Stop-KindDemonstration {
+    Remove-KindCluster -ClusterName "quarry-demo"
+    Write-Host "kind demonstration cluster removed."
+}
+
+function Test-KindDeployment {
+    $clusterName = "quarry-m7-$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
+    try {
+        $result = Invoke-KindDeploymentProof -ClusterName $clusterName
+        Write-KindResult -Result $result -ClusterName $clusterName
+    }
+    catch {
+        Write-KindDiagnostics -ClusterName $clusterName
+        throw
+    }
+    finally {
+        Remove-KindCluster -ClusterName $clusterName
+    }
+    Write-Host "Kind-test cleanup verified: port-forward, temporary files, cluster, node container, and kubectl context removed."
+}
+
 function Test-ObservabilityConfiguration {
     $prometheusConfig = (Resolve-Path -LiteralPath "deploy/observability/prometheus.yml").Path
     $composePrometheusConfig = (Resolve-Path -LiteralPath "deploy/observability/prometheus-compose.yml").Path
@@ -4898,6 +5460,8 @@ $script:GoExecutable = Find-GoExecutable
 $script:GoFmtExecutable = Find-GoFmtExecutable
 $script:DockerExecutable = $null
 $script:KubectlExecutable = $null
+$script:KindExecutable = $null
+$script:KindNodeImage = "kindest/node:v1.33.12@sha256:3f5c8443c620245e4d355cfe09e96a91ead32ceaa569d3f1ca9edf0cb2fe2ff4"
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 
 Push-Location $repositoryRoot
@@ -4920,6 +5484,7 @@ try {
             Test-GoBuild
             Test-ContainerImages
             Test-KubernetesConfiguration
+            Test-KindDeployment
             Test-ComposeWorkflow
             Test-ComposeRecoveryDemonstration
             Test-ObservabilityConfiguration
@@ -4997,6 +5562,15 @@ try {
         }
         "k8s-config-test" {
             Test-KubernetesConfiguration
+        }
+        "kind-up" {
+            Start-KindDemonstration
+        }
+        "kind-test" {
+            Test-KindDeployment
+        }
+        "kind-down" {
+            Stop-KindDemonstration
         }
         "smoke-test" {
             Test-ComposeSmoke
