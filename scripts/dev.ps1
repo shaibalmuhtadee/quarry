@@ -4,6 +4,7 @@ param(
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
         "generate", "generate-check", "format-check", "vet", "build", "image-test", "compose-test",
+        "compose-recovery", "compose-recovery-test", "compose-recovery-down",
         "smoke-test", "distributed-test", "recovery-test", "ack-loss-test", "failure-test", "semantics-test",
         "benchmark-smoke", "benchmark", "benchmark-verify",
         "observability-config-test", "observability-test", "observability-up", "observability-down"
@@ -4117,6 +4118,388 @@ function Test-ComposeWorkflow {
     Write-Host "Compose-test cleanup verified: containers, network, volume, and temporary directory removed."
 }
 
+function Get-ComposeRecoveryArguments {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComposeProject
+    )
+
+    return @(
+        "compose",
+        "--project-name", $ComposeProject,
+        "--file", "compose.yaml",
+        "--file", "deploy/compose.recovery.yaml"
+    )
+}
+
+function Test-ComposeProjectExists {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComposeProject
+    )
+
+    $containers = @(
+        Invoke-Docker -Arguments @(
+            "ps", "--all", "--quiet",
+            "--filter", "label=com.docker.compose.project=$ComposeProject"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $networks = @(
+        Invoke-Docker -Arguments @(
+            "network", "ls", "--quiet",
+            "--filter", "label=com.docker.compose.project=$ComposeProject"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $volumes = @(
+        Invoke-Docker -Arguments @(
+            "volume", "ls", "--quiet",
+            "--filter", "label=com.docker.compose.project=$ComposeProject"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    return $containers.Count -gt 0 -or $networks.Count -gt 0 -or $volumes.Count -gt 0
+}
+
+function Remove-ComposeRecoveryStack {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComposeProject
+    )
+
+    $composeArguments = @(Get-ComposeRecoveryArguments -ComposeProject $ComposeProject)
+    Invoke-Docker -Arguments ($composeArguments + @("down", "--volumes", "--remove-orphans"))
+    if (Test-ComposeProjectExists -ComposeProject $ComposeProject) {
+        throw "Compose recovery project '$ComposeProject' still has Docker resources after cleanup."
+    }
+}
+
+function Assert-ComposeRecoveryTarget {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ContainerID,
+
+        [Parameter(Mandatory)]
+        [string]$ComposeProject
+    )
+
+    $inspection = @(
+        Invoke-Docker -Arguments @(
+            "inspect", "--format",
+            "{{json .Config.Labels}}|{{.State.Running}}", $ContainerID
+        )
+    )[0].Trim()
+    $separator = $inspection.LastIndexOf('|')
+    if ($separator -le 0) {
+        throw "Compose recovery target '$ContainerID' returned invalid inspection data."
+    }
+    $labels = $inspection.Substring(0, $separator) | ConvertFrom-Json
+    $running = $inspection.Substring($separator + 1)
+    $projectLabel = $labels.PSObject.Properties['com.docker.compose.project'].Value
+    $serviceLabel = $labels.PSObject.Properties['com.docker.compose.service'].Value
+    if ($projectLabel -ne $ComposeProject -or $serviceLabel -ne "worker" -or $running -ne "true") {
+        throw "Refusing to kill container '$ContainerID': expected running $ComposeProject/worker labels."
+    }
+}
+
+function Wait-ComposeRecoveryAttemptOne {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $attempts = @(Get-ObservabilityJobAttempts -BaseURL $BaseURL -JobID $JobID)
+        if ($attempts.Count -eq 1 -and $attempts[0].status -eq "running" -and
+            -not [string]::IsNullOrWhiteSpace($attempts[0].worker_id)) {
+            return $attempts[0]
+        }
+        if ($attempts.Count -gt 1 -or
+            ($attempts.Count -eq 1 -and $attempts[0].status -ne "running")) {
+            throw "Compose recovery attempt 1 left running state before worker termination."
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    throw "Compose recovery attempt 1 did not start within 30 seconds."
+}
+
+function Wait-ComposeRecoverySucceeded {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    $lastStatus = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $job = Invoke-RestMethod -Uri "$BaseURL/v1/jobs/$JobID" -TimeoutSec 5
+        $lastStatus = $job.status
+        if ($lastStatus -eq "succeeded") {
+            return $job
+        }
+        if ($lastStatus -notin @("queued", "running", "retry_wait")) {
+            throw "Compose recovery job reached unexpected status '$lastStatus'."
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    throw "Compose recovery job did not succeed within 60 seconds. Last status: $lastStatus"
+}
+
+function Assert-ComposeRecoveryAttempts {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID,
+
+        [Parameter(Mandatory)]
+        [string]$FirstWorkerID,
+
+        [Parameter(Mandatory)]
+        [object]$JobState
+    )
+
+    if ($JobState.status -ne "succeeded" -or $JobState.attempt_count -ne 2 -or
+        $JobState.result.slept_ms -ne 6000) {
+        throw "Compose recovery job did not finish with two attempts and the expected result."
+    }
+    $attempts = @(Get-ObservabilityJobAttempts -BaseURL $BaseURL -JobID $JobID)
+    if ($attempts.Count -ne 2) {
+        throw "Compose recovery job has $($attempts.Count) attempts, expected two."
+    }
+    if ($attempts[0].attempt_no -ne 1 -or $attempts[0].worker_id -ne $FirstWorkerID -or
+        $attempts[0].status -ne "abandoned" -or $attempts[0].error_code -ne "lease_expired" -or
+        [string]::IsNullOrWhiteSpace($attempts[0].finished_at)) {
+        throw "Compose recovery attempt 1 is not abandoned with lease_expired on the killed worker."
+    }
+    if ($attempts[1].attempt_no -ne 2 -or $attempts[1].status -ne "succeeded" -or
+        $null -ne $attempts[1].error_code -or
+        [string]::IsNullOrWhiteSpace($attempts[1].finished_at)) {
+        throw "Compose recovery attempt 2 is not a finished success."
+    }
+    if ($attempts[1].worker_id -eq $FirstWorkerID -or
+        [string]::IsNullOrWhiteSpace($attempts[1].worker_id)) {
+        throw "Compose recovery attempt 2 did not use a distinct replacement worker identity."
+    }
+    return $attempts
+}
+
+function Wait-JaegerJobObservation {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID
+    )
+
+    $tags = [Uri]::EscapeDataString((@{ "job.id" = $JobID } | ConvertTo-Json -Compress))
+    $deadline = [DateTime]::UtcNow.AddSeconds(45)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $response = Invoke-RestMethod `
+                -Uri "$BaseURL/api/traces?service=quarry-api&tags=$tags&limit=20" `
+                -TimeoutSec 5
+            $traces = @($response.data)
+            if ($traces.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($traces[0].traceID)) {
+                return [string]$traces[0].traceID
+            }
+        }
+        catch {
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Jaeger did not return a trace for Compose recovery job $JobID within 45 seconds."
+}
+
+function Invoke-ComposeRecoveryFlow {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComposeProject
+    )
+
+    $composeArguments = @(Get-ComposeRecoveryArguments -ComposeProject $ComposeProject)
+    Invoke-Docker -Arguments ($composeArguments + @("config", "--quiet"))
+    Invoke-Docker -Arguments (
+        $composeArguments + @("up", "--build", "--detach", "--scale", "worker=1")
+    ) | Out-Null
+
+    $apiPort = Get-ConfiguredPort -EnvironmentVariable "QUARRY_API_PORT" -Default 8080
+    $grafanaPort = Get-ConfiguredPort -EnvironmentVariable "QUARRY_GRAFANA_PORT" -Default 3000
+    $jaegerPort = Get-ConfiguredPort -EnvironmentVariable "QUARRY_JAEGER_PORT" -Default 16686
+    $apiURL = "http://127.0.0.1:$apiPort"
+    $grafanaURL = "http://127.0.0.1:$grafanaPort"
+    $jaegerURL = "http://127.0.0.1:$jaegerPort"
+
+    Wait-ObservabilityEndpoint -Name "Compose recovery API" -URL "$apiURL/readyz"
+    Wait-ObservabilityEndpoint -Name "Compose recovery Grafana" -URL "$grafanaURL/api/health"
+    Wait-ObservabilityEndpoint -Name "Compose recovery Jaeger" -URL "$jaegerURL/api/services"
+
+    $workers = @(Get-ComposeServiceContainers `
+        -ComposeProject $ComposeProject -Service "worker" -Running)
+    if ($workers.Count -ne 1) {
+        throw "Compose recovery requires one running worker container, found $($workers.Count)."
+    }
+    $targetContainer = $workers[0].Trim()
+    Assert-ComposeRecoveryTarget -ContainerID $targetContainer -ComposeProject $ComposeProject
+
+    $submitted = Submit-ObservabilityJob -BaseURL $apiURL -Type "demo.sleep" `
+        -Payload @{ duration_ms = 6000 } -MaxAttempts 3 -TimeoutMilliseconds 30000
+    $attemptOne = Wait-ComposeRecoveryAttemptOne `
+        -BaseURL $apiURL -JobID $submitted.id
+    Start-Sleep -Milliseconds 500
+    Assert-ComposeRecoveryTarget -ContainerID $targetContainer -ComposeProject $ComposeProject
+    Invoke-Docker -Arguments @("kill", $targetContainer) | Out-Null
+    Invoke-Docker -Arguments (
+        $composeArguments + @("up", "--detach", "--no-deps", "worker")
+    ) | Out-Null
+
+    $jobState = Wait-ComposeRecoverySucceeded -BaseURL $apiURL -JobID $submitted.id
+    $attempts = @(Assert-ComposeRecoveryAttempts `
+        -BaseURL $apiURL `
+        -JobID $submitted.id `
+        -FirstWorkerID $attemptOne.worker_id `
+        -JobState $jobState)
+    $replacementWorkers = @(Get-ComposeServiceContainers `
+        -ComposeProject $ComposeProject -Service "worker" -Running)
+    if ($replacementWorkers.Count -ne 1) {
+        throw "Compose recovery has $($replacementWorkers.Count) replacement worker containers, expected one."
+    }
+    Assert-ComposeRecoveryTarget `
+        -ContainerID $replacementWorkers[0].Trim() -ComposeProject $ComposeProject
+
+    Wait-ObservabilityEndpoint -Name "Compose recovery Grafana after recovery" -URL "$grafanaURL/api/health"
+    Wait-ObservabilityEndpoint -Name "Compose recovery Jaeger after recovery" -URL "$jaegerURL/api/services"
+    Assert-GrafanaDashboard -BaseURL $grafanaURL
+    $traceID = Wait-JaegerJobObservation -BaseURL $jaegerURL -JobID $submitted.id
+
+    return [PSCustomObject]@{
+        JobID = [string]$submitted.id
+        AttemptOne = $attempts[0]
+        AttemptTwo = $attempts[1]
+        TraceID = $traceID
+        GrafanaURL = "$grafanaURL/d/quarry-overview/quarry"
+        JaegerURL = $jaegerURL
+    }
+}
+
+function Write-ComposeRecoveryResult {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Result,
+
+        [Parameter(Mandatory)]
+        [string]$ComposeProject
+    )
+
+    Write-Host "Compose recovery demonstration passed."
+    Write-Host "Job ID: $($Result.JobID)"
+    Write-Host "Attempt 1: worker $($Result.AttemptOne.worker_id), abandoned, lease_expired"
+    Write-Host "Attempt 2: worker $($Result.AttemptTwo.worker_id), succeeded"
+    Write-Host "Grafana: $($Result.GrafanaURL)"
+    Write-Host "Jaeger: $($Result.JaegerURL) (trace $($Result.TraceID))"
+    Write-Host "Compose project: $ComposeProject"
+}
+
+function Start-ComposeRecoveryDemonstration {
+    $composeProject = "quarry-recovery-demo"
+    if (Test-ComposeProjectExists -ComposeProject $composeProject) {
+        throw "Compose recovery project '$composeProject' already exists. Run 'pwsh ./scripts/dev.ps1 compose-recovery-down' first."
+    }
+
+    try {
+        $result = Invoke-ComposeRecoveryFlow -ComposeProject $composeProject
+    }
+    catch {
+        try {
+            Remove-ComposeRecoveryStack -ComposeProject $composeProject
+        }
+        catch {
+            Write-Warning "Failed to clean up unsuccessful Compose recovery demonstration: $_"
+        }
+        throw
+    }
+
+    Write-ComposeRecoveryResult -Result $result -ComposeProject $composeProject
+    Write-Host "The stack remains running for inspection."
+    Write-Host "Stop it with: pwsh ./scripts/dev.ps1 compose-recovery-down"
+}
+
+function Stop-ComposeRecoveryDemonstration {
+    $composeProject = "quarry-recovery-demo"
+    Remove-ComposeRecoveryStack -ComposeProject $composeProject
+    Write-Host "Compose recovery demonstration removed: containers, network, and volume deleted."
+}
+
+function Test-ComposeRecoveryDemonstration {
+    $testID = [Guid]::NewGuid().ToString("N")
+    $composeProject = "quarry-m7-recovery-$testID"
+    $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "quarry-compose-recovery-$testID"
+    $savedEnvironment = @{}
+    $environmentNames = @(
+        "QUARRY_POSTGRES_PORT",
+        "QUARRY_API_PORT",
+        "QUARRY_DISPATCHER_PORT",
+        "QUARRY_DISPATCHER_METRICS_PORT",
+        "QUARRY_PROMETHEUS_PORT",
+        "QUARRY_GRAFANA_PORT",
+        "QUARRY_OTEL_GRPC_PORT",
+        "QUARRY_OTEL_HTTP_PORT",
+        "QUARRY_OTEL_HEALTH_PORT",
+        "QUARRY_JAEGER_PORT"
+    )
+    foreach ($name in $environmentNames) {
+        $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
+    }
+
+    $ports = [System.Collections.Generic.List[int]]::new()
+    while ($ports.Count -lt 10) {
+        $candidate = Get-AvailableLoopbackPort
+        if (-not $ports.Contains($candidate)) {
+            $ports.Add($candidate)
+        }
+    }
+    for ($index = 0; $index -lt $environmentNames.Count; $index++) {
+        [Environment]::SetEnvironmentVariable($environmentNames[$index], [string]$ports[$index])
+    }
+
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        $result = Invoke-ComposeRecoveryFlow -ComposeProject $composeProject
+        Write-ComposeRecoveryResult -Result $result -ComposeProject $composeProject
+    }
+    finally {
+        try {
+            Remove-ComposeRecoveryStack -ComposeProject $composeProject
+        }
+        finally {
+            try {
+                Remove-DistributedTestDirectory -Directory $temporaryDirectory
+            }
+            finally {
+                foreach ($name in $environmentNames) {
+                    [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name])
+                }
+            }
+        }
+    }
+
+    Assert-ProcessTestCleanup `
+        -TestName "Compose-recovery-test" `
+        -ComposeProject $composeProject `
+        -TemporaryDirectory $temporaryDirectory
+    Write-Host "Compose-recovery-test cleanup verified: containers, network, volume, and temporary directory removed."
+}
+
 function Test-ComposeSmoke {
     $binaryExtension = if ($IsWindows) { ".exe" } else { "" }
     $apiBinary = Join-Path `
@@ -4394,6 +4777,7 @@ try {
             Test-GoBuild
             Test-ContainerImages
             Test-ComposeWorkflow
+            Test-ComposeRecoveryDemonstration
             Test-ObservabilityConfiguration
             Test-ObservabilityWorkflow
             Test-ComposeSmoke
@@ -4457,6 +4841,15 @@ try {
         }
         "compose-test" {
             Test-ComposeWorkflow
+        }
+        "compose-recovery" {
+            Start-ComposeRecoveryDemonstration
+        }
+        "compose-recovery-test" {
+            Test-ComposeRecoveryDemonstration
+        }
+        "compose-recovery-down" {
+            Stop-ComposeRecoveryDemonstration
         }
         "smoke-test" {
             Test-ComposeSmoke

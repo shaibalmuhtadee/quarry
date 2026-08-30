@@ -154,6 +154,25 @@ func TestCommittedConfigurationConnectsLocalStack(t *testing.T) {
 	if strings.Contains(string(compose), "container_name:") {
 		t.Error("Compose must not set fixed container names")
 	}
+
+	recoveryCompose, err := os.ReadFile(filepath.Join(repositoryRoot, "deploy", "compose.recovery.yaml"))
+	if err != nil {
+		t.Fatalf("read Compose recovery override: %v", err)
+	}
+	for _, required := range []string{
+		"QUARRY_LEASE_DURATION: 2s",
+		"QUARRY_REAPER_INTERVAL: 200ms",
+		`QUARRY_REAPER_BATCH_SIZE: "10"`,
+		"QUARRY_WORKER_LIVENESS_TIMEOUT: 2s",
+		"QUARRY_RETRY_BASE_DELAY: 100ms",
+		"QUARRY_RETRY_MAX_DELAY: 100ms",
+		`QUARRY_WORKER_CONCURRENCY: "1"`,
+		"QUARRY_HEARTBEAT_INTERVAL: 250ms",
+	} {
+		if !strings.Contains(string(recoveryCompose), required) {
+			t.Errorf("Compose recovery override is missing %q", required)
+		}
+	}
 }
 
 func readFile(t *testing.T, elements ...string) []byte {

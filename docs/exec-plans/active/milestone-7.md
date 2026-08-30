@@ -283,7 +283,7 @@ Make `docker compose up --build` start the complete local system with one explic
 
 ## Slice 3: Compose recovery demonstration
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -337,11 +337,21 @@ Provide a stranger-oriented command that demonstrates worker death, lease recove
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- The demonstration uses `deploy/compose.recovery.yaml` to limit the stack to one worker and shorten only its lease, liveness, reaper, retry, and heartbeat timings. The default Compose environment is unchanged.
+- The script validates the exact Compose project and `worker` service labels, plus running state, immediately before killing the target container. It starts the replacement with `docker compose up --no-deps worker`; relying on the restart policy was not deterministic when the first worker was killed before Docker's restart-success window, and `--no-deps` avoids rerunning the completed migration service.
+- Both commands share one HTTP-driven proof. `compose-recovery-test` uses a unique project and host ports and always removes its stack and temporary directory. `compose-recovery` uses the fixed `quarry-recovery-demo` project and leaves a successful stack running until `compose-recovery-down` removes it.
+- Job and attempt state comes only from the public HTTP API. Grafana and Jaeger confirm that the recovered execution remains observable; telemetry does not determine success.
+- No architecture or project-plan deviations were required. The demonstration proves at-least-once recovery and does not claim exactly-once execution or side-effect deduplication.
 
 ### Validation evidence
 
-None yet.
+- 2026-08-30: `docker compose -f compose.yaml -f deploy/compose.recovery.yaml config --quiet` and `go test -count=1 ./deploy/observability` passed, including assertions for every recovery-only timing and concurrency setting.
+- 2026-08-30: `pwsh ./scripts/dev.ps1 compose-recovery-test` passed twice directly. Job `ab92b143-edbb-47a3-a388-e2288ea7bfb3` moved from worker `f0e86f80-ae9b-43da-9edc-422412ffdc91` on abandoned attempt 1 to worker `8d28571a-821b-46d3-8931-c8c542e4d496` on successful attempt 2. Job `ed18ff94-7156-47ef-8eca-1c1066422737` moved from worker `5428853e-d59b-4b96-8b9d-a26846bd625c` to worker `cc386529-c526-4ad9-a223-85667041160c`. Both runs observed `lease_expired`, final `succeeded` state, a provisioned Grafana dashboard, a job trace in Jaeger, printed evidence and inspection URLs, and verified complete cleanup.
+- 2026-08-30: The first live recovery attempt was not counted as evidence because Docker's restart policy did not replace a worker killed before its restart-success window. The implementation now starts the replacement explicitly, and all three subsequent recovery runs passed.
+- 2026-08-30: `pwsh ./scripts/dev.ps1 failure-test` passed, including recovery, acknowledgement-loss, stale-completion rejection, and process and Docker cleanup.
+- 2026-08-30: `pwsh ./scripts/dev.ps1 check` passed. Its recovery run moved job `473bcd3c-1a4c-49ad-b45c-5ee48547f21d` from worker `9fb7dfc0-ea68-49d8-8ccc-eedb99198389` to worker `4b4d23b3-aa87-42b4-9a2f-b31bf7cb36d6`, found Jaeger trace `090f19c48de15900b25b8d8bb08551a4`, and cleaned the isolated stack. The canonical run also passed dependency and formatting checks, pinned tools, generation consistency, vet, all Go tests and builds, image and Compose validation, observability, API smoke, distributed execution, failure recovery, acknowledgement loss, stale-report handling, shutdown semantics, and race checks.
+- 2026-08-30: `git diff --check` passed after the tracking updates.
+- GitHub-hosted CI was not run and remains unverified.
 
 ## Slice 4: Kubernetes and Kustomize resources
 
