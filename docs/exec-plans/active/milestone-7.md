@@ -355,7 +355,7 @@ Provide a stranger-oriented command that demonstrates worker death, lease recove
 
 ## Slice 4: Kubernetes and Kustomize resources
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -406,11 +406,22 @@ Define the local Kubernetes deployment with plain resources and an ordered Kusto
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- The base and kind overlay each expose three explicit Kustomize entry points in deployment order: PostgreSQL, migration, and applications. Their parent Kustomizations render the complete configuration without removing the stage boundaries that Slice 5 will orchestrate.
+- The PostgreSQL stage owns the `quarry` Namespace, headless Service, one-replica StatefulSet, 1 GiB persistent volume claim, and local credential Secret. The base refers only to the Secret contract; the kind overlay generates the fixed-name Secret from plainly marked local-only values so later stages can consume it independently.
+- The application stage deploys one API replica behind an HTTP Service, two dispatcher replicas behind a gRPC Service, and three worker replicas without a Service. API probes use `/healthz` and `/readyz`; dispatcher probes use the native gRPC `quarry.dispatcher.liveness` and `quarry.dispatcher.readiness` services.
+- Every PostgreSQL, migration, API, dispatcher, and worker container has explicit CPU and memory requests and limits. Worker pods use a 20-second termination grace period with `QUARRY_WORKER_SHUTDOWN_TIMEOUT=10s`.
+- `kubectl apply --dry-run=client` still requires API discovery when schema validation is disabled. `k8s-config-test` therefore starts a temporary loopback discovery fixture that advertises only the built-in resource types used here, renders and client-dry-runs all eight Kustomize entry points, then removes the process and temporary directory. It does not create a cluster or perform Slice 5's runtime proof.
+- The Kubernetes configuration contains no observability stack, worker Service, Helm, autoscaling, operator, Terraform, cloud load balancer, or custom resource. The single PostgreSQL replica is marked as a local demonstration, not a highly available or production-ready database.
+- No architecture or project-plan deviations were required.
 
 ### Validation evidence
 
-None yet.
+- 2026-08-30: `kubectl version --client --output=yaml` reported kubectl v1.32.2 with Kustomize v5.5.0.
+- 2026-08-30: `go test -count=1 ./deploy/k8s/...` passed. Focused assertions covered stage order, kind image replacements and credentials, replica counts, API and dispatcher Services and probes, resource requests and limits, migration Job ownership, PostgreSQL persistence, worker shutdown grace, the absence of a worker Service, and excluded resource types.
+- 2026-08-30: `pwsh ./scripts/dev.ps1 k8s-config-test` passed. `kubectl kustomize` rendered the PostgreSQL, migration, application, and complete roots for both the base and kind overlay. `kubectl apply --dry-run=client --validate=false` accepted every rendered root through the temporary built-in-resource discovery fixture, and cleanup removed the fixture process, binary, rendered files, cache, and kubeconfig.
+- 2026-08-30: `pwsh ./scripts/dev.ps1 check` passed. The canonical run repeated the complete Kubernetes configuration proof and also passed dependency and formatting checks, pinned tools, generation consistency, vet, all Go tests and builds, image and Compose validation, observability, API smoke, distributed execution, failure recovery, acknowledgement loss, stale-report handling, shutdown semantics, and race checks.
+- 2026-08-30: `git diff --check` passed after the tracking updates.
+- A live Kubernetes deployment was not run because that is Slice 5 and `kind` is not installed. GitHub-hosted CI was not run and remains unverified.
 
 ## Slice 5: kind deployment proof
 

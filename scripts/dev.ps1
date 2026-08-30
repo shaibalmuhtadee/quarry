@@ -4,7 +4,7 @@ param(
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
         "generate", "generate-check", "format-check", "vet", "build", "image-test", "compose-test",
-        "compose-recovery", "compose-recovery-test", "compose-recovery-down",
+        "compose-recovery", "compose-recovery-test", "compose-recovery-down", "k8s-config-test",
         "smoke-test", "distributed-test", "recovery-test", "ack-loss-test", "failure-test", "semantics-test",
         "benchmark-smoke", "benchmark", "benchmark-verify",
         "observability-config-test", "observability-test", "observability-up", "observability-down"
@@ -75,6 +75,31 @@ function Invoke-Docker {
     & $script:DockerExecutable @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "docker $($Arguments -join ' ') failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Find-KubectlExecutable {
+    $kubectlCommand = Get-Command kubectl -ErrorAction SilentlyContinue
+    if ($null -ne $kubectlCommand) {
+        return $kubectlCommand.Source
+    }
+
+    throw "kubectl is not available. Install kubectl with built-in Kustomize support and add it to PATH."
+}
+
+function Invoke-Kubectl {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    if ($null -eq $script:KubectlExecutable) {
+        $script:KubectlExecutable = Find-KubectlExecutable
+    }
+
+    & $script:KubectlExecutable @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "kubectl $($Arguments -join ' ') failed with exit code $LASTEXITCODE."
     }
 }
 
@@ -3214,6 +3239,123 @@ function Wait-ObservabilityEndpoint {
     throw "$Name did not become ready at $URL within 60 seconds."
 }
 
+function Test-KubernetesConfiguration {
+    Invoke-Go -Arguments @("test", "-count=1", "./deploy/k8s")
+    if ($null -eq $script:KubectlExecutable) {
+        $script:KubectlExecutable = Find-KubectlExecutable
+    }
+
+    $testID = [Guid]::NewGuid().ToString("N")
+    $temporaryDirectory = Join-Path `
+        ([System.IO.Path]::GetTempPath()) `
+        "quarry-k8s-config-$testID"
+    $binaryExtension = if ($IsWindows) { ".exe" } else { "" }
+    $discoveryBinary = Join-Path $temporaryDirectory "quarry-k8s-discovery$binaryExtension"
+    $addressFile = Join-Path $temporaryDirectory "discovery-address"
+    $kubeconfigPath = Join-Path $temporaryDirectory "kubeconfig.yaml"
+    $cacheDirectory = Join-Path $temporaryDirectory "kubectl-cache"
+    $discoveryProcess = $null
+    $kustomizations = @(
+        "deploy/k8s/base/postgres",
+        "deploy/k8s/base/migration",
+        "deploy/k8s/base/applications",
+        "deploy/k8s/base",
+        "deploy/k8s/overlays/kind/postgres",
+        "deploy/k8s/overlays/kind/migration",
+        "deploy/k8s/overlays/kind/applications",
+        "deploy/k8s/overlays/kind"
+    )
+
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        New-Item -ItemType Directory -Path $cacheDirectory | Out-Null
+        Invoke-Go -Arguments @(
+            "build", "-o", $discoveryBinary, "./deploy/k8s/testdiscovery"
+        )
+        $discoveryProcess = Start-DistributedProcess `
+            -Binary $discoveryBinary `
+            -Environment @{} `
+            -Arguments @("-address-file", $addressFile)
+
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        while ([DateTime]::UtcNow -lt $deadline -and -not (Test-Path -LiteralPath $addressFile)) {
+            if ($discoveryProcess.HasExited) {
+                throw "Kubernetes discovery fixture exited with code $($discoveryProcess.ExitCode)."
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not (Test-Path -LiteralPath $addressFile)) {
+            throw "Kubernetes discovery fixture did not publish its address within 10 seconds."
+        }
+        $discoveryURL = (Get-Content -LiteralPath $addressFile -Raw).Trim()
+        if ([string]::IsNullOrWhiteSpace($discoveryURL)) {
+            throw "Kubernetes discovery fixture published an empty address."
+        }
+        $kubeconfig = @"
+apiVersion: v1
+kind: Config
+clusters:
+  - name: quarry-config-test
+    cluster:
+      server: $discoveryURL
+contexts:
+  - name: quarry-config-test
+    context:
+      cluster: quarry-config-test
+      user: quarry-config-test
+current-context: quarry-config-test
+users:
+  - name: quarry-config-test
+    user: {}
+"@
+        [System.IO.File]::WriteAllText(
+            $kubeconfigPath,
+            ($kubeconfig + [Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+
+        foreach ($kustomization in $kustomizations) {
+            $rendered = @(& $script:KubectlExecutable kustomize $kustomization)
+            if ($LASTEXITCODE -ne 0) {
+                throw "kubectl kustomize $kustomization failed with exit code $LASTEXITCODE."
+            }
+            if ($rendered.Count -eq 0) {
+                throw "kubectl kustomize $kustomization returned no resources."
+            }
+
+            $renderedPath = Join-Path `
+                $temporaryDirectory `
+                "$($kustomization.Replace('/', '-'))-rendered.yaml"
+            [System.IO.File]::WriteAllText(
+                $renderedPath,
+                (($rendered -join [Environment]::NewLine) + [Environment]::NewLine),
+                [System.Text.UTF8Encoding]::new($false)
+            )
+            Invoke-Kubectl -Arguments @(
+                "--kubeconfig", $kubeconfigPath,
+                "--cache-dir", $cacheDirectory,
+                "apply", "--dry-run=client", "--validate=false",
+                "--filename", $renderedPath
+            ) | Out-Null
+        }
+    }
+    finally {
+        try {
+            if ($null -ne $discoveryProcess) {
+                Stop-DistributedProcess -Process $discoveryProcess
+            }
+        }
+        finally {
+            Remove-DistributedTestDirectory -Directory $temporaryDirectory
+        }
+    }
+
+    if (Test-Path -LiteralPath $temporaryDirectory) {
+        throw "Kubernetes configuration test temporary directory remains after cleanup."
+    }
+    Write-Host "K8s-config-test passed: base and kind stages rendered, client dry-runs passed, focused assertions passed, and temporary files were removed."
+}
+
 function Test-ObservabilityConfiguration {
     $prometheusConfig = (Resolve-Path -LiteralPath "deploy/observability/prometheus.yml").Path
     $composePrometheusConfig = (Resolve-Path -LiteralPath "deploy/observability/prometheus-compose.yml").Path
@@ -4755,6 +4897,7 @@ function Test-ContainerImages {
 $script:GoExecutable = Find-GoExecutable
 $script:GoFmtExecutable = Find-GoFmtExecutable
 $script:DockerExecutable = $null
+$script:KubectlExecutable = $null
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 
 Push-Location $repositoryRoot
@@ -4776,6 +4919,7 @@ try {
             Test-GoPackages
             Test-GoBuild
             Test-ContainerImages
+            Test-KubernetesConfiguration
             Test-ComposeWorkflow
             Test-ComposeRecoveryDemonstration
             Test-ObservabilityConfiguration
@@ -4850,6 +4994,9 @@ try {
         }
         "compose-recovery-down" {
             Stop-ComposeRecoveryDemonstration
+        }
+        "k8s-config-test" {
+            Test-KubernetesConfiguration
         }
         "smoke-test" {
             Test-ComposeSmoke
