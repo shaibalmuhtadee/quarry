@@ -649,7 +649,7 @@ Make pull-request CI validate the completed Go, Docker, Compose, and Kustomize a
 
 ## Slice 8: architecture, guarantees, and portfolio entry point
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -712,11 +712,23 @@ Make the finished repository understandable and runnable without requiring the p
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- `README.md` is the short runnable entry point. Architecture, guarantees, and benchmark detail remain in their single-purpose documents instead of being copied into the README.
+- `scripts/dev.ps1 help` lists the primary demonstrations, and `docs-test` verifies inline local Markdown links without requiring Go. The canonical `check` command runs the same link check first.
+- `docs/benchmarks.md` did not change because its committed campaign links and reproduction commands remained correct.
+- The clean Compose walkthrough and canonical check used isolated Compose project names because the default `quarry_postgres-data` volume contained pre-existing development data. The demonstrations removed their isolated resources and preserved that volume.
+- The implementation matched the planned architecture and guarantee boundaries. No architecture or project-plan deviation was required.
 
 ### Validation evidence
 
-None yet.
+- On 2026-08-31, `pwsh -NoProfile ./scripts/dev.ps1 help` printed the primary Compose recovery, kind, benchmark-verification, documentation, and canonical-check commands. `pwsh -NoProfile ./scripts/dev.ps1 docs-test` passed with 9 local links across 16 Markdown files.
+- The README Compose walkthrough passed from a fresh `quarry-m7-docs` project and volume. Job `ae7b792d-42f3-455f-a95d-6fd07af052f1` succeeded in one attempt with the documented result. Grafana rendered queue depth 0 and two active workers; a Jaeger search by that exact job ID returned one trace with nine spans across three services. The isolated containers, network, and volume were removed.
+- `pwsh -NoProfile ./scripts/dev.ps1 compose-recovery` passed for job `70422e8d-e361-4f38-a02a-ef87f6c503c7`: attempt 1 was abandoned with `lease_expired`, and attempt 2 succeeded under a different worker. Grafana showed the abandoned and succeeded outcomes, and Jaeger trace `a512334098ee261ed465cdf1e26bd72c` showed both execution paths. `compose-recovery-down` removed the demonstration resources.
+- `pwsh -NoProfile ./scripts/dev.ps1 kind-up` passed with kind v0.32.0 and Kubernetes v1.33.12. The documented `kubectl` command showed one API, two dispatcher, and three worker pods Ready, and job `966eb720-baf0-4314-a9da-f696d08e3d53` succeeded. `kind-down` removed the cluster.
+- A separate `kind-scaling-test` passed at 1, 4, and 8 Ready workers, restored the committed three-worker default, and removed the cluster and temporary output. Its 31.88, 80.25, and 89.25 jobs/s observations remain explicitly non-publishable deployment evidence.
+- Guarantee statements were compared with the API cancellation path, dispatcher claim/report/reaper transitions, worker executor and shutdown behavior, PostgreSQL integration tests, and the recovery, acknowledgement-loss, and semantics process tests. Incorrect drafts about expired cancellation and universal forced handler cancellation were corrected before validation.
+- `pwsh -NoProfile ./scripts/dev.ps1 benchmark-verify` passed, including deterministic fixtures and committed campaign `quarry-20260829T002429Z`.
+- With `COMPOSE_PROJECT_NAME=quarry-m7-slice8-check` to isolate the retained development volume, `pwsh -NoProfile ./scripts/dev.ps1 check` passed. This covered documentation links, formatting and generation, pinned tools, static analysis, Go tests and builds, four images, Compose, Kustomize, kind scaling, observability, distributed execution, worker recovery, acknowledgement loss, shutdown semantics, PostgreSQL integration, and race-sensitive packages.
+- Final cleanup inspection found no Slice 8 containers, networks, kind clusters, or kind contexts. The one outer isolated-check volume was removed explicitly; the pre-existing `quarry_postgres-data` development volume remained. `git diff --check` passed.
 
 ## Milestone audit
 

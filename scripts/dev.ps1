@@ -1,6 +1,6 @@
 param(
     [ValidateSet(
-        "check", "test", "tools", "staticcheck", "workflow-check",
+        "help", "docs-test", "check", "test", "tools", "staticcheck", "workflow-check",
         "ci-go", "ci-race", "ci-packaging",
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
@@ -137,6 +137,63 @@ function Test-Tools {
     Invoke-Go -Arguments @("tool", "goose", "-version")
     Invoke-Go -Arguments @("tool", "sqlc", "version")
     Invoke-Go -Arguments @("tool", "staticcheck", "-version")
+}
+
+function Write-CommandHelp {
+    Write-Host @"
+Usage: pwsh ./scripts/dev.ps1 <command>
+
+Primary demonstrations:
+  compose-recovery       Start the full Compose stack, kill one validated worker, prove lease recovery, and leave the stack running.
+  compose-recovery-down  Remove the Compose recovery stack and its database volume.
+  kind-up                Build, deploy, and prove Quarry in a persistent local kind cluster.
+  kind-down              Remove the persistent kind demonstration cluster.
+  kind-scaling-test      Measure Workload B at 1, 4, and 8 workers in an isolated kind cluster, then remove it.
+  benchmark-verify       Regenerate and verify the committed benchmark summaries.
+
+Validation:
+  docs-test              Verify every local Markdown link in README.md and docs/.
+  check                  Run the complete local validation suite. This removes Quarry test containers, volumes, and kind clusters.
+
+See README.md for the Compose walkthrough, recovery proof, observability URLs, kind quickstart, and benchmark evidence.
+"@
+}
+
+function Test-DocumentationLinks {
+    $markdownFiles = @(
+        Get-ChildItem -LiteralPath "." -File -Filter "*.md"
+        Get-ChildItem -LiteralPath "docs" -File -Filter "*.md" -Recurse
+    ) | Sort-Object -Property FullName
+    $linkPattern = [regex]'(?<!!)\[[^\]]+\]\((?<destination>[^)]+)\)'
+    $localLinkCount = 0
+
+    foreach ($file in $markdownFiles) {
+        $content = Get-Content -Raw -LiteralPath $file.FullName
+        foreach ($linkMatch in $linkPattern.Matches($content)) {
+            $destination = $linkMatch.Groups["destination"].Value.Trim()
+            if ($destination.StartsWith("<") -and $destination.EndsWith(">")) {
+                $destination = $destination.Substring(1, $destination.Length - 2)
+            }
+            if ($destination -eq "" -or
+                $destination.StartsWith("#") -or
+                $destination -match '^[a-z][a-z0-9+.-]*:') {
+                continue
+            }
+
+            $pathPart = ($destination -split "#", 2)[0]
+            $decodedPath = [Uri]::UnescapeDataString($pathPart)
+            $target = Join-Path $file.DirectoryName $decodedPath
+            $localLinkCount++
+            if (-not (Test-Path -LiteralPath $target)) {
+                $prefix = $content.Substring(0, $linkMatch.Index)
+                $lineNumber = 1 + [regex]::Matches($prefix, "`r?`n").Count
+                $relativeSource = [IO.Path]::GetRelativePath($repositoryRoot, $file.FullName)
+                throw "Broken local Markdown link in ${relativeSource}:$lineNumber -> $destination"
+            }
+        }
+    }
+
+    Write-Host "Documentation link check passed: $localLinkCount local links across $($markdownFiles.Count) Markdown files."
 }
 
 function Test-GoPackages {
@@ -5824,8 +5881,8 @@ function Test-ContainerImageBuilds {
     Write-Host "Container image build check passed: api, dispatcher, worker, and migration targets built."
 }
 
-$script:GoExecutable = Find-GoExecutable
-$script:GoFmtExecutable = Find-GoFmtExecutable
+$script:GoExecutable = $null
+$script:GoFmtExecutable = $null
 $script:DockerExecutable = $null
 $script:KubectlExecutable = $null
 $script:KindExecutable = $null
@@ -5834,7 +5891,18 @@ $repositoryRoot = Split-Path -Parent $PSScriptRoot
 
 Push-Location $repositoryRoot
 try {
+    if ($Command -notin @("help", "docs-test")) {
+        $script:GoExecutable = Find-GoExecutable
+        $script:GoFmtExecutable = Find-GoFmtExecutable
+    }
+
     switch ($Command) {
+        "help" {
+            Write-CommandHelp
+        }
+        "docs-test" {
+            Test-DocumentationLinks
+        }
         "tools" {
             Test-Tools
         }
@@ -5868,6 +5936,7 @@ try {
             Test-GoPackages
         }
         "check" {
+            Test-DocumentationLinks
             Invoke-Go -Arguments @("mod", "tidy", "-diff")
             Test-GoFormatting
             Test-Tools
