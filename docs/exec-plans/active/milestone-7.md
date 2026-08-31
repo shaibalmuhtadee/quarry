@@ -571,7 +571,7 @@ Measure manual worker scaling at 1, 4, and 8 kind replicas without changing the 
 
 ## Slice 7: final CI
 
-Status: in progress
+Status: complete
 
 ### Goal
 
@@ -631,11 +631,21 @@ Make pull-request CI validate the completed Go, Docker, Compose, and Kustomize a
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- Pull-request and push CI now uses three jobs named `go-validation`, `race`, and `packaging`. The jobs call `ci-go`, `ci-race`, and `ci-packaging` in `scripts/dev.ps1` so contributors can rerun each hosted check locally.
+- Staticcheck 2026.2.1 (`v0.8.1`) and actionlint `v1.7.12` are pinned through the Go tool mechanism. Staticcheck 2026.2.1 supports the repository's Go 1.27 language version. actionlint provides the required local GitHub Actions syntax check.
+- The kubectl setup action installs Kubernetes `v1.33.12`, which matches the kind node version used by the repository.
+- Staticcheck adoption required behavior-preserving cleanup of deprecated OpenTelemetry and Prometheus APIs, two error strings, and one direct struct conversion. No domain behavior or architecture changed.
+- No extended workflow was added. The long failure, complete kind, and benchmark commands remain explicit local checks because a second workflow would duplicate existing commands without adding evidence required by this slice.
 
 ### Validation evidence
 
-None yet.
+- `pwsh -NoProfile ./scripts/dev.ps1 workflow-check`: passed locally; actionlint accepted `.github/workflows/ci.yml`.
+- `pwsh -NoProfile ./scripts/dev.ps1 ci-go`: passed locally. It verified `go mod tidy -diff`, formatting, pinned tools, sqlc and Protocol Buffer generation, actionlint, Staticcheck, `go vet`, unit and PostgreSQL integration tests, and all Go builds.
+- `pwsh -NoProfile ./scripts/dev.ps1 ci-packaging`: passed locally. All four named Docker targets built, `docker compose config --quiet` passed, and every base and kind Kustomize stage rendered and passed client dry-run validation.
+- Linux `go test -count=1 -race ./...`: passed locally in the pinned `golang:1.27.0-bookworm` image with PostgreSQL testcontainers connected through Docker.
+- `pwsh -NoProfile ./scripts/dev.ps1 check`: passed locally. The canonical check also completed the image runtime, kind scaling, full Compose, Compose recovery, observability, distributed-process, acknowledgement-loss, failure, and shutdown suites with cleanup verified.
+- `git diff --check`: passed.
+- GitHub Actions run [33356794797](https://github.com/shaibalmuhtadee/quarry/actions/runs/33356794797) passed on 2026-08-31 for commit `e8a067fe58c4b7747dcb7b11fd4bcc724a3ba6df`. The hosted `go-validation`, `race`, and `packaging` jobs all succeeded.
 
 ## Slice 8: architecture, guarantees, and portfolio entry point
 
