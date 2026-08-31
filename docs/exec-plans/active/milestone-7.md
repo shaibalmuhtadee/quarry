@@ -571,7 +571,7 @@ Measure manual worker scaling at 1, 4, and 8 kind replicas without changing the 
 
 ## Slice 7: final CI
 
-Status: not started
+Status: in progress
 
 ### Goal
 

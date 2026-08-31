@@ -1,6 +1,7 @@
 param(
     [ValidateSet(
-        "check", "test", "tools",
+        "check", "test", "tools", "staticcheck", "workflow-check",
+        "ci-go", "ci-race", "ci-packaging",
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
         "generate", "generate-check", "format-check", "vet", "build", "image-test", "compose-test",
@@ -131,9 +132,11 @@ function Invoke-Kind {
 
 function Test-Tools {
     Invoke-Go -Arguments @("version")
+    Invoke-Go -Arguments @("tool", "actionlint", "-version")
     Invoke-Go -Arguments @("tool", "buf", "--version")
     Invoke-Go -Arguments @("tool", "goose", "-version")
     Invoke-Go -Arguments @("tool", "sqlc", "version")
+    Invoke-Go -Arguments @("tool", "staticcheck", "-version")
 }
 
 function Test-GoPackages {
@@ -174,6 +177,18 @@ function Test-GoVet {
 
 function Test-GoBuild {
     Invoke-Go -Arguments @("build", "./...")
+}
+
+function Test-Staticcheck {
+    Invoke-Go -Arguments @("tool", "staticcheck", "./...")
+}
+
+function Test-GitHubWorkflows {
+    Invoke-Go -Arguments @("tool", "actionlint")
+}
+
+function Test-GoRace {
+    Invoke-Go -Arguments @("test", "-count=1", "-race", "./...")
 }
 
 function Get-PostgresConnectionString {
@@ -5792,6 +5807,23 @@ function Test-ContainerImages {
     Write-Host "Image-test cleanup verified: containers and network removed."
 }
 
+function Test-ContainerImageBuilds {
+    $images = @(
+        @{ Target = "api"; Tag = "quarry-api:ci" },
+        @{ Target = "dispatcher"; Tag = "quarry-dispatcher:ci" },
+        @{ Target = "worker"; Tag = "quarry-worker:ci" },
+        @{ Target = "migration"; Tag = "quarry-migration:ci" }
+    )
+
+    foreach ($image in $images) {
+        Invoke-Docker -Arguments @(
+            "build", "--target", $image.Target, "--tag", $image.Tag, "."
+        )
+    }
+
+    Write-Host "Container image build check passed: api, dispatcher, worker, and migration targets built."
+}
+
 $script:GoExecutable = Find-GoExecutable
 $script:GoFmtExecutable = Find-GoFmtExecutable
 $script:DockerExecutable = $null
@@ -5806,6 +5838,32 @@ try {
         "tools" {
             Test-Tools
         }
+        "staticcheck" {
+            Test-Staticcheck
+        }
+        "workflow-check" {
+            Test-GitHubWorkflows
+        }
+        "ci-go" {
+            Invoke-Go -Arguments @("mod", "tidy", "-diff")
+            Test-GoFormatting
+            Test-Tools
+            Invoke-Sqlc -SqlcCommand "diff"
+            Test-BufGeneratedCode
+            Test-GitHubWorkflows
+            Test-Staticcheck
+            Test-GoVet
+            Test-GoPackages
+            Test-GoBuild
+        }
+        "ci-race" {
+            Test-GoRace
+        }
+        "ci-packaging" {
+            Test-ContainerImageBuilds
+            Invoke-Docker -Arguments @("compose", "config", "--quiet")
+            Test-KubernetesConfiguration
+        }
         "test" {
             Test-GoPackages
         }
@@ -5815,6 +5873,8 @@ try {
             Test-Tools
             Invoke-Sqlc -SqlcCommand "diff"
             Test-BufGeneratedCode
+            Test-GitHubWorkflows
+            Test-Staticcheck
             Test-GoVet
             Test-GoPackages
             Test-GoBuild

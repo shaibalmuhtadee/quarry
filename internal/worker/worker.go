@@ -15,6 +15,7 @@ import (
 	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -145,7 +146,7 @@ func New(dispatcher Dispatcher, handlers map[string]Handler, cfg Config) (*Worke
 	}
 	tracer := cfg.Tracer
 	if tracer == nil {
-		tracer = trace.NewNoopTracerProvider().Tracer("quarry/worker")
+		tracer = noop.NewTracerProvider().Tracer("quarry/worker")
 	}
 
 	handlerCopy := make(map[string]Handler, len(handlers))

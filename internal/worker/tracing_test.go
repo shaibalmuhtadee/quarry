@@ -84,7 +84,7 @@ func TestWorkerContinuesAcquiredTraceThroughHandlerAndReport(t *testing.T) {
 	}
 	workerAttributes := map[string]string{}
 	for _, value := range workerSpan.Attributes() {
-		workerAttributes[string(value.Key)] = value.Value.Emit()
+		workerAttributes[string(value.Key)] = value.Value.String()
 	}
 	for key, want := range map[string]string{
 		"job.id": job.ID.String(), "job.type": job.Type.String(), "job.attempt": "1",

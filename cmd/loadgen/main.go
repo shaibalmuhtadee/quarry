@@ -191,7 +191,7 @@ func parseConfig(args []string, stderr io.Writer, now time.Time) (config, error)
 			return config{}, errors.New("-recovery-event is required for Workload C")
 		}
 		if cfg.maxAttempts < 2 {
-			return config{}, errors.New("Workload C requires at least two attempts")
+			return config{}, errors.New("workload C requires at least two attempts")
 		}
 		parent, statErr := os.Stat(filepath.Dir(cfg.recoveryEventPath))
 		if statErr != nil || !parent.IsDir() {

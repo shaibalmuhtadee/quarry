@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  validate:
+  go-validation:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -19,6 +19,40 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-      - name: Validate repository
+      - name: Validate Go and generated code
         shell: pwsh
-        run: ./scripts/dev.ps1 check
+        run: ./scripts/dev.ps1 ci-go
+
+  race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Run race detector
+        shell: pwsh
+        run: ./scripts/dev.ps1 ci-race
+
+  packaging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.33.12
+      - name: Validate images and deployment configuration
+        shell: pwsh
+        run: ./scripts/dev.ps1 ci-packaging

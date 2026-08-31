@@ -194,14 +194,14 @@ func (config BenchmarkRunConfig) validate() error {
 	}
 	if config.Workload == WorkloadRecovery {
 		if config.WorkerProcesses != 2 {
-			return errors.New("Workload C requires two worker processes")
+			return errors.New("workload C requires two worker processes")
 		}
 		if config.MaxAttempts < 2 {
-			return errors.New("Workload C requires at least two attempts")
+			return errors.New("workload C requires at least two attempts")
 		}
 	} else if config.WorkerProcesses != 1 && config.WorkerProcesses != 2 &&
 		config.WorkerProcesses != 4 && config.WorkerProcesses != 8 {
-		return errors.New("Workloads A and B require 1, 2, 4, or 8 worker processes")
+		return errors.New("workloads A and B require 1, 2, 4, or 8 worker processes")
 	}
 	if config.WorkerConcurrency != 8 {
 		return errors.New("worker concurrency must be 8")
