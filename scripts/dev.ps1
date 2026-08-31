@@ -5,7 +5,7 @@ param(
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
         "generate", "generate-check", "format-check", "vet", "build", "image-test", "compose-test",
         "compose-recovery", "compose-recovery-test", "compose-recovery-down", "k8s-config-test",
-        "kind-up", "kind-test", "kind-down",
+        "kind-up", "kind-test", "kind-scaling-test", "kind-down",
         "smoke-test", "distributed-test", "recovery-test", "ack-loss-test", "failure-test", "semantics-test",
         "benchmark-smoke", "benchmark", "benchmark-verify",
         "observability-config-test", "observability-test", "observability-up", "observability-down"
@@ -3547,9 +3547,16 @@ function Assert-KindPodsReady {
             "get", "pods", "--namespace", "quarry",
             "--selector", "app.kubernetes.io/component=$Component"
         )
-    $pods = @($response.items)
+    $pods = @(
+        $response.items | Where-Object {
+            $deletionTimestamp = $_.metadata.PSObject.Properties["deletionTimestamp"]
+            ($null -eq $deletionTimestamp -or
+                [string]::IsNullOrWhiteSpace([string]$deletionTimestamp.Value)) -and
+                $_.status.phase -notin @("Succeeded", "Failed")
+        }
+    )
     if ($pods.Count -ne $ExpectedCount) {
-        throw "kind component '$Component' has $($pods.Count) pods, expected $ExpectedCount."
+        throw "kind component '$Component' has $($pods.Count) active pods, expected $ExpectedCount."
     }
     foreach ($pod in $pods) {
         $readyCondition = @($pod.status.conditions | Where-Object { $_.type -eq "Ready" })
@@ -3685,7 +3692,7 @@ function Deploy-KindStages {
     }
 }
 
-function Invoke-KindPublicAPIProof {
+function Start-KindAPIPortForward {
     param(
         [Parameter(Mandatory)]
         [string]$ClusterName
@@ -3698,7 +3705,6 @@ function Invoke-KindPublicAPIProof {
     $standardOutput = Join-Path $temporaryDirectory "port-forward.stdout.log"
     $standardError = Join-Path $temporaryDirectory "port-forward.stderr.log"
     $portForward = $null
-    $portForwardID = $null
     $port = Get-AvailableLoopbackPort
     $baseURL = "http://127.0.0.1:$port"
 
@@ -3715,7 +3721,6 @@ function Invoke-KindPublicAPIProof {
             ) `
             -StandardOutputPath $standardOutput `
             -StandardErrorPath $standardError
-        $portForwardID = $portForward.Id
 
         $deadline = [DateTime]::UtcNow.AddSeconds(30)
         $ready = $false
@@ -3743,6 +3748,57 @@ function Invoke-KindPublicAPIProof {
             throw "kind API liveness returned HTTP $($health.StatusCode)."
         }
 
+        return [PSCustomObject]@{
+            Process = $portForward
+            ProcessID = $portForward.Id
+            TemporaryDirectory = $temporaryDirectory
+            BaseURL = $baseURL
+        }
+    }
+    catch {
+        try {
+            if ($null -ne $portForward) {
+                Stop-DistributedProcess -Process $portForward
+            }
+        }
+        finally {
+            Remove-DistributedTestDirectory -Directory $temporaryDirectory
+        }
+        throw
+    }
+}
+
+function Stop-KindAPIPortForward {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Forward
+    )
+
+    try {
+        Stop-DistributedProcess -Process $Forward.Process
+    }
+    finally {
+        Remove-DistributedTestDirectory -Directory $Forward.TemporaryDirectory
+    }
+    if ($null -ne (Get-Process -Id $Forward.ProcessID -ErrorAction SilentlyContinue)) {
+        throw "kind API port-forward process $($Forward.ProcessID) remains after cleanup."
+    }
+    if (Test-Path -LiteralPath $Forward.TemporaryDirectory) {
+        throw "kind API port-forward temporary directory remains after cleanup."
+    }
+}
+
+function Invoke-KindPublicAPIProof {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    $forward = $null
+    try {
+        $forward = Start-KindAPIPortForward -ClusterName $ClusterName
+        $baseURL = $forward.BaseURL
+
         $submitted = Submit-ObservabilityJob -BaseURL $baseURL -Type "demo.echo" `
             -Payload @{ message = "kind-test" } -MaxAttempts 1 -TimeoutMilliseconds 30000
         $jobState = Wait-ObservabilityJobStatus `
@@ -3759,20 +3815,8 @@ function Invoke-KindPublicAPIProof {
         }
     }
     finally {
-        try {
-            if ($null -ne $portForward) {
-                Stop-DistributedProcess -Process $portForward
-            }
-        }
-        finally {
-            Remove-DistributedTestDirectory -Directory $temporaryDirectory
-        }
-        if ($null -ne $portForwardID -and
-            $null -ne (Get-Process -Id $portForwardID -ErrorAction SilentlyContinue)) {
-            throw "kind API port-forward process $portForwardID remains after cleanup."
-        }
-        if (Test-Path -LiteralPath $temporaryDirectory) {
-            throw "kind API port-forward temporary directory remains after cleanup."
+        if ($null -ne $forward) {
+            Stop-KindAPIPortForward -Forward $forward
         }
     }
 }
@@ -3786,7 +3830,7 @@ function Write-KindDiagnostics {
     if (-not (Test-KindClusterExists -ClusterName $ClusterName)) {
         return
     }
-    Write-Warning "kind deployment failed; collecting cluster state before cleanup."
+    Write-Warning "kind validation failed; collecting cluster state before cleanup."
     $namespace = @(
         Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
             "get", "namespace", "quarry", "--ignore-not-found", "--output", "name"
@@ -3916,6 +3960,298 @@ function Test-KindDeployment {
         Remove-KindCluster -ClusterName $clusterName
     }
     Write-Host "Kind-test cleanup verified: port-forward, temporary files, cluster, node container, and kubectl context removed."
+}
+
+function Assert-KindWorkerState {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName,
+
+        [Parameter(Mandatory)]
+        [int]$ExpectedReplicas,
+
+        [Parameter(Mandatory)]
+        [int]$ExpectedConcurrency
+    )
+
+    $deployment = Assert-KindDeploymentReady `
+        -ClusterName $ClusterName `
+        -Deployment "quarry-worker" `
+        -ExpectedReplicas $ExpectedReplicas
+    $null = @(Assert-KindPodsReady `
+        -ClusterName $ClusterName `
+        -Component "worker" `
+        -ExpectedCount $ExpectedReplicas)
+
+    $workerContainers = @(
+        $deployment.spec.template.spec.containers |
+            Where-Object { $_.name -eq "worker" }
+    )
+    if ($workerContainers.Count -ne 1) {
+        throw "kind worker Deployment does not contain exactly one worker container."
+    }
+    $concurrencyVariables = @(
+        $workerContainers[0].env |
+            Where-Object { $_.name -eq "QUARRY_WORKER_CONCURRENCY" }
+    )
+    if ($concurrencyVariables.Count -ne 1 -or
+        [string]$concurrencyVariables[0].value -ne [string]$ExpectedConcurrency) {
+        throw "kind worker Deployment concurrency is not $ExpectedConcurrency."
+    }
+}
+
+function Invoke-KindScalingConfiguration {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName,
+
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$LoadgenBinary,
+
+        [Parameter(Mandatory)]
+        [string]$OutputDirectory,
+
+        [Parameter(Mandatory)]
+        [string]$RunPrefix,
+
+        [Parameter(Mandatory)]
+        [int]$WorkerReplicas,
+
+        [Parameter(Mandatory)]
+        [int]$MaxOutstanding,
+
+        [Parameter(Mandatory)]
+        [TimeSpan]$Warmup,
+
+        [Parameter(Mandatory)]
+        [TimeSpan]$Measurement,
+
+        [Parameter(Mandatory)]
+        [TimeSpan]$Drain
+    )
+
+    Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+        "scale", "deployment/quarry-worker",
+        "--namespace", "quarry",
+        "--replicas", [string]$WorkerReplicas
+    ) | Out-Host
+    Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+        "rollout", "status", "deployment/quarry-worker",
+        "--namespace", "quarry", "--timeout", "180s"
+    ) | Out-Host
+    Assert-KindWorkerState `
+        -ClusterName $ClusterName `
+        -ExpectedReplicas $WorkerReplicas `
+        -ExpectedConcurrency 1
+
+    $runID = "$RunPrefix-w$WorkerReplicas"
+    $runDirectory = Join-Path $OutputDirectory $runID
+    New-Item -ItemType Directory -Path $runDirectory | Out-Null
+    $samplesPath = Join-Path $runDirectory "jobs.jsonl.gz"
+    $summaryPath = Join-Path $runDirectory "summary.json"
+    $arguments = @(
+        "-api-url", $BaseURL,
+        "-output", $samplesPath,
+        "-summary", $summaryPath,
+        "-run-id", $runID,
+        "-workload", "b",
+        "-seed", "20260830",
+        "-warmup", "$([long]$Warmup.TotalMilliseconds)ms",
+        "-measurement", "$([long]$Measurement.TotalMilliseconds)ms",
+        "-drain-timeout", "$([long]$Drain.TotalMilliseconds)ms",
+        "-poll-interval", "10ms",
+        "-max-outstanding", [string]$MaxOutstanding,
+        "-http-concurrency", [string]$MaxOutstanding,
+        "-max-attempts", "1",
+        "-job-timeout", "5s"
+    )
+    $loadgenOutput = @(& $LoadgenBinary @arguments)
+    if ($LASTEXITCODE -ne 0) {
+        throw "kind scaling load generator failed for $WorkerReplicas workers with exit code $LASTEXITCODE. Output: $($loadgenOutput -join ' ')"
+    }
+    if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
+        throw "kind scaling load generator did not write a summary for $WorkerReplicas workers."
+    }
+
+    $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+    $measurementStartedAt = [DateTimeOffset]::Parse([string]$summary.measurement_started_at)
+    $measurementEndedAt = [DateTimeOffset]::Parse([string]$summary.measurement_ended_at)
+    $measuredDuration = $measurementEndedAt - $measurementStartedAt
+    if ($summary.run_id -ne $runID -or
+        [int]$summary.completed_count -le 0 -or
+        [int]$summary.completed_count -ne [int]$summary.successful_count -or
+        [int]$summary.terminal_failure_count -ne 0 -or
+        [int]$summary.submission_failure_count -ne 0 -or
+        [int]$summary.incomplete_count -ne 0 -or
+        [double]$summary.completed_per_second -le 0 -or
+        [math]::Abs(($measuredDuration - $Measurement).TotalMilliseconds) -gt 1) {
+        throw "kind scaling Workload B summary failed validation for $WorkerReplicas workers."
+    }
+
+    return [PSCustomObject]@{
+        Publishable = $false
+        Workload = "b"
+        WorkerReplicas = $WorkerReplicas
+        WorkerConcurrency = 1
+        MaxOutstanding = $MaxOutstanding
+        HTTPConcurrency = $MaxOutstanding
+        WarmupSeconds = [int]$Warmup.TotalSeconds
+        MeasurementSeconds = [int]$Measurement.TotalSeconds
+        DrainSeconds = [int]$Drain.TotalSeconds
+        CompletedJobs = [int]$summary.completed_count
+        CompletedJobsPerSecond = [double]$summary.completed_per_second
+    }
+}
+
+function Write-KindScalingResults {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Results
+    )
+
+    if (($Results.WorkerReplicas -join ",") -ne "1,4,8" -or
+        @($Results.WorkerConcurrency | Select-Object -Unique).Count -ne 1 -or
+        @($Results.MaxOutstanding | Select-Object -Unique).Count -ne 1 -or
+        @($Results.HTTPConcurrency | Select-Object -Unique).Count -ne 1 -or
+        @($Results.WarmupSeconds | Select-Object -Unique).Count -ne 1 -or
+        @($Results.MeasurementSeconds | Select-Object -Unique).Count -ne 1 -or
+        @($Results.DrainSeconds | Select-Object -Unique).Count -ne 1 -or
+        @($Results | Where-Object { $_.Publishable }).Count -ne 0) {
+        throw "kind scaling results do not preserve the required 1, 4, and 8 matrix and fixed load settings."
+    }
+
+    Write-Host "NON-PUBLISHABLE kind scaling measurements. Do not add these values to benchmarks/results or use them as benchmark claims."
+    foreach ($result in $Results) {
+        $rate = $result.CompletedJobsPerSecond.ToString(
+            "F2",
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+        Write-Host (
+            "workload=b workers=$($result.WorkerReplicas) worker_concurrency=1 " +
+            "max_outstanding=$($result.MaxOutstanding) http_concurrency=$($result.HTTPConcurrency) " +
+            "warmup=$($result.WarmupSeconds)s measurement=$($result.MeasurementSeconds)s " +
+            "drain=$($result.DrainSeconds)s completed_jobs=$($result.CompletedJobs) " +
+            "completed_jobs_per_second=$rate"
+        )
+    }
+}
+
+function Invoke-KindScalingDemonstration {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    $testID = [Guid]::NewGuid().ToString("N")
+    $temporaryDirectory = Join-Path `
+        ([System.IO.Path]::GetTempPath()) `
+        "quarry-kind-scaling-$testID"
+    $binaryExtension = if ($IsWindows) { ".exe" } else { "" }
+    $loadgenBinary = Join-Path $temporaryDirectory "quarry-loadgen$binaryExtension"
+    $forward = $null
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        Invoke-Go -Arguments @("build", "-o", $loadgenBinary, "./cmd/loadgen") | Out-Host
+
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "set", "env", "deployment/quarry-worker",
+            "--namespace", "quarry",
+            "QUARRY_WORKER_CONCURRENCY=1"
+        ) | Out-Host
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "rollout", "status", "deployment/quarry-worker",
+            "--namespace", "quarry", "--timeout", "180s"
+        ) | Out-Host
+        Assert-KindWorkerState `
+            -ClusterName $ClusterName `
+            -ExpectedReplicas 3 `
+            -ExpectedConcurrency 1
+
+        $forward = Start-KindAPIPortForward -ClusterName $ClusterName
+        $warmup = [TimeSpan]::FromSeconds(2)
+        $measurement = [TimeSpan]::FromSeconds(8)
+        $drain = [TimeSpan]::FromSeconds(10)
+        $maxOutstanding = 8
+        $runPrefix = "kind-scale-$testID"
+        foreach ($workerReplicas in @(1, 4, 8)) {
+            $results.Add((Invoke-KindScalingConfiguration `
+                -ClusterName $ClusterName `
+                -BaseURL $forward.BaseURL `
+                -LoadgenBinary $loadgenBinary `
+                -OutputDirectory $temporaryDirectory `
+                -RunPrefix $runPrefix `
+                -WorkerReplicas $workerReplicas `
+                -MaxOutstanding $maxOutstanding `
+                -Warmup $warmup `
+                -Measurement $measurement `
+                -Drain $drain))
+        }
+        Write-KindScalingResults -Results $results.ToArray()
+        return $results.ToArray()
+    }
+    finally {
+        try {
+            Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+                "apply", "--kustomize", "deploy/k8s/overlays/kind/applications"
+            ) | Out-Host
+            Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+                "scale", "deployment/quarry-worker",
+                "--namespace", "quarry", "--replicas", "3"
+            ) | Out-Host
+            Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+                "rollout", "status", "deployment/quarry-worker",
+                "--namespace", "quarry", "--timeout", "180s"
+            ) | Out-Host
+            Assert-KindWorkerState `
+                -ClusterName $ClusterName `
+                -ExpectedReplicas 3 `
+                -ExpectedConcurrency 4
+            Write-Host "Restored the documented worker default: replicas=3, concurrency=4."
+        }
+        finally {
+            try {
+                if ($null -ne $forward) {
+                    Stop-KindAPIPortForward -Forward $forward
+                }
+            }
+            finally {
+                Remove-DistributedTestDirectory -Directory $temporaryDirectory
+            }
+        }
+        if (Test-Path -LiteralPath $temporaryDirectory) {
+            throw "kind scaling temporary directory remains after cleanup."
+        }
+    }
+}
+
+function Test-KindScaling {
+    $clusterName = "quarry-m7-scale-$([Guid]::NewGuid().ToString('N').Substring(0, 10))"
+    try {
+        $deploymentResult = Invoke-KindDeploymentProof -ClusterName $clusterName
+        Write-KindResult -Result $deploymentResult -ClusterName $clusterName
+        $results = @(Invoke-KindScalingDemonstration -ClusterName $clusterName)
+        if ($results.Count -ne 3) {
+            throw "kind scaling demonstration returned $($results.Count) results, expected three."
+        }
+        Assert-KindWorkerState `
+            -ClusterName $clusterName `
+            -ExpectedReplicas 3 `
+            -ExpectedConcurrency 4
+    }
+    catch {
+        Write-KindDiagnostics -ClusterName $clusterName
+        throw
+    }
+    finally {
+        Remove-KindCluster -ClusterName $clusterName
+    }
+
+    Write-Host "Kind-scaling-test cleanup verified. Defaults were restored before cluster deletion. The port-forward, output, cluster, node container, and kubectl context were removed."
 }
 
 function Test-ObservabilityConfiguration {
@@ -5484,7 +5820,7 @@ try {
             Test-GoBuild
             Test-ContainerImages
             Test-KubernetesConfiguration
-            Test-KindDeployment
+            Test-KindScaling
             Test-ComposeWorkflow
             Test-ComposeRecoveryDemonstration
             Test-ObservabilityConfiguration
@@ -5568,6 +5904,9 @@ try {
         }
         "kind-test" {
             Test-KindDeployment
+        }
+        "kind-scaling-test" {
+            Test-KindScaling
         }
         "kind-down" {
             Stop-KindDemonstration

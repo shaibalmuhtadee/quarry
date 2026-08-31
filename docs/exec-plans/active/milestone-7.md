@@ -501,7 +501,7 @@ Prove that a fresh kind cluster can run locally built Quarry images and complete
 
 ## Slice 6: Kubernetes worker scaling demonstration
 
-Status: not started
+Status: complete
 
 ### Goal
 
@@ -552,11 +552,22 @@ Measure manual worker scaling at 1, 4, and 8 kind replicas without changing the 
 
 ### Decisions and deviations discovered during implementation
 
-None yet.
+- `kind-scaling-test` creates a fresh isolated cluster, runs the existing deployment proof, and then measures Workload B in the same cluster at 1, 4, and 8 worker replicas. Reusing the cluster and one owned API port-forward keeps each comparison on the same control plane while retaining full test ownership and cleanup.
+- Every configuration fixes worker concurrency at 1, maximum outstanding jobs and HTTP concurrency at 8, warmup at 2 seconds, measurement at 8 seconds, and drain timeout at 10 seconds. The proof requires all completed jobs to succeed with no terminal, submission, or incomplete failures.
+- Exact worker readiness counts only active, non-terminating pods. Kubernetes can briefly retain terminal or terminating pods from the prior ReplicaSet after a successful rollout, so counting every historical pod record would reject a correct exact Ready state.
+- The command prints completed jobs and completed jobs per second with an explicit non-publishable warning. It does not write to `benchmarks/results/` or change the Milestone 6 campaign.
+- Cleanup reapplies the kind application manifests, restores 3 worker replicas with concurrency 4, validates that state, and then removes the port-forward, temporary output, cluster, node container, and kubectl context.
+- The canonical `check` runs `kind-scaling-test` in place of the deployment-only kind proof because the scaling command includes that complete baseline proof before measuring. No architecture or project-plan deviations were required. Slice 7 did not begin.
 
 ### Validation evidence
 
-None yet.
+- 2026-08-30: the first focused run exposed that completed rollout pods can remain visible briefly after `kubectl rollout status`; it restored the 3-replica, concurrency-4 default and removed all resources but is not completion evidence. The readiness assertion was corrected to count only active, non-terminating pods.
+- 2026-08-30: `pwsh ./scripts/dev.ps1 kind-scaling-test` passed on a fresh kind v0.32.0 / Kubernetes v1.33.12 cluster. The baseline public job succeeded, Workload B completed with no failures at exactly 1, 4, and 8 Ready workers, and the non-publishable output reported 31.38, 64.38, and 83.00 completed jobs per second under the fixed load and phase settings. The command restored 3 replicas with concurrency 4 before deleting the cluster and verified cleanup.
+- 2026-08-30: `pwsh ./scripts/dev.ps1 benchmark-verify` passed after the implementation and verified campaign `quarry-20260829T002429Z`; no committed benchmark evidence changed.
+- 2026-08-30: `pwsh ./scripts/dev.ps1 check` passed. Its independent fresh kind run repeated the baseline deployment proof and measured 30.75, 82.88, and 84.12 completed jobs per second at 1, 4, and 8 workers, then restored defaults and removed the cluster. The canonical run also passed formatting, pinned-tool, generated-code, vet, unit, PostgreSQL integration, build, image, Kubernetes configuration, Compose, recovery, observability, distributed-process, acknowledgement-loss, shutdown-semantics, and race-sensitive validation with cleanup.
+- 2026-08-30: an independent post-validation residue check found zero Slice 6 clusters, kubectl contexts, node containers, Quarry Compose containers, and kind temporary directories.
+- 2026-08-30: `git diff --check` passed after the implementation and tracking updates.
+- GitHub-hosted CI was not run and remains deferred to Slice 7.
 
 ## Slice 7: final CI
 
