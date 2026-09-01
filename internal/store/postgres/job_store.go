@@ -16,6 +16,7 @@ import (
 	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 type JobStore struct {
@@ -25,7 +26,7 @@ type JobStore struct {
 }
 
 func NewJobStore(pool *pgxpool.Pool) *JobStore {
-	return NewJobStoreWithTracer(pool, trace.NewNoopTracerProvider().Tracer("quarry/store/postgres"))
+	return NewJobStoreWithTracer(pool, noop.NewTracerProvider().Tracer("quarry/store/postgres"))
 }
 
 func NewJobStoreWithTracer(pool *pgxpool.Pool, tracer trace.Tracer) *JobStore {

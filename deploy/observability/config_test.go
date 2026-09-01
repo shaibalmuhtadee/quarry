@@ -102,6 +102,12 @@ func TestCommittedConfigurationConnectsLocalStack(t *testing.T) {
 			t.Errorf("Prometheus configuration is missing target %q", target)
 		}
 	}
+	composePrometheus := string(readFile(t, "prometheus-compose.yml"))
+	for _, target := range []string{"api:8080", "dispatcher:9464", `names: ["worker"]`, "port: 9465"} {
+		if !strings.Contains(composePrometheus, target) {
+			t.Errorf("Compose Prometheus configuration is missing %q", target)
+		}
+	}
 
 	collector := string(readFile(t, "otel-collector.yaml"))
 	for _, required := range []string{"0.0.0.0:4318", "endpoint: jaeger:4317", "insecure: true", "health_check"} {
@@ -130,6 +136,41 @@ func TestCommittedConfigurationConnectsLocalStack(t *testing.T) {
 	} {
 		if !strings.Contains(string(compose), image) {
 			t.Errorf("Compose is missing pinned image %q", image)
+		}
+	}
+	for _, required := range []string{
+		"target: migration",
+		"target: api",
+		"target: dispatcher",
+		"target: worker",
+		"condition: service_completed_successfully",
+		"prometheus-compose.yml",
+		"QUARRY_WORKER_METRICS_ADDR: :9465",
+	} {
+		if !strings.Contains(string(compose), required) {
+			t.Errorf("Compose is missing %q", required)
+		}
+	}
+	if strings.Contains(string(compose), "container_name:") {
+		t.Error("Compose must not set fixed container names")
+	}
+
+	recoveryCompose, err := os.ReadFile(filepath.Join(repositoryRoot, "deploy", "compose.recovery.yaml"))
+	if err != nil {
+		t.Fatalf("read Compose recovery override: %v", err)
+	}
+	for _, required := range []string{
+		"QUARRY_LEASE_DURATION: 2s",
+		"QUARRY_REAPER_INTERVAL: 200ms",
+		`QUARRY_REAPER_BATCH_SIZE: "10"`,
+		"QUARRY_WORKER_LIVENESS_TIMEOUT: 2s",
+		"QUARRY_RETRY_BASE_DELAY: 100ms",
+		"QUARRY_RETRY_MAX_DELAY: 100ms",
+		`QUARRY_WORKER_CONCURRENCY: "1"`,
+		"QUARRY_HEARTBEAT_INTERVAL: 250ms",
+	} {
+		if !strings.Contains(string(recoveryCompose), required) {
+			t.Errorf("Compose recovery override is missing %q", required)
 		}
 	}
 }

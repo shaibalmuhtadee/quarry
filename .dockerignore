@@ -1,0 +1,9 @@
+.git
+.github
+benchmarks
+deploy
+docs
+scripts
+AGENTS.md
+README.md
+compose.yaml

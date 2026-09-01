@@ -1,0 +1,15 @@
+services:
+  dispatcher:
+    environment:
+      QUARRY_LEASE_DURATION: 2s
+      QUARRY_REAPER_INTERVAL: 200ms
+      QUARRY_REAPER_BATCH_SIZE: "10"
+      QUARRY_WORKER_LIVENESS_TIMEOUT: 2s
+      QUARRY_RETRY_BASE_DELAY: 100ms
+      QUARRY_RETRY_MAX_DELAY: 100ms
+
+  worker:
+    environment:
+      QUARRY_WORKER_CONCURRENCY: "1"
+      QUARRY_HEARTBEAT_INTERVAL: 250ms
+      QUARRY_WORKER_VERSION: compose-recovery

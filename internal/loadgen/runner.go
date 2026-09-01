@@ -343,15 +343,7 @@ func appendContextError(errors []RequestError, operation RequestOperation, obser
 func toAttemptSamples(attempts []Attempt) []AttemptSample {
 	samples := make([]AttemptSample, 0, len(attempts))
 	for _, attempt := range attempts {
-		samples = append(samples, AttemptSample{
-			Number:       attempt.Number,
-			WorkerID:     attempt.WorkerID,
-			Status:       attempt.Status,
-			ErrorCode:    attempt.ErrorCode,
-			ErrorMessage: attempt.ErrorMessage,
-			StartedAt:    attempt.StartedAt,
-			FinishedAt:   attempt.FinishedAt,
-		})
+		samples = append(samples, AttemptSample(attempt))
 	}
 	return samples
 }

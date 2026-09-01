@@ -1,0 +1,46 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quarry-migration
+  labels:
+    app.kubernetes.io/name: quarry-migration
+    app.kubernetes.io/component: migration
+    app.kubernetes.io/part-of: quarry
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: quarry-migration
+        app.kubernetes.io/component: migration
+        app.kubernetes.io/part-of: quarry
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migration
+          image: quarry-migration:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GOOSE_DBSTRING
+              valueFrom:
+                secretKeyRef:
+                  name: quarry-postgres
+                  key: database-url
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi

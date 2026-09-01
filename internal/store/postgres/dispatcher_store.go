@@ -13,6 +13,7 @@ import (
 	postgresdb "github.com/shaibalmuhtadee/quarry/internal/store/postgres/generated"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 var (
@@ -81,7 +82,7 @@ func NewDispatcherStore(
 	leaseDuration time.Duration,
 	retryPolicy domain.RetryPolicy,
 ) *DispatcherStore {
-	return NewDispatcherStoreWithTracer(pool, leaseDuration, retryPolicy, trace.NewNoopTracerProvider().Tracer("quarry/store/postgres"))
+	return NewDispatcherStoreWithTracer(pool, leaseDuration, retryPolicy, noop.NewTracerProvider().Tracer("quarry/store/postgres"))
 }
 
 func NewDispatcherStoreWithTracer(

@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 2s
+  scrape_timeout: 1s
+  evaluation_interval: 2s
+
+scrape_configs:
+  - job_name: quarry-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8080"]
+
+  - job_name: quarry-dispatcher
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["dispatcher:9464"]
+
+  - job_name: quarry-worker
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names: ["worker"]
+        type: A
+        port: 9465
+        refresh_interval: 2s

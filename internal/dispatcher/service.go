@@ -15,6 +15,7 @@ import (
 	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -49,11 +50,11 @@ type Service struct {
 }
 
 func NewService(store store) *Service {
-	return NewServiceWithTelemetry(store, nil, trace.NewNoopTracerProvider().Tracer("quarry/dispatcher"), slog.Default())
+	return NewServiceWithTelemetry(store, nil, noop.NewTracerProvider().Tracer("quarry/dispatcher"), slog.Default())
 }
 
 func NewServiceWithMetrics(store store, metrics serviceMetrics) *Service {
-	return NewServiceWithTelemetry(store, metrics, trace.NewNoopTracerProvider().Tracer("quarry/dispatcher"), slog.Default())
+	return NewServiceWithTelemetry(store, metrics, noop.NewTracerProvider().Tracer("quarry/dispatcher"), slog.Default())
 }
 
 func NewServiceWithTelemetry(store store, metrics serviceMetrics, tracer trace.Tracer, logger *slog.Logger) *Service {

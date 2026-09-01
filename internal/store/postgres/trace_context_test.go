@@ -93,7 +93,7 @@ func TestPersistenceSpansRemainOnTheAttemptTrace(t *testing.T) {
 func traceSpanAttributes(span sdktrace.ReadOnlySpan) map[string]string {
 	attributes := map[string]string{}
 	for _, value := range span.Attributes() {
-		attributes[string(value.Key)] = value.Value.Emit()
+		attributes[string(value.Key)] = value.Value.String()
 	}
 	return attributes
 }

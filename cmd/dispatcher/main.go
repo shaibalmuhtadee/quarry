@@ -20,6 +20,7 @@ import (
 	"github.com/shaibalmuhtadee/quarry/internal/store/postgres"
 	"github.com/shaibalmuhtadee/quarry/internal/telemetry"
 	"google.golang.org/grpc"
+	healthv1 "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 const (
@@ -218,6 +219,7 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) (runErr error) {
 	}
 
 	server := grpc.NewServer(grpc.StatsHandler(telemetryRuntime.GRPCServerStatsHandler()))
+	healthv1.RegisterHealthServer(server, newDispatcherHealthServer(pool))
 	dispatcherv1.RegisterDispatcherServiceServer(
 		server,
 		dispatcher.NewServiceWithTelemetry(

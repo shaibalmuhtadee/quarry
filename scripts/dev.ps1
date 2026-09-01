@@ -1,9 +1,12 @@
 param(
     [ValidateSet(
-        "check", "test", "tools",
+        "help", "docs-test", "check", "test", "tools", "staticcheck", "workflow-check",
+        "ci-go", "ci-race", "ci-packaging",
         "db-config", "db-up", "db-ready", "db-down",
         "migrate-up", "migrate-down", "migrate-status", "migration-test", "restart-test",
-        "generate", "generate-check", "format-check", "vet", "build",
+        "generate", "generate-check", "format-check", "vet", "build", "image-test", "compose-test",
+        "compose-recovery", "compose-recovery-test", "compose-recovery-down", "k8s-config-test",
+        "kind-up", "kind-test", "kind-scaling-test", "kind-down",
         "smoke-test", "distributed-test", "recovery-test", "ack-loss-test", "failure-test", "semantics-test",
         "benchmark-smoke", "benchmark", "benchmark-verify",
         "observability-config-test", "observability-test", "observability-up", "observability-down"
@@ -77,11 +80,120 @@ function Invoke-Docker {
     }
 }
 
+function Find-KubectlExecutable {
+    $kubectlCommand = Get-Command kubectl -ErrorAction SilentlyContinue
+    if ($null -ne $kubectlCommand) {
+        return $kubectlCommand.Source
+    }
+
+    throw "kubectl is not available. Install kubectl with built-in Kustomize support and add it to PATH."
+}
+
+function Invoke-Kubectl {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    if ($null -eq $script:KubectlExecutable) {
+        $script:KubectlExecutable = Find-KubectlExecutable
+    }
+
+    & $script:KubectlExecutable @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "kubectl $($Arguments -join ' ') failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Find-KindExecutable {
+    $kindCommand = Get-Command kind -ErrorAction SilentlyContinue
+    if ($null -ne $kindCommand) {
+        return $kindCommand.Source
+    }
+
+    throw "kind is not available. Install kind v0.32.0 or newer and add it to PATH."
+}
+
+function Invoke-Kind {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    if ($null -eq $script:KindExecutable) {
+        $script:KindExecutable = Find-KindExecutable
+    }
+
+    & $script:KindExecutable @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "kind $($Arguments -join ' ') failed with exit code $LASTEXITCODE."
+    }
+}
+
 function Test-Tools {
     Invoke-Go -Arguments @("version")
+    Invoke-Go -Arguments @("tool", "actionlint", "-version")
     Invoke-Go -Arguments @("tool", "buf", "--version")
     Invoke-Go -Arguments @("tool", "goose", "-version")
     Invoke-Go -Arguments @("tool", "sqlc", "version")
+    Invoke-Go -Arguments @("tool", "staticcheck", "-version")
+}
+
+function Write-CommandHelp {
+    Write-Host @"
+Usage: pwsh ./scripts/dev.ps1 <command>
+
+Primary demonstrations:
+  compose-recovery       Start the full Compose stack, kill one validated worker, prove lease recovery, and leave the stack running.
+  compose-recovery-down  Remove the Compose recovery stack and its database volume.
+  kind-up                Build, deploy, and prove Quarry in a persistent local kind cluster.
+  kind-down              Remove the persistent kind demonstration cluster.
+  kind-scaling-test      Measure Workload B at 1, 4, and 8 workers in an isolated kind cluster, then remove it.
+  benchmark-verify       Regenerate and verify the committed benchmark summaries.
+
+Validation:
+  docs-test              Verify every local Markdown link in README.md and docs/.
+  check                  Run the complete local validation suite. This removes Quarry test containers, volumes, and kind clusters.
+
+See README.md for the Compose walkthrough, recovery proof, observability URLs, kind quickstart, and benchmark evidence.
+"@
+}
+
+function Test-DocumentationLinks {
+    $markdownFiles = @(
+        Get-ChildItem -LiteralPath "." -File -Filter "*.md"
+        Get-ChildItem -LiteralPath "docs" -File -Filter "*.md" -Recurse
+    ) | Sort-Object -Property FullName
+    $linkPattern = [regex]'(?<!!)\[[^\]]+\]\((?<destination>[^)]+)\)'
+    $localLinkCount = 0
+
+    foreach ($file in $markdownFiles) {
+        $content = Get-Content -Raw -LiteralPath $file.FullName
+        foreach ($linkMatch in $linkPattern.Matches($content)) {
+            $destination = $linkMatch.Groups["destination"].Value.Trim()
+            if ($destination.StartsWith("<") -and $destination.EndsWith(">")) {
+                $destination = $destination.Substring(1, $destination.Length - 2)
+            }
+            if ($destination -eq "" -or
+                $destination.StartsWith("#") -or
+                $destination -match '^[a-z][a-z0-9+.-]*:') {
+                continue
+            }
+
+            $pathPart = ($destination -split "#", 2)[0]
+            $decodedPath = [Uri]::UnescapeDataString($pathPart)
+            $target = Join-Path $file.DirectoryName $decodedPath
+            $localLinkCount++
+            if (-not (Test-Path -LiteralPath $target)) {
+                $prefix = $content.Substring(0, $linkMatch.Index)
+                $lineNumber = 1 + [regex]::Matches($prefix, "`r?`n").Count
+                $relativeSource = [IO.Path]::GetRelativePath($repositoryRoot, $file.FullName)
+                throw "Broken local Markdown link in ${relativeSource}:$lineNumber -> $destination"
+            }
+        }
+    }
+
+    Write-Host "Documentation link check passed: $localLinkCount local links across $($markdownFiles.Count) Markdown files."
 }
 
 function Test-GoPackages {
@@ -122,6 +234,18 @@ function Test-GoVet {
 
 function Test-GoBuild {
     Invoke-Go -Arguments @("build", "./...")
+}
+
+function Test-Staticcheck {
+    Invoke-Go -Arguments @("tool", "staticcheck", "./...")
+}
+
+function Test-GitHubWorkflows {
+    Invoke-Go -Arguments @("tool", "actionlint")
+}
+
+function Test-GoRace {
+    Invoke-Go -Arguments @("test", "-count=1", "-race", "./...")
 }
 
 function Get-PostgresConnectionString {
@@ -1006,8 +1130,7 @@ function Assert-ProcessTestCleanup {
         [Parameter(Mandatory)]
         [string]$TemporaryDirectory,
 
-        [Parameter(Mandatory)]
-        [int[]]$ProcessIDs
+        [int[]]$ProcessIDs = @()
     )
 
     if (Test-Path -LiteralPath $TemporaryDirectory) {
@@ -3214,14 +3337,1011 @@ function Wait-ObservabilityEndpoint {
     throw "$Name did not become ready at $URL within 60 seconds."
 }
 
+function Test-KubernetesConfiguration {
+    Invoke-Go -Arguments @("test", "-count=1", "./deploy/k8s")
+    if ($null -eq $script:KubectlExecutable) {
+        $script:KubectlExecutable = Find-KubectlExecutable
+    }
+
+    $testID = [Guid]::NewGuid().ToString("N")
+    $temporaryDirectory = Join-Path `
+        ([System.IO.Path]::GetTempPath()) `
+        "quarry-k8s-config-$testID"
+    $binaryExtension = if ($IsWindows) { ".exe" } else { "" }
+    $discoveryBinary = Join-Path $temporaryDirectory "quarry-k8s-discovery$binaryExtension"
+    $addressFile = Join-Path $temporaryDirectory "discovery-address"
+    $kubeconfigPath = Join-Path $temporaryDirectory "kubeconfig.yaml"
+    $cacheDirectory = Join-Path $temporaryDirectory "kubectl-cache"
+    $discoveryProcess = $null
+    $kustomizations = @(
+        "deploy/k8s/base/postgres",
+        "deploy/k8s/base/migration",
+        "deploy/k8s/base/applications",
+        "deploy/k8s/base",
+        "deploy/k8s/overlays/kind/postgres",
+        "deploy/k8s/overlays/kind/migration",
+        "deploy/k8s/overlays/kind/applications",
+        "deploy/k8s/overlays/kind"
+    )
+
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        New-Item -ItemType Directory -Path $cacheDirectory | Out-Null
+        Invoke-Go -Arguments @(
+            "build", "-o", $discoveryBinary, "./deploy/k8s/testdiscovery"
+        )
+        $discoveryProcess = Start-DistributedProcess `
+            -Binary $discoveryBinary `
+            -Environment @{} `
+            -Arguments @("-address-file", $addressFile)
+
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        while ([DateTime]::UtcNow -lt $deadline -and -not (Test-Path -LiteralPath $addressFile)) {
+            if ($discoveryProcess.HasExited) {
+                throw "Kubernetes discovery fixture exited with code $($discoveryProcess.ExitCode)."
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not (Test-Path -LiteralPath $addressFile)) {
+            throw "Kubernetes discovery fixture did not publish its address within 10 seconds."
+        }
+        $discoveryURL = (Get-Content -LiteralPath $addressFile -Raw).Trim()
+        if ([string]::IsNullOrWhiteSpace($discoveryURL)) {
+            throw "Kubernetes discovery fixture published an empty address."
+        }
+        $kubeconfig = @"
+apiVersion: v1
+kind: Config
+clusters:
+  - name: quarry-config-test
+    cluster:
+      server: $discoveryURL
+contexts:
+  - name: quarry-config-test
+    context:
+      cluster: quarry-config-test
+      user: quarry-config-test
+current-context: quarry-config-test
+users:
+  - name: quarry-config-test
+    user: {}
+"@
+        [System.IO.File]::WriteAllText(
+            $kubeconfigPath,
+            ($kubeconfig + [Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+
+        foreach ($kustomization in $kustomizations) {
+            $rendered = @(& $script:KubectlExecutable kustomize $kustomization)
+            if ($LASTEXITCODE -ne 0) {
+                throw "kubectl kustomize $kustomization failed with exit code $LASTEXITCODE."
+            }
+            if ($rendered.Count -eq 0) {
+                throw "kubectl kustomize $kustomization returned no resources."
+            }
+
+            $renderedPath = Join-Path `
+                $temporaryDirectory `
+                "$($kustomization.Replace('/', '-'))-rendered.yaml"
+            [System.IO.File]::WriteAllText(
+                $renderedPath,
+                (($rendered -join [Environment]::NewLine) + [Environment]::NewLine),
+                [System.Text.UTF8Encoding]::new($false)
+            )
+            Invoke-Kubectl -Arguments @(
+                "--kubeconfig", $kubeconfigPath,
+                "--cache-dir", $cacheDirectory,
+                "apply", "--dry-run=client", "--validate=false",
+                "--filename", $renderedPath
+            ) | Out-Null
+        }
+    }
+    finally {
+        try {
+            if ($null -ne $discoveryProcess) {
+                Stop-DistributedProcess -Process $discoveryProcess
+            }
+        }
+        finally {
+            Remove-DistributedTestDirectory -Directory $temporaryDirectory
+        }
+    }
+
+    if (Test-Path -LiteralPath $temporaryDirectory) {
+        throw "Kubernetes configuration test temporary directory remains after cleanup."
+    }
+    Write-Host "K8s-config-test passed: base and kind stages rendered, client dry-runs passed, focused assertions passed, and temporary files were removed."
+}
+
+function Assert-KindVersion {
+    if ($null -eq $script:KindExecutable) {
+        $script:KindExecutable = Find-KindExecutable
+    }
+
+    $output = @(& $script:KindExecutable version)
+    if ($LASTEXITCODE -ne 0) {
+        throw "kind version failed with exit code $LASTEXITCODE."
+    }
+    $versionMatch = [regex]::Match(($output -join " "), 'kind v(?<version>\d+\.\d+\.\d+)')
+    if (-not $versionMatch.Success) {
+        throw "kind returned an unrecognized version: $($output -join ' ')"
+    }
+    $version = [version]$versionMatch.Groups['version'].Value
+    if ($version -lt [version]'0.32.0') {
+        throw "kind v$version is too old. Quarry requires kind v0.32.0 or newer."
+    }
+    return "v$version"
+}
+
+function Get-KindClusters {
+    return @(
+        Invoke-Kind -Arguments @("get", "clusters") |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+}
+
+function Test-KindClusterExists {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    return (Get-KindClusters) -contains $ClusterName
+}
+
+function Invoke-KindKubectl {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName,
+
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    Invoke-Kubectl -Arguments (@("--context", "kind-$ClusterName") + $Arguments)
+}
+
+function Get-KindKubectlJSON {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName,
+
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    $output = @(Invoke-KindKubectl -ClusterName $ClusterName -Arguments ($Arguments + @("-o", "json")))
+    return (($output -join [Environment]::NewLine) | ConvertFrom-Json)
+}
+
+function Remove-KindCluster {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    if ($null -eq $script:KubectlExecutable) {
+        $script:KubectlExecutable = Find-KubectlExecutable
+    }
+    if (Test-KindClusterExists -ClusterName $ClusterName) {
+        Invoke-Kind -Arguments @("delete", "cluster", "--name", $ClusterName)
+    }
+    if (Test-KindClusterExists -ClusterName $ClusterName) {
+        throw "kind cluster '$ClusterName' remains after deletion."
+    }
+
+    $containers = @(
+        Invoke-Docker -Arguments @(
+            "ps", "--all", "--quiet",
+            "--filter", "label=io.x-k8s.kind.cluster=$ClusterName"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($containers.Count -ne 0) {
+        throw "kind cluster '$ClusterName' still has Docker node containers after deletion."
+    }
+
+    $contexts = @(
+        & $script:KubectlExecutable config get-contexts --output name 2>$null |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "kubectl config get-contexts failed with exit code $LASTEXITCODE."
+    }
+    if ($contexts -contains "kind-$ClusterName") {
+        throw "kubectl context 'kind-$ClusterName' remains after cluster deletion."
+    }
+}
+
+function Get-KindImages {
+    return @(
+        [PSCustomObject]@{ Target = "api"; Tag = "quarry-api:kind" },
+        [PSCustomObject]@{ Target = "dispatcher"; Tag = "quarry-dispatcher:kind" },
+        [PSCustomObject]@{ Target = "worker"; Tag = "quarry-worker:kind" },
+        [PSCustomObject]@{ Target = "migration"; Tag = "quarry-migration:kind" }
+    )
+}
+
+function Build-AndLoadKindImages {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    $images = @(Get-KindImages)
+    foreach ($image in $images) {
+        Invoke-Docker -Arguments @(
+            "build", "--target", $image.Target, "--tag", $image.Tag, "."
+        ) | Out-Host
+    }
+
+    foreach ($image in $images) {
+        Invoke-Kind -Arguments @(
+            "load", "docker-image", "--name", $ClusterName, $image.Tag
+        ) | Out-Host
+    }
+
+    $nodes = @(
+        Invoke-Docker -Arguments @(
+            "ps", "--quiet",
+            "--filter", "label=io.x-k8s.kind.cluster=$ClusterName",
+            "--filter", "label=io.x-k8s.kind.role=control-plane"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($nodes.Count -ne 1) {
+        throw "kind cluster '$ClusterName' has $($nodes.Count) control-plane containers, expected one."
+    }
+    $loadedImages = @(
+        Invoke-Docker -Arguments @("exec", $nodes[0], "crictl", "images", "--output", "json")
+    ) -join [Environment]::NewLine
+    foreach ($tag in @($images.Tag)) {
+        if (-not $loadedImages.Contains($tag)) {
+            throw "kind node does not contain loaded image '$tag'."
+        }
+    }
+}
+
+function Assert-KindPodsReady {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName,
+
+        [Parameter(Mandatory)]
+        [string]$Component,
+
+        [Parameter(Mandatory)]
+        [int]$ExpectedCount
+    )
+
+    $response = Get-KindKubectlJSON `
+        -ClusterName $ClusterName `
+        -Arguments @(
+            "get", "pods", "--namespace", "quarry",
+            "--selector", "app.kubernetes.io/component=$Component"
+        )
+    $pods = @(
+        $response.items | Where-Object {
+            $deletionTimestamp = $_.metadata.PSObject.Properties["deletionTimestamp"]
+            ($null -eq $deletionTimestamp -or
+                [string]::IsNullOrWhiteSpace([string]$deletionTimestamp.Value)) -and
+                $_.status.phase -notin @("Succeeded", "Failed")
+        }
+    )
+    if ($pods.Count -ne $ExpectedCount) {
+        throw "kind component '$Component' has $($pods.Count) active pods, expected $ExpectedCount."
+    }
+    foreach ($pod in $pods) {
+        $readyCondition = @($pod.status.conditions | Where-Object { $_.type -eq "Ready" })
+        $containerStatuses = @($pod.status.containerStatuses)
+        if ($readyCondition.Count -ne 1 -or $readyCondition[0].status -ne "True" -or
+            $containerStatuses.Count -ne 1 -or -not $containerStatuses[0].ready) {
+            throw "kind pod '$($pod.metadata.name)' is not Ready with one ready container."
+        }
+    }
+    return $pods
+}
+
+function Assert-KindDeploymentReady {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName,
+
+        [Parameter(Mandatory)]
+        [string]$Deployment,
+
+        [Parameter(Mandatory)]
+        [int]$ExpectedReplicas
+    )
+
+    $resource = Get-KindKubectlJSON `
+        -ClusterName $ClusterName `
+        -Arguments @("get", "deployment/$Deployment", "--namespace", "quarry")
+    if ([int]$resource.spec.replicas -ne $ExpectedReplicas -or
+        [int]$resource.status.readyReplicas -ne $ExpectedReplicas -or
+        [int]$resource.status.availableReplicas -ne $ExpectedReplicas) {
+        throw "kind deployment '$Deployment' is not ready at $ExpectedReplicas replicas."
+    }
+    return $resource
+}
+
+function Deploy-KindStages {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    $existingNamespace = @(
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "get", "namespace", "quarry", "--ignore-not-found", "--output", "name"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($existingNamespace.Count -ne 0) {
+        throw "fresh kind cluster '$ClusterName' already contains Quarry resources."
+    }
+
+    Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+        "apply", "--kustomize", "deploy/k8s/overlays/kind/postgres"
+    ) | Out-Host
+    Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+        "rollout", "status", "statefulset/postgres", "--namespace", "quarry", "--timeout", "180s"
+    ) | Out-Host
+    $postgresPods = @(Assert-KindPodsReady `
+        -ClusterName $ClusterName -Component "database" -ExpectedCount 1)
+    $postgresReadyCondition = @(
+        $postgresPods[0].status.conditions | Where-Object { $_.type -eq "Ready" }
+    )[0]
+    $postgresReadyAt = [DateTimeOffset]::Parse([string]$postgresReadyCondition.lastTransitionTime)
+
+    $jobsBeforeMigration = @(
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "get", "jobs", "--namespace", "quarry", "--output", "name"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($jobsBeforeMigration.Count -ne 0) {
+        throw "kind migration Job exists before the migration stage was applied."
+    }
+
+    Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+        "apply", "--kustomize", "deploy/k8s/overlays/kind/migration"
+    ) | Out-Host
+    Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+        "wait", "--for=condition=complete", "job/quarry-migration",
+        "--namespace", "quarry", "--timeout", "180s"
+    ) | Out-Host
+    $migration = Get-KindKubectlJSON `
+        -ClusterName $ClusterName `
+        -Arguments @("get", "job/quarry-migration", "--namespace", "quarry")
+    if ([int]$migration.status.succeeded -ne 1) {
+        throw "kind migration Job did not record one successful completion."
+    }
+    $migrationStartedAt = [DateTimeOffset]::Parse([string]$migration.status.startTime)
+    $migrationCompletedAt = [DateTimeOffset]::Parse([string]$migration.status.completionTime)
+    if ($migrationStartedAt -lt $postgresReadyAt) {
+        throw "kind migration started before PostgreSQL became Ready."
+    }
+
+    $deploymentsBeforeApplications = @(
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "get", "deployments", "--namespace", "quarry", "--output", "name"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($deploymentsBeforeApplications.Count -ne 0) {
+        throw "kind application Deployments exist before the application stage was applied."
+    }
+
+    Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+        "apply", "--kustomize", "deploy/k8s/overlays/kind/applications"
+    ) | Out-Host
+    foreach ($deployment in @("quarry-api", "quarry-dispatcher", "quarry-worker")) {
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "rollout", "status", "deployment/$deployment",
+            "--namespace", "quarry", "--timeout", "180s"
+        ) | Out-Host
+    }
+
+    $api = Assert-KindDeploymentReady `
+        -ClusterName $ClusterName -Deployment "quarry-api" -ExpectedReplicas 1
+    $dispatcher = Assert-KindDeploymentReady `
+        -ClusterName $ClusterName -Deployment "quarry-dispatcher" -ExpectedReplicas 2
+    $worker = Assert-KindDeploymentReady `
+        -ClusterName $ClusterName -Deployment "quarry-worker" -ExpectedReplicas 3
+    foreach ($deployment in @($api, $dispatcher, $worker)) {
+        $createdAt = [DateTimeOffset]::Parse([string]$deployment.metadata.creationTimestamp)
+        if ($createdAt -lt $migrationCompletedAt) {
+            throw "kind application deployment '$($deployment.metadata.name)' predates migration completion."
+        }
+    }
+
+    $null = @(Assert-KindPodsReady -ClusterName $ClusterName -Component "api" -ExpectedCount 1)
+    $null = @(Assert-KindPodsReady -ClusterName $ClusterName -Component "dispatcher" -ExpectedCount 2)
+    $null = @(Assert-KindPodsReady -ClusterName $ClusterName -Component "worker" -ExpectedCount 3)
+
+    $version = Get-KindKubectlJSON -ClusterName $ClusterName -Arguments @("version")
+    return [PSCustomObject]@{
+        KubernetesVersion = [string]$version.serverVersion.gitVersion
+        PostgresReadyAt = $postgresReadyAt
+        MigrationCompletedAt = $migrationCompletedAt
+    }
+}
+
+function Start-KindAPIPortForward {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    $testID = [Guid]::NewGuid().ToString("N")
+    $temporaryDirectory = Join-Path `
+        ([System.IO.Path]::GetTempPath()) `
+        "quarry-kind-port-forward-$testID"
+    $standardOutput = Join-Path $temporaryDirectory "port-forward.stdout.log"
+    $standardError = Join-Path $temporaryDirectory "port-forward.stderr.log"
+    $portForward = $null
+    $port = Get-AvailableLoopbackPort
+    $baseURL = "http://127.0.0.1:$port"
+
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        $portForward = Start-DistributedProcess `
+            -Binary $script:KubectlExecutable `
+            -Environment @{} `
+            -Arguments @(
+                "--context", "kind-$ClusterName",
+                "--namespace", "quarry",
+                "port-forward", "--address", "127.0.0.1",
+                "service/quarry-api", "${port}:8080"
+            ) `
+            -StandardOutputPath $standardOutput `
+            -StandardErrorPath $standardError
+
+        $deadline = [DateTime]::UtcNow.AddSeconds(30)
+        $ready = $false
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ($portForward.HasExited) {
+                throw (Get-DistributedProcessFailure `
+                    -Process $portForward -Label "kind API port-forward")
+            }
+            try {
+                $response = Invoke-WebRequest -Uri "$baseURL/readyz" -TimeoutSec 2
+                if ($response.StatusCode -eq 200) {
+                    $ready = $true
+                    break
+                }
+            }
+            catch {
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        if (-not $ready) {
+            throw "kind API port-forward did not reach readiness within 30 seconds."
+        }
+        $health = Invoke-WebRequest -Uri "$baseURL/healthz" -TimeoutSec 5
+        if ($health.StatusCode -ne 200) {
+            throw "kind API liveness returned HTTP $($health.StatusCode)."
+        }
+
+        return [PSCustomObject]@{
+            Process = $portForward
+            ProcessID = $portForward.Id
+            TemporaryDirectory = $temporaryDirectory
+            BaseURL = $baseURL
+        }
+    }
+    catch {
+        try {
+            if ($null -ne $portForward) {
+                Stop-DistributedProcess -Process $portForward
+            }
+        }
+        finally {
+            Remove-DistributedTestDirectory -Directory $temporaryDirectory
+        }
+        throw
+    }
+}
+
+function Stop-KindAPIPortForward {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Forward
+    )
+
+    try {
+        Stop-DistributedProcess -Process $Forward.Process
+    }
+    finally {
+        Remove-DistributedTestDirectory -Directory $Forward.TemporaryDirectory
+    }
+    if ($null -ne (Get-Process -Id $Forward.ProcessID -ErrorAction SilentlyContinue)) {
+        throw "kind API port-forward process $($Forward.ProcessID) remains after cleanup."
+    }
+    if (Test-Path -LiteralPath $Forward.TemporaryDirectory) {
+        throw "kind API port-forward temporary directory remains after cleanup."
+    }
+}
+
+function Invoke-KindPublicAPIProof {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    $forward = $null
+    try {
+        $forward = Start-KindAPIPortForward -ClusterName $ClusterName
+        $baseURL = $forward.BaseURL
+
+        $submitted = Submit-ObservabilityJob -BaseURL $baseURL -Type "demo.echo" `
+            -Payload @{ message = "kind-test" } -MaxAttempts 1 -TimeoutMilliseconds 30000
+        $jobState = Wait-ObservabilityJobStatus `
+            -BaseURL $baseURL -JobID $submitted.id -ExpectedStatus "succeeded"
+        $attempts = @(Get-ObservabilityJobAttempts -BaseURL $baseURL -JobID $submitted.id)
+        if ($jobState.result.message -ne "kind-test" -or
+            $attempts.Count -ne 1 -or $attempts[0].status -ne "succeeded" -or
+            [string]::IsNullOrWhiteSpace($attempts[0].worker_id)) {
+            throw "kind public API did not return the expected result and one succeeded worker attempt."
+        }
+        return [PSCustomObject]@{
+            JobID = [string]$submitted.id
+            WorkerID = [string]$attempts[0].worker_id
+        }
+    }
+    finally {
+        if ($null -ne $forward) {
+            Stop-KindAPIPortForward -Forward $forward
+        }
+    }
+}
+
+function Write-KindDiagnostics {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    if (-not (Test-KindClusterExists -ClusterName $ClusterName)) {
+        return
+    }
+    Write-Warning "kind validation failed; collecting cluster state before cleanup."
+    $namespace = @(
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "get", "namespace", "quarry", "--ignore-not-found", "--output", "name"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($namespace.Count -eq 0) {
+        Write-Warning "The failed kind cluster contains no Quarry namespace."
+        return
+    }
+    try {
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "get", "all,pvc", "--namespace", "quarry", "--output", "wide"
+        )
+    }
+    catch {
+        Write-Warning "Could not read kind cluster diagnostics: $_"
+    }
+    try {
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "describe", "pods", "--namespace", "quarry"
+        )
+    }
+    catch {
+        Write-Warning "Could not describe kind pods: $_"
+    }
+    try {
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "logs", "job/quarry-migration", "--namespace", "quarry"
+        )
+    }
+    catch {
+        Write-Warning "Could not read kind migration logs: $_"
+    }
+}
+
+function Invoke-KindDeploymentProof {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    $kindVersion = Assert-KindVersion
+    if (Test-KindClusterExists -ClusterName $ClusterName) {
+        throw "kind cluster '$ClusterName' already exists."
+    }
+
+    Invoke-Kind -Arguments @(
+        "create", "cluster",
+        "--name", $ClusterName,
+        "--image", $script:KindNodeImage,
+        "--wait", "180s"
+    ) | Out-Host
+    if (-not (Test-KindClusterExists -ClusterName $ClusterName)) {
+        throw "kind did not report newly created cluster '$ClusterName'."
+    }
+
+    $null = Build-AndLoadKindImages -ClusterName $ClusterName
+    $deployment = Deploy-KindStages -ClusterName $ClusterName
+    $apiProof = Invoke-KindPublicAPIProof -ClusterName $ClusterName
+    return [PSCustomObject]@{
+        KindVersion = $kindVersion
+        KubernetesVersion = $deployment.KubernetesVersion
+        JobID = $apiProof.JobID
+        WorkerID = $apiProof.WorkerID
+    }
+}
+
+function Write-KindResult {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Result,
+
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    Write-Host "kind deployment proof passed."
+    Write-Host "Cluster: $ClusterName"
+    Write-Host "kind: $($Result.KindVersion)"
+    Write-Host "Kubernetes: $($Result.KubernetesVersion)"
+    Write-Host "Ready replicas: API 1, dispatcher 2, worker 3"
+    Write-Host "Job ID: $($Result.JobID)"
+    Write-Host "Succeeded attempt worker: $($Result.WorkerID)"
+}
+
+function Start-KindDemonstration {
+    $clusterName = "quarry-demo"
+    if (Test-KindClusterExists -ClusterName $clusterName) {
+        throw "kind cluster '$clusterName' already exists. Run 'pwsh ./scripts/dev.ps1 kind-down' first."
+    }
+
+    try {
+        $result = Invoke-KindDeploymentProof -ClusterName $clusterName
+    }
+    catch {
+        try {
+            Write-KindDiagnostics -ClusterName $clusterName
+        }
+        finally {
+            Remove-KindCluster -ClusterName $clusterName
+        }
+        throw
+    }
+
+    Write-KindResult -Result $result -ClusterName $clusterName
+    Write-Host "The cluster remains running for inspection."
+    Write-Host "Forward the API with: kubectl --context kind-$clusterName --namespace quarry port-forward service/quarry-api 8080:8080"
+    Write-Host "Remove it with: pwsh ./scripts/dev.ps1 kind-down"
+}
+
+function Stop-KindDemonstration {
+    Remove-KindCluster -ClusterName "quarry-demo"
+    Write-Host "kind demonstration cluster removed."
+}
+
+function Test-KindDeployment {
+    $clusterName = "quarry-m7-$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
+    try {
+        $result = Invoke-KindDeploymentProof -ClusterName $clusterName
+        Write-KindResult -Result $result -ClusterName $clusterName
+    }
+    catch {
+        Write-KindDiagnostics -ClusterName $clusterName
+        throw
+    }
+    finally {
+        Remove-KindCluster -ClusterName $clusterName
+    }
+    Write-Host "Kind-test cleanup verified: port-forward, temporary files, cluster, node container, and kubectl context removed."
+}
+
+function Assert-KindWorkerState {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName,
+
+        [Parameter(Mandatory)]
+        [int]$ExpectedReplicas,
+
+        [Parameter(Mandatory)]
+        [int]$ExpectedConcurrency
+    )
+
+    $deployment = Assert-KindDeploymentReady `
+        -ClusterName $ClusterName `
+        -Deployment "quarry-worker" `
+        -ExpectedReplicas $ExpectedReplicas
+    $null = @(Assert-KindPodsReady `
+        -ClusterName $ClusterName `
+        -Component "worker" `
+        -ExpectedCount $ExpectedReplicas)
+
+    $workerContainers = @(
+        $deployment.spec.template.spec.containers |
+            Where-Object { $_.name -eq "worker" }
+    )
+    if ($workerContainers.Count -ne 1) {
+        throw "kind worker Deployment does not contain exactly one worker container."
+    }
+    $concurrencyVariables = @(
+        $workerContainers[0].env |
+            Where-Object { $_.name -eq "QUARRY_WORKER_CONCURRENCY" }
+    )
+    if ($concurrencyVariables.Count -ne 1 -or
+        [string]$concurrencyVariables[0].value -ne [string]$ExpectedConcurrency) {
+        throw "kind worker Deployment concurrency is not $ExpectedConcurrency."
+    }
+}
+
+function Invoke-KindScalingConfiguration {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName,
+
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$LoadgenBinary,
+
+        [Parameter(Mandatory)]
+        [string]$OutputDirectory,
+
+        [Parameter(Mandatory)]
+        [string]$RunPrefix,
+
+        [Parameter(Mandatory)]
+        [int]$WorkerReplicas,
+
+        [Parameter(Mandatory)]
+        [int]$MaxOutstanding,
+
+        [Parameter(Mandatory)]
+        [TimeSpan]$Warmup,
+
+        [Parameter(Mandatory)]
+        [TimeSpan]$Measurement,
+
+        [Parameter(Mandatory)]
+        [TimeSpan]$Drain
+    )
+
+    Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+        "scale", "deployment/quarry-worker",
+        "--namespace", "quarry",
+        "--replicas", [string]$WorkerReplicas
+    ) | Out-Host
+    Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+        "rollout", "status", "deployment/quarry-worker",
+        "--namespace", "quarry", "--timeout", "180s"
+    ) | Out-Host
+    Assert-KindWorkerState `
+        -ClusterName $ClusterName `
+        -ExpectedReplicas $WorkerReplicas `
+        -ExpectedConcurrency 1
+
+    $runID = "$RunPrefix-w$WorkerReplicas"
+    $runDirectory = Join-Path $OutputDirectory $runID
+    New-Item -ItemType Directory -Path $runDirectory | Out-Null
+    $samplesPath = Join-Path $runDirectory "jobs.jsonl.gz"
+    $summaryPath = Join-Path $runDirectory "summary.json"
+    $arguments = @(
+        "-api-url", $BaseURL,
+        "-output", $samplesPath,
+        "-summary", $summaryPath,
+        "-run-id", $runID,
+        "-workload", "b",
+        "-seed", "20260830",
+        "-warmup", "$([long]$Warmup.TotalMilliseconds)ms",
+        "-measurement", "$([long]$Measurement.TotalMilliseconds)ms",
+        "-drain-timeout", "$([long]$Drain.TotalMilliseconds)ms",
+        "-poll-interval", "10ms",
+        "-max-outstanding", [string]$MaxOutstanding,
+        "-http-concurrency", [string]$MaxOutstanding,
+        "-max-attempts", "1",
+        "-job-timeout", "5s"
+    )
+    $loadgenOutput = @(& $LoadgenBinary @arguments)
+    if ($LASTEXITCODE -ne 0) {
+        throw "kind scaling load generator failed for $WorkerReplicas workers with exit code $LASTEXITCODE. Output: $($loadgenOutput -join ' ')"
+    }
+    if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
+        throw "kind scaling load generator did not write a summary for $WorkerReplicas workers."
+    }
+
+    $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+    $measurementStartedAt = [DateTimeOffset]::Parse([string]$summary.measurement_started_at)
+    $measurementEndedAt = [DateTimeOffset]::Parse([string]$summary.measurement_ended_at)
+    $measuredDuration = $measurementEndedAt - $measurementStartedAt
+    if ($summary.run_id -ne $runID -or
+        [int]$summary.completed_count -le 0 -or
+        [int]$summary.completed_count -ne [int]$summary.successful_count -or
+        [int]$summary.terminal_failure_count -ne 0 -or
+        [int]$summary.submission_failure_count -ne 0 -or
+        [int]$summary.incomplete_count -ne 0 -or
+        [double]$summary.completed_per_second -le 0 -or
+        [math]::Abs(($measuredDuration - $Measurement).TotalMilliseconds) -gt 1) {
+        throw "kind scaling Workload B summary failed validation for $WorkerReplicas workers."
+    }
+
+    return [PSCustomObject]@{
+        Publishable = $false
+        Workload = "b"
+        WorkerReplicas = $WorkerReplicas
+        WorkerConcurrency = 1
+        MaxOutstanding = $MaxOutstanding
+        HTTPConcurrency = $MaxOutstanding
+        WarmupSeconds = [int]$Warmup.TotalSeconds
+        MeasurementSeconds = [int]$Measurement.TotalSeconds
+        DrainSeconds = [int]$Drain.TotalSeconds
+        CompletedJobs = [int]$summary.completed_count
+        CompletedJobsPerSecond = [double]$summary.completed_per_second
+    }
+}
+
+function Write-KindScalingResults {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Results
+    )
+
+    if (($Results.WorkerReplicas -join ",") -ne "1,4,8" -or
+        @($Results.WorkerConcurrency | Select-Object -Unique).Count -ne 1 -or
+        @($Results.MaxOutstanding | Select-Object -Unique).Count -ne 1 -or
+        @($Results.HTTPConcurrency | Select-Object -Unique).Count -ne 1 -or
+        @($Results.WarmupSeconds | Select-Object -Unique).Count -ne 1 -or
+        @($Results.MeasurementSeconds | Select-Object -Unique).Count -ne 1 -or
+        @($Results.DrainSeconds | Select-Object -Unique).Count -ne 1 -or
+        @($Results | Where-Object { $_.Publishable }).Count -ne 0) {
+        throw "kind scaling results do not preserve the required 1, 4, and 8 matrix and fixed load settings."
+    }
+
+    Write-Host "NON-PUBLISHABLE kind scaling measurements. Do not add these values to benchmarks/results or use them as benchmark claims."
+    foreach ($result in $Results) {
+        $rate = $result.CompletedJobsPerSecond.ToString(
+            "F2",
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+        Write-Host (
+            "workload=b workers=$($result.WorkerReplicas) worker_concurrency=1 " +
+            "max_outstanding=$($result.MaxOutstanding) http_concurrency=$($result.HTTPConcurrency) " +
+            "warmup=$($result.WarmupSeconds)s measurement=$($result.MeasurementSeconds)s " +
+            "drain=$($result.DrainSeconds)s completed_jobs=$($result.CompletedJobs) " +
+            "completed_jobs_per_second=$rate"
+        )
+    }
+}
+
+function Invoke-KindScalingDemonstration {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ClusterName
+    )
+
+    $testID = [Guid]::NewGuid().ToString("N")
+    $temporaryDirectory = Join-Path `
+        ([System.IO.Path]::GetTempPath()) `
+        "quarry-kind-scaling-$testID"
+    $binaryExtension = if ($IsWindows) { ".exe" } else { "" }
+    $loadgenBinary = Join-Path $temporaryDirectory "quarry-loadgen$binaryExtension"
+    $forward = $null
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        Invoke-Go -Arguments @("build", "-o", $loadgenBinary, "./cmd/loadgen") | Out-Host
+
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "set", "env", "deployment/quarry-worker",
+            "--namespace", "quarry",
+            "QUARRY_WORKER_CONCURRENCY=1"
+        ) | Out-Host
+        Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+            "rollout", "status", "deployment/quarry-worker",
+            "--namespace", "quarry", "--timeout", "180s"
+        ) | Out-Host
+        Assert-KindWorkerState `
+            -ClusterName $ClusterName `
+            -ExpectedReplicas 3 `
+            -ExpectedConcurrency 1
+
+        $forward = Start-KindAPIPortForward -ClusterName $ClusterName
+        $warmup = [TimeSpan]::FromSeconds(2)
+        $measurement = [TimeSpan]::FromSeconds(8)
+        $drain = [TimeSpan]::FromSeconds(10)
+        $maxOutstanding = 8
+        $runPrefix = "kind-scale-$testID"
+        foreach ($workerReplicas in @(1, 4, 8)) {
+            $results.Add((Invoke-KindScalingConfiguration `
+                -ClusterName $ClusterName `
+                -BaseURL $forward.BaseURL `
+                -LoadgenBinary $loadgenBinary `
+                -OutputDirectory $temporaryDirectory `
+                -RunPrefix $runPrefix `
+                -WorkerReplicas $workerReplicas `
+                -MaxOutstanding $maxOutstanding `
+                -Warmup $warmup `
+                -Measurement $measurement `
+                -Drain $drain))
+        }
+        Write-KindScalingResults -Results $results.ToArray()
+        return $results.ToArray()
+    }
+    finally {
+        try {
+            Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+                "apply", "--kustomize", "deploy/k8s/overlays/kind/applications"
+            ) | Out-Host
+            Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+                "scale", "deployment/quarry-worker",
+                "--namespace", "quarry", "--replicas", "3"
+            ) | Out-Host
+            Invoke-KindKubectl -ClusterName $ClusterName -Arguments @(
+                "rollout", "status", "deployment/quarry-worker",
+                "--namespace", "quarry", "--timeout", "180s"
+            ) | Out-Host
+            Assert-KindWorkerState `
+                -ClusterName $ClusterName `
+                -ExpectedReplicas 3 `
+                -ExpectedConcurrency 4
+            Write-Host "Restored the documented worker default: replicas=3, concurrency=4."
+        }
+        finally {
+            try {
+                if ($null -ne $forward) {
+                    Stop-KindAPIPortForward -Forward $forward
+                }
+            }
+            finally {
+                Remove-DistributedTestDirectory -Directory $temporaryDirectory
+            }
+        }
+        if (Test-Path -LiteralPath $temporaryDirectory) {
+            throw "kind scaling temporary directory remains after cleanup."
+        }
+    }
+}
+
+function Test-KindScaling {
+    $clusterName = "quarry-m7-scale-$([Guid]::NewGuid().ToString('N').Substring(0, 10))"
+    try {
+        $deploymentResult = Invoke-KindDeploymentProof -ClusterName $clusterName
+        Write-KindResult -Result $deploymentResult -ClusterName $clusterName
+        $results = @(Invoke-KindScalingDemonstration -ClusterName $clusterName)
+        if ($results.Count -ne 3) {
+            throw "kind scaling demonstration returned $($results.Count) results, expected three."
+        }
+        Assert-KindWorkerState `
+            -ClusterName $clusterName `
+            -ExpectedReplicas 3 `
+            -ExpectedConcurrency 4
+    }
+    catch {
+        Write-KindDiagnostics -ClusterName $clusterName
+        throw
+    }
+    finally {
+        Remove-KindCluster -ClusterName $clusterName
+    }
+
+    Write-Host "Kind-scaling-test cleanup verified. Defaults were restored before cluster deletion. The port-forward, output, cluster, node container, and kubectl context were removed."
+}
+
 function Test-ObservabilityConfiguration {
     $prometheusConfig = (Resolve-Path -LiteralPath "deploy/observability/prometheus.yml").Path
+    $composePrometheusConfig = (Resolve-Path -LiteralPath "deploy/observability/prometheus-compose.yml").Path
     $collectorConfig = (Resolve-Path -LiteralPath "deploy/observability/otel-collector.yaml").Path
 
     Invoke-Docker -Arguments @("compose", "config", "--quiet")
     Invoke-Docker -Arguments @(
         "run", "--rm",
         "--volume", "${prometheusConfig}:/etc/prometheus/prometheus.yml:ro",
+        "--entrypoint", "promtool",
+        "prom/prometheus:v3.12.0",
+        "check", "config", "/etc/prometheus/prometheus.yml"
+    )
+    Invoke-Docker -Arguments @(
+        "run", "--rm",
+        "--volume", "${composePrometheusConfig}:/etc/prometheus/prometheus.yml:ro",
         "--entrypoint", "promtool",
         "prom/prometheus:v3.12.0",
         "check", "config", "/etc/prometheus/prometheus.yml"
@@ -3238,7 +4358,10 @@ function Test-ObservabilityConfiguration {
 function Start-ObservabilityInfrastructure {
     Test-ObservabilityConfiguration
     Invoke-Docker -Arguments @(
-        "compose", "up", "--detach", "--wait",
+        "compose",
+        "--file", "compose.yaml",
+        "--file", "deploy/observability/compose.host-observability.yaml",
+        "up", "--detach", "--wait", "--no-deps",
         "prometheus", "jaeger", "otel-collector", "grafana"
     )
 
@@ -3904,6 +5027,591 @@ function Test-ObservabilityWorkflow {
     Write-Host "Observability-test cleanup verified: processes, temporary binaries, containers, network, and volume removed."
 }
 
+function Get-ComposeServiceContainers {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComposeProject,
+
+        [Parameter(Mandatory)]
+        [string]$Service,
+
+        [switch]$Running
+    )
+
+    $arguments = @("ps", "--quiet")
+    if ($Running) {
+        $arguments += @("--filter", "status=running")
+    }
+    else {
+        $arguments = @("ps", "--all", "--quiet")
+    }
+    $arguments += @(
+        "--filter", "label=com.docker.compose.project=$ComposeProject",
+        "--filter", "label=com.docker.compose.service=$Service"
+    )
+
+    return @(
+        Invoke-Docker -Arguments $arguments |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+}
+
+function Wait-PrometheusWorkerTargets {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [int]$MinimumCount
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(45)
+    $lastCount = 0
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $response = Invoke-RestMethod -Uri "$BaseURL/api/v1/targets" -TimeoutSec 5
+            $lastCount = @(
+                $response.data.activeTargets |
+                    Where-Object { $_.health -eq "up" -and $_.labels.job -eq "quarry-worker" }
+            ).Count
+            if ($lastCount -ge $MinimumCount) {
+                return
+            }
+        }
+        catch {
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Prometheus reported $lastCount healthy worker targets, expected at least $MinimumCount."
+}
+
+function Test-ComposeWorkflow {
+    $testID = [Guid]::NewGuid().ToString("N")
+    $composeProject = "quarry-m7-compose-$testID"
+    $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "quarry-compose-$testID"
+    $savedEnvironment = @{}
+    $environmentNames = @(
+        "COMPOSE_PROJECT_NAME",
+        "QUARRY_POSTGRES_PORT",
+        "QUARRY_API_PORT",
+        "QUARRY_DISPATCHER_PORT",
+        "QUARRY_DISPATCHER_METRICS_PORT",
+        "QUARRY_PROMETHEUS_PORT",
+        "QUARRY_GRAFANA_PORT",
+        "QUARRY_OTEL_GRPC_PORT",
+        "QUARRY_OTEL_HTTP_PORT",
+        "QUARRY_OTEL_HEALTH_PORT",
+        "QUARRY_JAEGER_PORT",
+        "QUARRY_WORKER_CONCURRENCY"
+    )
+    foreach ($name in $environmentNames) {
+        $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
+    }
+
+    $ports = [System.Collections.Generic.List[int]]::new()
+    while ($ports.Count -lt 10) {
+        $candidate = Get-AvailableLoopbackPort
+        if (-not $ports.Contains($candidate)) {
+            $ports.Add($candidate)
+        }
+    }
+
+    $env:COMPOSE_PROJECT_NAME = $composeProject
+    $env:QUARRY_POSTGRES_PORT = [string]$ports[0]
+    $env:QUARRY_API_PORT = [string]$ports[1]
+    $env:QUARRY_DISPATCHER_PORT = [string]$ports[2]
+    $env:QUARRY_DISPATCHER_METRICS_PORT = [string]$ports[3]
+    $env:QUARRY_PROMETHEUS_PORT = [string]$ports[4]
+    $env:QUARRY_GRAFANA_PORT = [string]$ports[5]
+    $env:QUARRY_OTEL_GRPC_PORT = [string]$ports[6]
+    $env:QUARRY_OTEL_HTTP_PORT = [string]$ports[7]
+    $env:QUARRY_OTEL_HEALTH_PORT = [string]$ports[8]
+    $env:QUARRY_JAEGER_PORT = [string]$ports[9]
+    $env:QUARRY_WORKER_CONCURRENCY = "1"
+
+    $apiURL = "http://127.0.0.1:$($env:QUARRY_API_PORT)"
+    $prometheusURL = "http://127.0.0.1:$($env:QUARRY_PROMETHEUS_PORT)"
+    $grafanaURL = "http://127.0.0.1:$($env:QUARRY_GRAFANA_PORT)"
+    $jaegerURL = "http://127.0.0.1:$($env:QUARRY_JAEGER_PORT)"
+
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        Invoke-Docker -Arguments @("compose", "config", "--quiet")
+        Invoke-Docker -Arguments @("compose", "up", "--build", "--detach", "--scale", "worker=2")
+
+        Wait-ObservabilityEndpoint -Name "Compose API readiness" -URL "$apiURL/readyz"
+        Wait-ObservabilityEndpoint `
+            -Name "Compose OpenTelemetry Collector" `
+            -URL "http://127.0.0.1:$($env:QUARRY_OTEL_HEALTH_PORT)/"
+        Wait-ObservabilityEndpoint -Name "Compose Prometheus" -URL "$prometheusURL/-/ready"
+        Wait-ObservabilityEndpoint -Name "Compose Grafana" -URL "$grafanaURL/api/health"
+        Wait-ObservabilityEndpoint -Name "Compose Jaeger" -URL "$jaegerURL/api/services"
+
+        $migrationContainers = @(Get-ComposeServiceContainers `
+            -ComposeProject $composeProject -Service "migration")
+        if ($migrationContainers.Count -ne 1) {
+            throw "Compose created $($migrationContainers.Count) migration containers, expected exactly one."
+        }
+        $migrationState = @(
+            Invoke-Docker -Arguments @(
+                "inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", $migrationContainers[0]
+            )
+        )[0].Trim()
+        if ($migrationState -ne "exited 0") {
+            throw "Compose migration state was '$migrationState', expected 'exited 0'."
+        }
+        $migrationStartedAt = @(
+            Invoke-Docker -Arguments @(
+                "inspect", "--format", "{{.State.StartedAt}}", $migrationContainers[0]
+            )
+        )[0].Trim()
+
+        $submitted = Submit-ObservabilityJob -BaseURL $apiURL -Type "demo.echo" `
+            -Payload @{ message = "compose-test" } -MaxAttempts 1 -TimeoutMilliseconds 30000
+        $jobState = Wait-ObservabilityJobStatus `
+            -BaseURL $apiURL -JobID $submitted.id -ExpectedStatus "succeeded"
+        $attempts = Get-ObservabilityJobAttempts -BaseURL $apiURL -JobID $submitted.id
+        if ($jobState.result.message -ne "compose-test" -or
+            $attempts.Count -ne 1 -or $attempts[0].status -ne "succeeded") {
+            throw "Compose public API did not return the expected result and one succeeded attempt."
+        }
+
+        Wait-PrometheusTargets -BaseURL $prometheusURL
+        Wait-PrometheusWorkerTargets -BaseURL $prometheusURL -MinimumCount 2
+        Assert-GrafanaDashboard -BaseURL $grafanaURL
+        $traceID = Wait-JaegerJobTrace -BaseURL $jaegerURL -JobID $submitted.id
+
+        Invoke-Docker -Arguments @(
+            "compose", "up", "--detach", "--no-deps", "--scale", "worker=3", "worker"
+        )
+        $deadline = [DateTime]::UtcNow.AddSeconds(45)
+        do {
+            $runningWorkers = @(Get-ComposeServiceContainers `
+                -ComposeProject $composeProject -Service "worker" -Running)
+            if ($runningWorkers.Count -eq 3) {
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if ($runningWorkers.Count -ne 3) {
+            throw "Compose worker service has $($runningWorkers.Count) running containers, expected 3."
+        }
+        Wait-PrometheusWorkerTargets -BaseURL $prometheusURL -MinimumCount 3
+        $migrationStartedAtAfterScale = @(
+            Invoke-Docker -Arguments @(
+                "inspect", "--format", "{{.State.StartedAt}}", $migrationContainers[0]
+            )
+        )[0].Trim()
+        if ($migrationStartedAtAfterScale -ne $migrationStartedAt) {
+            throw "Compose restarted the one-shot migration while scaling workers."
+        }
+
+        Write-Host "Compose test passed: one migration, ready API, successful job $($submitted.id), trace $traceID, observability targets, and three scaled workers verified."
+    }
+    finally {
+        try {
+            Invoke-Docker -Arguments @("compose", "down", "--volumes", "--remove-orphans")
+        }
+        finally {
+            try {
+                Remove-DistributedTestDirectory -Directory $temporaryDirectory
+            }
+            finally {
+                foreach ($name in $environmentNames) {
+                    [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name])
+                }
+            }
+        }
+    }
+
+    Assert-ProcessTestCleanup -TestName "Compose-test" -ComposeProject $composeProject `
+        -TemporaryDirectory $temporaryDirectory
+    Write-Host "Compose-test cleanup verified: containers, network, volume, and temporary directory removed."
+}
+
+function Get-ComposeRecoveryArguments {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComposeProject
+    )
+
+    return @(
+        "compose",
+        "--project-name", $ComposeProject,
+        "--file", "compose.yaml",
+        "--file", "deploy/compose.recovery.yaml"
+    )
+}
+
+function Test-ComposeProjectExists {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComposeProject
+    )
+
+    $containers = @(
+        Invoke-Docker -Arguments @(
+            "ps", "--all", "--quiet",
+            "--filter", "label=com.docker.compose.project=$ComposeProject"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $networks = @(
+        Invoke-Docker -Arguments @(
+            "network", "ls", "--quiet",
+            "--filter", "label=com.docker.compose.project=$ComposeProject"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $volumes = @(
+        Invoke-Docker -Arguments @(
+            "volume", "ls", "--quiet",
+            "--filter", "label=com.docker.compose.project=$ComposeProject"
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    return $containers.Count -gt 0 -or $networks.Count -gt 0 -or $volumes.Count -gt 0
+}
+
+function Remove-ComposeRecoveryStack {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComposeProject
+    )
+
+    $composeArguments = @(Get-ComposeRecoveryArguments -ComposeProject $ComposeProject)
+    Invoke-Docker -Arguments ($composeArguments + @("down", "--volumes", "--remove-orphans"))
+    if (Test-ComposeProjectExists -ComposeProject $ComposeProject) {
+        throw "Compose recovery project '$ComposeProject' still has Docker resources after cleanup."
+    }
+}
+
+function Assert-ComposeRecoveryTarget {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ContainerID,
+
+        [Parameter(Mandatory)]
+        [string]$ComposeProject
+    )
+
+    $inspection = @(
+        Invoke-Docker -Arguments @(
+            "inspect", "--format",
+            "{{json .Config.Labels}}|{{.State.Running}}", $ContainerID
+        )
+    )[0].Trim()
+    $separator = $inspection.LastIndexOf('|')
+    if ($separator -le 0) {
+        throw "Compose recovery target '$ContainerID' returned invalid inspection data."
+    }
+    $labels = $inspection.Substring(0, $separator) | ConvertFrom-Json
+    $running = $inspection.Substring($separator + 1)
+    $projectLabel = $labels.PSObject.Properties['com.docker.compose.project'].Value
+    $serviceLabel = $labels.PSObject.Properties['com.docker.compose.service'].Value
+    if ($projectLabel -ne $ComposeProject -or $serviceLabel -ne "worker" -or $running -ne "true") {
+        throw "Refusing to kill container '$ContainerID': expected running $ComposeProject/worker labels."
+    }
+}
+
+function Wait-ComposeRecoveryAttemptOne {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $attempts = @(Get-ObservabilityJobAttempts -BaseURL $BaseURL -JobID $JobID)
+        if ($attempts.Count -eq 1 -and $attempts[0].status -eq "running" -and
+            -not [string]::IsNullOrWhiteSpace($attempts[0].worker_id)) {
+            return $attempts[0]
+        }
+        if ($attempts.Count -gt 1 -or
+            ($attempts.Count -eq 1 -and $attempts[0].status -ne "running")) {
+            throw "Compose recovery attempt 1 left running state before worker termination."
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    throw "Compose recovery attempt 1 did not start within 30 seconds."
+}
+
+function Wait-ComposeRecoverySucceeded {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    $lastStatus = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $job = Invoke-RestMethod -Uri "$BaseURL/v1/jobs/$JobID" -TimeoutSec 5
+        $lastStatus = $job.status
+        if ($lastStatus -eq "succeeded") {
+            return $job
+        }
+        if ($lastStatus -notin @("queued", "running", "retry_wait")) {
+            throw "Compose recovery job reached unexpected status '$lastStatus'."
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    throw "Compose recovery job did not succeed within 60 seconds. Last status: $lastStatus"
+}
+
+function Assert-ComposeRecoveryAttempts {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID,
+
+        [Parameter(Mandatory)]
+        [string]$FirstWorkerID,
+
+        [Parameter(Mandatory)]
+        [object]$JobState
+    )
+
+    if ($JobState.status -ne "succeeded" -or $JobState.attempt_count -ne 2 -or
+        $JobState.result.slept_ms -ne 6000) {
+        throw "Compose recovery job did not finish with two attempts and the expected result."
+    }
+    $attempts = @(Get-ObservabilityJobAttempts -BaseURL $BaseURL -JobID $JobID)
+    if ($attempts.Count -ne 2) {
+        throw "Compose recovery job has $($attempts.Count) attempts, expected two."
+    }
+    if ($attempts[0].attempt_no -ne 1 -or $attempts[0].worker_id -ne $FirstWorkerID -or
+        $attempts[0].status -ne "abandoned" -or $attempts[0].error_code -ne "lease_expired" -or
+        [string]::IsNullOrWhiteSpace($attempts[0].finished_at)) {
+        throw "Compose recovery attempt 1 is not abandoned with lease_expired on the killed worker."
+    }
+    if ($attempts[1].attempt_no -ne 2 -or $attempts[1].status -ne "succeeded" -or
+        $null -ne $attempts[1].error_code -or
+        [string]::IsNullOrWhiteSpace($attempts[1].finished_at)) {
+        throw "Compose recovery attempt 2 is not a finished success."
+    }
+    if ($attempts[1].worker_id -eq $FirstWorkerID -or
+        [string]::IsNullOrWhiteSpace($attempts[1].worker_id)) {
+        throw "Compose recovery attempt 2 did not use a distinct replacement worker identity."
+    }
+    return $attempts
+}
+
+function Wait-JaegerJobObservation {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseURL,
+
+        [Parameter(Mandatory)]
+        [string]$JobID
+    )
+
+    $tags = [Uri]::EscapeDataString((@{ "job.id" = $JobID } | ConvertTo-Json -Compress))
+    $deadline = [DateTime]::UtcNow.AddSeconds(45)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $response = Invoke-RestMethod `
+                -Uri "$BaseURL/api/traces?service=quarry-api&tags=$tags&limit=20" `
+                -TimeoutSec 5
+            $traces = @($response.data)
+            if ($traces.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($traces[0].traceID)) {
+                return [string]$traces[0].traceID
+            }
+        }
+        catch {
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Jaeger did not return a trace for Compose recovery job $JobID within 45 seconds."
+}
+
+function Invoke-ComposeRecoveryFlow {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComposeProject
+    )
+
+    $composeArguments = @(Get-ComposeRecoveryArguments -ComposeProject $ComposeProject)
+    Invoke-Docker -Arguments ($composeArguments + @("config", "--quiet"))
+    Invoke-Docker -Arguments (
+        $composeArguments + @("up", "--build", "--detach", "--scale", "worker=1")
+    ) | Out-Null
+
+    $apiPort = Get-ConfiguredPort -EnvironmentVariable "QUARRY_API_PORT" -Default 8080
+    $grafanaPort = Get-ConfiguredPort -EnvironmentVariable "QUARRY_GRAFANA_PORT" -Default 3000
+    $jaegerPort = Get-ConfiguredPort -EnvironmentVariable "QUARRY_JAEGER_PORT" -Default 16686
+    $apiURL = "http://127.0.0.1:$apiPort"
+    $grafanaURL = "http://127.0.0.1:$grafanaPort"
+    $jaegerURL = "http://127.0.0.1:$jaegerPort"
+
+    Wait-ObservabilityEndpoint -Name "Compose recovery API" -URL "$apiURL/readyz"
+    Wait-ObservabilityEndpoint -Name "Compose recovery Grafana" -URL "$grafanaURL/api/health"
+    Wait-ObservabilityEndpoint -Name "Compose recovery Jaeger" -URL "$jaegerURL/api/services"
+
+    $workers = @(Get-ComposeServiceContainers `
+        -ComposeProject $ComposeProject -Service "worker" -Running)
+    if ($workers.Count -ne 1) {
+        throw "Compose recovery requires one running worker container, found $($workers.Count)."
+    }
+    $targetContainer = $workers[0].Trim()
+    Assert-ComposeRecoveryTarget -ContainerID $targetContainer -ComposeProject $ComposeProject
+
+    $submitted = Submit-ObservabilityJob -BaseURL $apiURL -Type "demo.sleep" `
+        -Payload @{ duration_ms = 6000 } -MaxAttempts 3 -TimeoutMilliseconds 30000
+    $attemptOne = Wait-ComposeRecoveryAttemptOne `
+        -BaseURL $apiURL -JobID $submitted.id
+    Start-Sleep -Milliseconds 500
+    Assert-ComposeRecoveryTarget -ContainerID $targetContainer -ComposeProject $ComposeProject
+    Invoke-Docker -Arguments @("kill", $targetContainer) | Out-Null
+    Invoke-Docker -Arguments (
+        $composeArguments + @("up", "--detach", "--no-deps", "worker")
+    ) | Out-Null
+
+    $jobState = Wait-ComposeRecoverySucceeded -BaseURL $apiURL -JobID $submitted.id
+    $attempts = @(Assert-ComposeRecoveryAttempts `
+        -BaseURL $apiURL `
+        -JobID $submitted.id `
+        -FirstWorkerID $attemptOne.worker_id `
+        -JobState $jobState)
+    $replacementWorkers = @(Get-ComposeServiceContainers `
+        -ComposeProject $ComposeProject -Service "worker" -Running)
+    if ($replacementWorkers.Count -ne 1) {
+        throw "Compose recovery has $($replacementWorkers.Count) replacement worker containers, expected one."
+    }
+    Assert-ComposeRecoveryTarget `
+        -ContainerID $replacementWorkers[0].Trim() -ComposeProject $ComposeProject
+
+    Wait-ObservabilityEndpoint -Name "Compose recovery Grafana after recovery" -URL "$grafanaURL/api/health"
+    Wait-ObservabilityEndpoint -Name "Compose recovery Jaeger after recovery" -URL "$jaegerURL/api/services"
+    Assert-GrafanaDashboard -BaseURL $grafanaURL
+    $traceID = Wait-JaegerJobObservation -BaseURL $jaegerURL -JobID $submitted.id
+
+    return [PSCustomObject]@{
+        JobID = [string]$submitted.id
+        AttemptOne = $attempts[0]
+        AttemptTwo = $attempts[1]
+        TraceID = $traceID
+        GrafanaURL = "$grafanaURL/d/quarry-overview/quarry"
+        JaegerURL = $jaegerURL
+    }
+}
+
+function Write-ComposeRecoveryResult {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Result,
+
+        [Parameter(Mandatory)]
+        [string]$ComposeProject
+    )
+
+    Write-Host "Compose recovery demonstration passed."
+    Write-Host "Job ID: $($Result.JobID)"
+    Write-Host "Attempt 1: worker $($Result.AttemptOne.worker_id), abandoned, lease_expired"
+    Write-Host "Attempt 2: worker $($Result.AttemptTwo.worker_id), succeeded"
+    Write-Host "Grafana: $($Result.GrafanaURL)"
+    Write-Host "Jaeger: $($Result.JaegerURL) (trace $($Result.TraceID))"
+    Write-Host "Compose project: $ComposeProject"
+}
+
+function Start-ComposeRecoveryDemonstration {
+    $composeProject = "quarry-recovery-demo"
+    if (Test-ComposeProjectExists -ComposeProject $composeProject) {
+        throw "Compose recovery project '$composeProject' already exists. Run 'pwsh ./scripts/dev.ps1 compose-recovery-down' first."
+    }
+
+    try {
+        $result = Invoke-ComposeRecoveryFlow -ComposeProject $composeProject
+    }
+    catch {
+        try {
+            Remove-ComposeRecoveryStack -ComposeProject $composeProject
+        }
+        catch {
+            Write-Warning "Failed to clean up unsuccessful Compose recovery demonstration: $_"
+        }
+        throw
+    }
+
+    Write-ComposeRecoveryResult -Result $result -ComposeProject $composeProject
+    Write-Host "The stack remains running for inspection."
+    Write-Host "Stop it with: pwsh ./scripts/dev.ps1 compose-recovery-down"
+}
+
+function Stop-ComposeRecoveryDemonstration {
+    $composeProject = "quarry-recovery-demo"
+    Remove-ComposeRecoveryStack -ComposeProject $composeProject
+    Write-Host "Compose recovery demonstration removed: containers, network, and volume deleted."
+}
+
+function Test-ComposeRecoveryDemonstration {
+    $testID = [Guid]::NewGuid().ToString("N")
+    $composeProject = "quarry-m7-recovery-$testID"
+    $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "quarry-compose-recovery-$testID"
+    $savedEnvironment = @{}
+    $environmentNames = @(
+        "QUARRY_POSTGRES_PORT",
+        "QUARRY_API_PORT",
+        "QUARRY_DISPATCHER_PORT",
+        "QUARRY_DISPATCHER_METRICS_PORT",
+        "QUARRY_PROMETHEUS_PORT",
+        "QUARRY_GRAFANA_PORT",
+        "QUARRY_OTEL_GRPC_PORT",
+        "QUARRY_OTEL_HTTP_PORT",
+        "QUARRY_OTEL_HEALTH_PORT",
+        "QUARRY_JAEGER_PORT"
+    )
+    foreach ($name in $environmentNames) {
+        $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
+    }
+
+    $ports = [System.Collections.Generic.List[int]]::new()
+    while ($ports.Count -lt 10) {
+        $candidate = Get-AvailableLoopbackPort
+        if (-not $ports.Contains($candidate)) {
+            $ports.Add($candidate)
+        }
+    }
+    for ($index = 0; $index -lt $environmentNames.Count; $index++) {
+        [Environment]::SetEnvironmentVariable($environmentNames[$index], [string]$ports[$index])
+    }
+
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        $result = Invoke-ComposeRecoveryFlow -ComposeProject $composeProject
+        Write-ComposeRecoveryResult -Result $result -ComposeProject $composeProject
+    }
+    finally {
+        try {
+            Remove-ComposeRecoveryStack -ComposeProject $composeProject
+        }
+        finally {
+            try {
+                Remove-DistributedTestDirectory -Directory $temporaryDirectory
+            }
+            finally {
+                foreach ($name in $environmentNames) {
+                    [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name])
+                }
+            }
+        }
+    }
+
+    Assert-ProcessTestCleanup `
+        -TestName "Compose-recovery-test" `
+        -ComposeProject $composeProject `
+        -TemporaryDirectory $temporaryDirectory
+    Write-Host "Compose-recovery-test cleanup verified: containers, network, volume, and temporary directory removed."
+}
+
 function Test-ComposeSmoke {
     $binaryExtension = if ($IsWindows) { ".exe" } else { "" }
     $apiBinary = Join-Path `
@@ -3940,29 +5648,310 @@ function Test-ComposeSmoke {
     }
 }
 
-$script:GoExecutable = Find-GoExecutable
-$script:GoFmtExecutable = Find-GoFmtExecutable
+function Wait-ImageTestPostgres {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ContainerName
+    )
+
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(45)
+    do {
+        & $script:DockerExecutable exec $ContainerName `
+            pg_isready --username quarry --dbname quarry *> $null
+        if ($LASTEXITCODE -eq 0) {
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    } while ([DateTimeOffset]::UtcNow -lt $deadline)
+
+    $logs = @(& $script:DockerExecutable logs $ContainerName 2>&1) -join "`n"
+    throw "Image-test PostgreSQL did not become ready.`n$logs"
+}
+
+function Wait-ImageTestApplication {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ContainerName,
+
+        [Parameter(Mandatory)]
+        [string]$StartMessage
+    )
+
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
+    do {
+        $running = @(
+            & $script:DockerExecutable inspect --format "{{.State.Running}}" $ContainerName 2>$null
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw "Image-test container '$ContainerName' could not be inspected."
+        }
+
+        $logs = @(& $script:DockerExecutable logs $ContainerName 2>&1) -join "`n"
+        if ($running.Count -eq 1 -and $running[0].Trim() -eq "true" -and $logs.Contains($StartMessage)) {
+            return
+        }
+        if ($running.Count -eq 1 -and $running[0].Trim() -ne "true") {
+            throw "Image-test container '$ContainerName' exited before startup.`n$logs"
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTimeOffset]::UtcNow -lt $deadline)
+
+    throw "Image-test container '$ContainerName' did not log '$StartMessage'.`n$logs"
+}
+
+function Assert-ContainerImageMetadata {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Image,
+
+        [Parameter(Mandatory)]
+        [string]$EntryPoint
+    )
+
+    $configurationJSON = @(
+        Invoke-Docker -Arguments @("image", "inspect", "--format", "{{json .Config}}", $Image)
+    )[0]
+    $configuration = $configurationJSON | ConvertFrom-Json
+    $entryPointValues = @($configuration.Entrypoint)
+    if ($entryPointValues.Count -ne 1 -or $entryPointValues[0] -ne $EntryPoint) {
+        throw "Image '$Image' entry point is '$($entryPointValues -join ' ')', expected '$EntryPoint'."
+    }
+    if ([string]::IsNullOrWhiteSpace($configuration.User) -or $configuration.User -in @("0", "root")) {
+        throw "Image '$Image' must configure a non-root user, found '$($configuration.User)'."
+    }
+}
+
+function Remove-ImageTestContainer {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ContainerName
+    )
+
+    $containerIDs = @(
+        & $script:DockerExecutable ps --all --quiet --filter "name=^/$ContainerName$" 2>$null |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($containerIDs.Count -gt 0) {
+        Invoke-Docker -Arguments @("rm", "--force", $ContainerName) | Out-Null
+    }
+}
+
+function Test-ContainerImages {
+    $suffix = [Guid]::NewGuid().ToString("N")
+    $networkName = "quarry-image-test-$suffix"
+    $postgresContainer = "quarry-image-test-postgres-$suffix"
+    $apiContainer = "quarry-image-test-api-$suffix"
+    $dispatcherContainer = "quarry-image-test-dispatcher-$suffix"
+    $workerContainer = "quarry-image-test-worker-$suffix"
+    $containers = @($workerContainer, $dispatcherContainer, $apiContainer, $postgresContainer)
+    $images = @(
+        @{ Target = "api"; Tag = "quarry-api:dev"; EntryPoint = "/quarry-api" },
+        @{ Target = "dispatcher"; Tag = "quarry-dispatcher:dev"; EntryPoint = "/quarry-dispatcher" },
+        @{ Target = "worker"; Tag = "quarry-worker:dev"; EntryPoint = "/quarry-worker" },
+        @{ Target = "migration"; Tag = "quarry-migration:dev"; EntryPoint = "/goose" }
+    )
+    $databaseURL = "postgres://quarry:quarry@postgres:5432/quarry?sslmode=disable"
+
+    try {
+        foreach ($image in $images) {
+            Invoke-Docker -Arguments @(
+                "build", "--target", $image.Target, "--tag", $image.Tag, "."
+            )
+            Assert-ContainerImageMetadata -Image $image.Tag -EntryPoint $image.EntryPoint
+        }
+
+        Invoke-Docker -Arguments @("network", "create", $networkName) | Out-Null
+        Invoke-Docker -Arguments @(
+            "run", "--detach",
+            "--name", $postgresContainer,
+            "--network", $networkName,
+            "--network-alias", "postgres",
+            "--env", "POSTGRES_DB=quarry",
+            "--env", "POSTGRES_USER=quarry",
+            "--env", "POSTGRES_PASSWORD=quarry",
+            "postgres:18.6"
+        ) | Out-Null
+        Wait-ImageTestPostgres -ContainerName $postgresContainer
+
+        Invoke-Docker -Arguments @(
+            "run", "--rm",
+            "--network", $networkName,
+            "--env", "GOOSE_DBSTRING=$databaseURL",
+            "quarry-migration:dev"
+        )
+        $migrationVersion = @(
+            Invoke-Docker -Arguments @(
+                "exec", $postgresContainer,
+                "psql", "--username", "quarry", "--dbname", "quarry",
+                "--tuples-only", "--no-align",
+                "--command", "SELECT MAX(version_id) FROM goose_db_version WHERE is_applied;"
+            )
+        )[0].Trim()
+        if ($migrationVersion -ne "8") {
+            throw "Migration image applied version '$migrationVersion', expected '8'."
+        }
+
+        Invoke-Docker -Arguments @(
+            "run", "--detach",
+            "--name", $apiContainer,
+            "--network", $networkName,
+            "--env", "QUARRY_DATABASE_URL=$databaseURL",
+            "--env", "QUARRY_HTTP_ADDR=:8080",
+            "quarry-api:dev"
+        ) | Out-Null
+        Wait-ImageTestApplication -ContainerName $apiContainer -StartMessage '"msg":"api starting"'
+
+        Invoke-Docker -Arguments @(
+            "run", "--detach",
+            "--name", $dispatcherContainer,
+            "--network", $networkName,
+            "--network-alias", "dispatcher",
+            "--env", "QUARRY_DATABASE_URL=$databaseURL",
+            "--env", "QUARRY_DISPATCHER_ADDR=:9090",
+            "--env", "QUARRY_DISPATCHER_METRICS_ADDR=:9464",
+            "quarry-dispatcher:dev"
+        ) | Out-Null
+        Wait-ImageTestApplication `
+            -ContainerName $dispatcherContainer -StartMessage '"msg":"dispatcher starting"'
+
+        Invoke-Docker -Arguments @(
+            "run", "--detach",
+            "--name", $workerContainer,
+            "--network", $networkName,
+            "--env", "QUARRY_DISPATCHER_ADDR=dispatcher:9090",
+            "--env", "QUARRY_WORKER_HOSTNAME=image-test",
+            "--env", "QUARRY_WORKER_METRICS_ADDR=:9465",
+            "quarry-worker:dev"
+        ) | Out-Null
+        Wait-ImageTestApplication -ContainerName $workerContainer -StartMessage '"msg":"worker starting"'
+
+        Write-Host "Image test passed: four non-root targets, migration version 8, and API, dispatcher, and worker startup verified."
+    }
+    finally {
+        foreach ($container in $containers) {
+            try {
+                Remove-ImageTestContainer -ContainerName $container
+            }
+            catch {
+                Write-Warning "Failed to remove image-test container '$container': $_"
+            }
+        }
+        $networks = @(
+            & $script:DockerExecutable network ls --quiet --filter "name=^$networkName$" 2>$null |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        if ($networks.Count -gt 0) {
+            Invoke-Docker -Arguments @("network", "rm", $networkName) | Out-Null
+        }
+    }
+
+    foreach ($container in $containers) {
+        $remaining = @(
+            & $script:DockerExecutable ps --all --quiet --filter "name=^/$container$" 2>$null |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        if ($remaining.Count -ne 0) {
+            throw "Image-test container '$container' remains after cleanup."
+        }
+    }
+    $remainingNetwork = @(
+        & $script:DockerExecutable network ls --quiet --filter "name=^$networkName$" 2>$null |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($remainingNetwork.Count -ne 0) {
+        throw "Image-test network '$networkName' remains after cleanup."
+    }
+    Write-Host "Image-test cleanup verified: containers and network removed."
+}
+
+function Test-ContainerImageBuilds {
+    $images = @(
+        @{ Target = "api"; Tag = "quarry-api:ci" },
+        @{ Target = "dispatcher"; Tag = "quarry-dispatcher:ci" },
+        @{ Target = "worker"; Tag = "quarry-worker:ci" },
+        @{ Target = "migration"; Tag = "quarry-migration:ci" }
+    )
+
+    foreach ($image in $images) {
+        Invoke-Docker -Arguments @(
+            "build", "--target", $image.Target, "--tag", $image.Tag, "."
+        )
+    }
+
+    Write-Host "Container image build check passed: api, dispatcher, worker, and migration targets built."
+}
+
+$script:GoExecutable = $null
+$script:GoFmtExecutable = $null
 $script:DockerExecutable = $null
+$script:KubectlExecutable = $null
+$script:KindExecutable = $null
+$script:KindNodeImage = "kindest/node:v1.33.12@sha256:3f5c8443c620245e4d355cfe09e96a91ead32ceaa569d3f1ca9edf0cb2fe2ff4"
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 
 Push-Location $repositoryRoot
 try {
+    if ($Command -notin @("help", "docs-test")) {
+        $script:GoExecutable = Find-GoExecutable
+        $script:GoFmtExecutable = Find-GoFmtExecutable
+    }
+
     switch ($Command) {
+        "help" {
+            Write-CommandHelp
+        }
+        "docs-test" {
+            Test-DocumentationLinks
+        }
         "tools" {
             Test-Tools
         }
-        "test" {
-            Test-GoPackages
+        "staticcheck" {
+            Test-Staticcheck
         }
-        "check" {
+        "workflow-check" {
+            Test-GitHubWorkflows
+        }
+        "ci-go" {
             Invoke-Go -Arguments @("mod", "tidy", "-diff")
             Test-GoFormatting
             Test-Tools
             Invoke-Sqlc -SqlcCommand "diff"
             Test-BufGeneratedCode
+            Test-GitHubWorkflows
+            Test-Staticcheck
             Test-GoVet
             Test-GoPackages
             Test-GoBuild
+        }
+        "ci-race" {
+            Test-GoRace
+        }
+        "ci-packaging" {
+            Test-ContainerImageBuilds
+            Invoke-Docker -Arguments @("compose", "config", "--quiet")
+            Test-KubernetesConfiguration
+        }
+        "test" {
+            Test-GoPackages
+        }
+        "check" {
+            Test-DocumentationLinks
+            Invoke-Go -Arguments @("mod", "tidy", "-diff")
+            Test-GoFormatting
+            Test-Tools
+            Invoke-Sqlc -SqlcCommand "diff"
+            Test-BufGeneratedCode
+            Test-GitHubWorkflows
+            Test-Staticcheck
+            Test-GoVet
+            Test-GoPackages
+            Test-GoBuild
+            Test-ContainerImages
+            Test-KubernetesConfiguration
+            Test-KindScaling
+            Test-ComposeWorkflow
+            Test-ComposeRecoveryDemonstration
             Test-ObservabilityConfiguration
             Test-ObservabilityWorkflow
             Test-ComposeSmoke
@@ -4020,6 +6009,36 @@ try {
         }
         "build" {
             Test-GoBuild
+        }
+        "image-test" {
+            Test-ContainerImages
+        }
+        "compose-test" {
+            Test-ComposeWorkflow
+        }
+        "compose-recovery" {
+            Start-ComposeRecoveryDemonstration
+        }
+        "compose-recovery-test" {
+            Test-ComposeRecoveryDemonstration
+        }
+        "compose-recovery-down" {
+            Stop-ComposeRecoveryDemonstration
+        }
+        "k8s-config-test" {
+            Test-KubernetesConfiguration
+        }
+        "kind-up" {
+            Start-KindDemonstration
+        }
+        "kind-test" {
+            Test-KindDeployment
+        }
+        "kind-scaling-test" {
+            Test-KindScaling
+        }
+        "kind-down" {
+            Stop-KindDemonstration
         }
         "smoke-test" {
             Test-ComposeSmoke

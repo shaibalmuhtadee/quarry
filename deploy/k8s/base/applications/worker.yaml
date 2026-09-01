@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quarry-worker
+  labels:
+    app.kubernetes.io/name: quarry-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: quarry
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: quarry-worker
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: quarry-worker
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: quarry
+    spec:
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: quarry-worker:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: QUARRY_DISPATCHER_ADDR
+              value: quarry-dispatcher:9090
+            - name: QUARRY_WORKER_CONCURRENCY
+              value: "4"
+            - name: QUARRY_WORKER_VERSION
+              value: kind
+            - name: QUARRY_WORKER_SHUTDOWN_TIMEOUT
+              value: 10s
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
