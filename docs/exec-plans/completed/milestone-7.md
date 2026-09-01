@@ -732,9 +732,9 @@ Make the finished repository understandable and runnable without requiring the p
 
 ## Milestone audit
 
-Status: not started
+Status: complete
 
-The milestone audit begins only after all eight slices are complete. Completed slice statuses are not proof that Milestone 7 is complete.
+The audit inspected the implementation and reran the required proofs independently of the slice statuses. Milestone 7 requirements M7-R1 through M7-R10 and definition-of-done items M7-D1 through M7-D7 are satisfied. No implementation defect or omission required a code change.
 
 ### Required audit checks
 
@@ -757,3 +757,16 @@ Only after the audit passes:
 - move this plan to `docs/exec-plans/completed/milestone-7.md`,
 - record any remaining limitations,
 - stop adding V1 features.
+
+### Audit evidence
+
+- Direct inspection covered the public HTTP API, dispatcher and worker runtime paths, PostgreSQL migrations and state transitions, all four Docker image targets, the complete Compose topology, Kustomize base and kind overlay, health probes, resource controls, scaling scripts, CI workflow, Go dependencies, README, architecture, guarantees, and benchmark documentation. The implementation preserves the planned PostgreSQL authority and at-least-once boundary and contains no excluded V1 feature, unsupported availability or exactly-once claim, or unnecessary runtime dependency.
+- The README Compose walkthrough passed from a fresh isolated project. Job `1b693475-91f6-4847-8ff5-dbb5d96a5003` succeeded; Prometheus reported the submitted and succeeded work plus two active workers; Grafana loaded the provisioned 13-panel dashboard; and Jaeger trace `bc17cf64f4fee76a3c8d685678671607` contained nine spans across the API, dispatcher, worker, handler, and database operations.
+- The documented worker-kill recovery demonstration passed for job `591b9d1b-516b-4c1c-aca6-7009bb97a349`. Public attempt history and direct PostgreSQL inspection agreed: attempt 1 was abandoned with `lease_expired`, and attempt 2 succeeded under a distinct worker. Prometheus exposed both outcomes, and Jaeger returned an 11-span trace containing both execution paths.
+- The README kind walkthrough passed with one API, two dispatcher, and three worker pods Ready. A submitted job succeeded, and direct PostgreSQL inspection confirmed migration version 8 plus the durable succeeded job and attempt rows. The cluster was removed afterward.
+- Focused `image-test`, `compose-test`, `compose-recovery-test`, `k8s-config-test`, `kind-test`, `kind-scaling-test`, and `benchmark-verify` commands passed. The standalone scaling proof observed 32.00, 95.12, and 98.88 jobs/s at 1, 4, and 8 workers, restored the committed three-worker and concurrency-four defaults, and remains explicitly non-publishable. Benchmark verification accepted the deterministic fixtures and committed campaign `quarry-20260829T002429Z`.
+- Linux `go test -count=1 -race ./...` passed in the pinned `golang:1.27.0-bookworm` image, including real PostgreSQL testcontainers. `go mod tidy -diff`, focused dispatcher, Kustomize, and observability tests, documentation links, and `git diff --check` also passed.
+- A fresh canonical `pwsh -NoProfile ./scripts/dev.ps1 check` passed with `COMPOSE_PROJECT_NAME=quarry-m7-audit-check2`. It covered documentation, formatting, generation, pinned tools, workflow linting, static analysis, all Go tests and builds, image runtime, Kustomize validation, kind scaling, full Compose, public recovery, observability failure isolation, distributed execution, process-crash recovery, acknowledgement loss, shutdown semantics, PostgreSQL state, and owned-resource cleanup.
+- GitHub Actions run [33423791505](https://github.com/shaibalmuhtadee/quarry/actions/runs/33423791505) passed for audited commit `f64e3f93780422dc0dd5265e53eecc624cdda8c2`; its `go-validation`, `race`, and `packaging` jobs all succeeded.
+- Final cleanup inspection found no audit containers, networks, kind clusters, kind contexts, or port-forwards. The exact isolated canonical-check volume was removed after its Compose project label and lack of attached containers were verified. The pre-existing `quarry_postgres-data` development volume was preserved.
+- Remaining limitations are intentional and documented: execution is at least once, cancellation depends on handler cooperation until process exit, Compose and kind are local demonstrations rather than production high-availability deployments, local Jaeger storage is in memory, and benchmark results describe one bounded local environment.
